@@ -59,8 +59,8 @@ const PIN_ROOT_SALT: &str = "secure-send:pin-root:v2";
 /// domain-separated by its HKDF info label.
 const PIN_HKDF_SALT: &str = "secure-send:pin:v2";
 
-/// PIN hint length in hex characters (64 bits): the Nostr `#h` filter tag.
-const PIN_HINT_LENGTH: usize = 16;
+/// PIN hint length in hex characters (32 bits): the Nostr `#h` filter tag.
+const PIN_HINT_LENGTH: usize = 8;
 /// PIN fingerprint length in lowercase hex characters (48 bits, local-only).
 const PIN_FINGERPRINT_LENGTH: usize = 12;
 /// The fingerprint is never transmitted — it exists only for on-screen human
@@ -186,7 +186,7 @@ impl PinRoot {
         key
     }
 
-    /// The PIN hint (16 hex chars) for an absolute rotation bucket. Published
+    /// The PIN hint (8 hex chars) for an absolute rotation bucket. Published
     /// as the Nostr `#h` tag so the receiver can locate the rendezvous event
     /// without revealing the PIN; bucket scoping keeps the tag from being a
     /// stable cross-transfer correlator.
@@ -294,7 +294,7 @@ mod tests {
         // iterations, salt "secure-send:pin-root:v2"; HKDF-SHA-256, salt
         // "secure-send:pin:v2").
         let root = PinRoot::derive("ABCDEFGHJKLc");
-        assert_eq!(root.hint_for_bucket(14778858), "1d5c44a599863be2");
+        assert_eq!(root.hint_for_bucket(14778858), "1d5c44a5");
         assert_eq!(
             hex_lower(&root.auth_key()),
             "65528de3152b27ac4282046a042074e9bc595422338b2815eec855ee38669db0"
