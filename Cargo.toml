@@ -5,6 +5,9 @@ version = "0.0.20"
 edition = "2024"
 publish = false
 
+[package.metadata]
+secure-send-web-version = "0.0.16"
+
 [lib]
 name = "secure_send_cli"
 path = "src/lib.rs"

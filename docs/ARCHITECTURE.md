@@ -19,7 +19,7 @@ and filters unsupported characters. The PIN root is
 is an HKDF-SHA256 expansion off it (salt
 `secure-send:pin:v2`) with a distinct info label:
 
-- `hint:<bucket>` — 16-hex-char event lookup tag, scoped to the 5-minute
+- `hint:<bucket>` — 8-hex-char event lookup tag, scoped to the 5-minute
   rotation bucket (`floor(now_ms / 300000)`).
 - `auth` — AES-256-GCM key sealing the claim/confirm handshake payloads.
 - `rendezvous` — AES-256-GCM key sealing the rendezvous payload.
