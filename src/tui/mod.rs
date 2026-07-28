@@ -18,7 +18,9 @@ mod transfer_screen;
 mod widgets;
 
 use anyhow::{Context, Result};
-use crossterm::event::{KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, KeyEvent, KeyModifiers,
+};
 use ratatui::DefaultTerminal;
 
 use crate::util::OnConflict;
@@ -70,6 +72,10 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn init() -> Result<Self> {
         let terminal = ratatui::try_init().context("Cannot initialize the terminal")?;
+        if let Err(error) = crossterm::execute!(std::io::stdout(), EnableBracketedPaste) {
+            ratatui::restore();
+            return Err(error).context("Cannot enable terminal paste handling");
+        }
         Ok(Self { terminal })
     }
 
@@ -80,6 +86,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
         ratatui::restore();
     }
 }

@@ -13,9 +13,9 @@ full-screen TUI wizard that walks through the whole transfer: send or receive,
 file/folder selection, signaling mode, output directory, and PIN entry.
 
 - Nostr PIN signaling by default, compatible with the web app's Auto Exchange
-  mode: a short rotating PIN (fresh every 2 minutes; the sender can also mint
-  a new one on demand with `r`) authenticates an ephemeral ECDH exchange that
-  derives the actual signaling and content keys.
+  mode: a case-sensitive 12-character PIN (fresh every 5 minutes; the sender
+  can also mint a new one on demand with `r`) authenticates an ephemeral ECDH
+  exchange that derives the actual signaling and content keys.
 - Manual SS03 copy/paste signaling, compatible with the web app's manual
   exchange codes. When chosen in the wizard, the TUI exits back to the normal
   terminal so the offer/response codes can be copy/pasted.
@@ -111,12 +111,11 @@ secure-send-cli test send /path/to/file more-files a-folder
 secure-send-cli test receive <PIN> --output /path/to/dir
 ```
 
-The sender prints a 10-character PIN (`XXXXX-XXXXX`) on stdout, and prints a
-fresh one each time it rotates (every 2 minutes) until a receiver claims the
-transfer; enter the code currently shown. PIN entry is forgiving: lowercase is
-accepted, and the look-alikes `O`/`I`/`L` map to `0`/`1`/`1`. Multiple paths
-or a folder are sent as one ZIP. If the destination file already exists the
-receiver fails; pass `--overwrite` to replace it.
+The sender prints a case-sensitive 12-character PIN on stdout, and prints a
+fresh one each time it rotates (every 5 minutes) until a receiver claims the
+transfer; enter the code currently shown exactly. Multiple paths or a folder
+are sent as one ZIP. If the destination file already exists the receiver
+fails; pass `--overwrite` to replace it.
 
 Manual SS03 mode:
 
@@ -142,8 +141,8 @@ The CLI follows `secure-send-web` as the source of truth:
   key, and the on-screen fingerprint are HKDF expansions off that root. The
   PIN derives no content keys — signaling and content keys come from an
   ephemeral P-256 ECDH exchange authenticated by the claim/confirm handshake.
-- PIN rotation: fresh PIN every 2 minutes; only PINs minted in the current or
-  immediately previous bucket are honored (roughly 2–4 minutes). The sender
+- PIN rotation: fresh PIN every 5 minutes; only PINs minted in the current or
+  immediately previous bucket are honored (roughly 5–10 minutes). The sender
   waits up to 30 minutes for a receiver before giving up.
 - Manual signaling uses SS03 payloads.
 - File chunks use AES-256-GCM with the 2-byte chunk index as AAD, followed by

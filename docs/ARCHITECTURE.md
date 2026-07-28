@@ -11,25 +11,26 @@ This is the default mode. The PIN authenticates the handshake; it derives no
 content keys. Signaling and content keys come from an ephemeral P-256 ECDH
 exchange.
 
-**PIN and PIN root.** The PIN is 10 Crockford-base32 characters (9 data + 1
-position-weighted checksum), displayed as `XXXXX-XXXXX`. Entry canonicalizes
-lowercase and the look-alikes `O -> 0`, `I/L -> 1` and drops separators. The
-PIN root is `PBKDF2-SHA256(pin, "secure-send:pin-root:v2", 600k)`; every
-PIN-scoped value is an HKDF-SHA256 expansion off it (salt
+**PIN and PIN root.** The PIN is 12 case-sensitive characters (11 data + 1
+position-weighted checksum) from a 69-character alphabet that excludes
+ambiguous `0`, `1`, `I`, `O`, `i`, `l`, and `o`. Entry preserves exact case
+and filters unsupported characters. The PIN root is
+`PBKDF2-SHA256(pin, "secure-send:pin-root:v2", 600k)`; every PIN-scoped value
+is an HKDF-SHA256 expansion off it (salt
 `secure-send:pin:v2`) with a distinct info label:
 
-- `hint:<bucket>` — 16-hex-char event lookup tag, scoped to the 2-minute
-  rotation bucket (`floor(now_ms / 120000)`).
+- `hint:<bucket>` — 16-hex-char event lookup tag, scoped to the 5-minute
+  rotation bucket (`floor(now_ms / 300000)`).
 - `auth` — AES-256-GCM key sealing the claim/confirm handshake payloads.
 - `rendezvous` — AES-256-GCM key sealing the rendezvous payload.
-- `fingerprint` — 8 uppercase base32 chars, shown locally on both sides for a
+- `fingerprint` — 12 lowercase hex chars, shown locally on both sides for a
   human visual check; never published.
 
-**Rotation.** The sender mints and publishes a fresh PIN every 2 minutes
+**Rotation.** The sender mints and publishes a fresh PIN every 5 minutes
 (`PIN_ROTATION_MS`), honors only PINs minted in its current or immediately
 previous bucket, and attaches a NIP-40 expiration at the end of the PIN's
 second bucket. The receiver derives hints for its current and previous buckets
-and refuses rendezvous events older than the 4-minute maximum (`PIN_TTL_MS`).
+and refuses rendezvous events older than the 10-minute maximum (`PIN_TTL_MS`).
 The TUI `r` key (and the web app's
 refresh button) mints a fresh PIN immediately, dropping all retained
 generations. The sender keeps rotating for up to 30 minutes — a resource
