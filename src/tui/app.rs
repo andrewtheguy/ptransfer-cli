@@ -12,9 +12,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Stylize;
 use ratatui::widgets::Paragraph;
 
-use crate::crypto::pin::{
-    PIN_LENGTH, canonical_pin_char, format_pin, is_valid_pin, pin_fingerprint,
-};
+use crate::crypto::pin::{PIN_LENGTH, is_valid_pin, pin_char, pin_fingerprint};
 
 use super::dir_picker::{DirPicker, DirPickerStep};
 use super::file_browser::{Browser, BrowserStep};
@@ -90,15 +88,18 @@ pub async fn run_wizard(terminal: &mut DefaultTerminal) -> Result<Option<WizardP
             .next()
             .await
             .ok_or_else(|| anyhow!("input stream closed"))??;
-        let Event::Key(key) = event else { continue };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        if is_ctrl_c(&key) {
-            return Err(anyhow!("Interrupted"));
-        }
+        let step = match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if is_ctrl_c(&key) {
+                    return Err(anyhow!("Interrupted"));
+                }
+                handle_key(screen, key)
+            }
+            Event::Paste(text) => handle_paste(screen, &text),
+            _ => continue,
+        };
 
-        match handle_key(screen, key) {
+        match step {
             Step::Continue(next) => screen = next,
             Step::Finish(plan) => return Ok(Some(plan)),
             Step::Quit => return Ok(None),
@@ -251,14 +252,15 @@ fn pin_entry_key(
                 edited = true;
             }
         }
-        // Typed characters are canonicalized like secure-send-web's PIN box:
-        // lowercase is uppercased, O -> 0 and I/L -> 1; separators and other
-        // characters are ignored.
+        // PIN entry is case-sensitive. Unsupported characters are filtered
+        // without changing the supported characters around them.
         KeyCode::Char(c) if input.len() < PIN_LENGTH => {
-            if let Some(c) = canonical_pin_char(c) {
+            if let Some(c) = pin_char(c) {
                 input.insert(cursor, c);
                 cursor += 1;
                 edited = true;
+            } else {
+                error = Some("That character is not supported in a PIN".to_string());
             }
         }
         _ => {}
@@ -281,20 +283,32 @@ fn pin_entry_key(
     })
 }
 
-/// Byte index in the dash-grouped PIN display for a cursor sitting before the
-/// `cursor`-th canonical character: skips over the group dashes `format_pin`
-/// inserts.
-fn display_cursor(display: &str, cursor: usize) -> usize {
-    let mut remaining = cursor;
-    for (i, c) in display.char_indices() {
-        if c != '-' {
-            if remaining == 0 {
-                return i;
+fn handle_paste(screen: Screen, pasted: &str) -> Step {
+    let Screen::PinEntry { output, .. } = screen else {
+        return Step::Continue(screen);
+    };
+
+    let mut input = String::with_capacity(PIN_LENGTH);
+    let mut invalid = false;
+    for c in pasted.chars() {
+        if let Some(c) = pin_char(c) {
+            if input.len() < PIN_LENGTH {
+                input.push(c);
             }
-            remaining -= 1;
+        } else {
+            invalid = true;
         }
     }
-    display.len()
+    let fingerprint =
+        (input.len() == PIN_LENGTH && is_valid_pin(&input)).then(|| pin_fingerprint(&input));
+
+    Step::Continue(Screen::PinEntry {
+        output,
+        cursor: input.len(),
+        input,
+        fingerprint,
+        error: invalid.then(|| "Unsupported characters were removed".to_string()),
+    })
 }
 
 fn draw(f: &mut Frame, screen: &mut Screen) {
@@ -382,17 +396,10 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
             ])
             .areas(area);
             f.render_widget(
-                Paragraph::new("Enter the sender's 10-character PIN (XXXXX-XXXXX):"),
+                Paragraph::new("Enter the sender's 12-character PIN (case-sensitive):"),
                 title,
             );
-            let display = format_pin(input);
-            widgets::input_line(
-                f,
-                line,
-                "PIN: ",
-                &display,
-                display_cursor(&display, *cursor),
-            );
+            widgets::input_line(f, line, "PIN: ", input, *cursor);
             if let Some(error) = error {
                 widgets::error_line(f, extra, error);
             } else if let Some(fp) = fingerprint {
@@ -405,5 +412,40 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
             }
             widgets::key_hints(f, inner, "Enter confirm · ←/→ move · Esc back");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pasted_pin_replaces_input_and_filters_unsupported_characters() {
+        let screen = Screen::PinEntry {
+            output: PathBuf::from("."),
+            input: "old".to_string(),
+            cursor: 3,
+            fingerprint: None,
+            error: None,
+        };
+
+        let Step::Continue(Screen::PinEntry {
+            input,
+            cursor,
+            fingerprint,
+            error,
+            ..
+        }) = handle_paste(screen, "AB*CD EFGHJKLc")
+        else {
+            panic!("paste should remain on the PIN entry screen");
+        };
+
+        assert_eq!(input, "ABCDEFGHJKLc");
+        assert_eq!(cursor, PIN_LENGTH);
+        assert!(fingerprint.is_some());
+        assert_eq!(
+            error.as_deref(),
+            Some("Unsupported characters were removed")
+        );
     }
 }

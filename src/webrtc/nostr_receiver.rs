@@ -20,8 +20,8 @@ use crate::crypto::aes;
 use crate::crypto::chunk::MAX_MESSAGE_SIZE;
 use crate::crypto::ecdh::{EcdhKeyPair, NostrSessionKeys};
 use crate::crypto::pin::{
-    PIN_HINT_LOOKBACK_BUCKETS, PIN_TTL_MS, PinRoot, is_valid_pin, normalize_pin_input, now_ms,
-    pin_bucket, pin_fingerprint,
+    PIN_HINT_LOOKBACK_BUCKETS, PIN_TTL_MS, PinRoot, is_valid_pin, now_ms, pin_bucket,
+    pin_fingerprint,
 };
 use crate::signaling::nostr::{
     CandidatePayload, ClaimPayload, ConfirmPayload, HandshakeType, NostrClient, RendezvousPayload,
@@ -67,10 +67,10 @@ pub async fn receive_file_nostr(
     output_dir: Option<PathBuf>,
     on_conflict: OnConflict,
 ) -> Result<()> {
-    let pin = normalize_pin_input(pin.trim());
-    if !is_valid_pin(&pin) {
+    if !is_valid_pin(pin) {
         bail!("Invalid PIN: check for typos and try again");
     }
+    let pin = pin.to_string();
 
     let fingerprint = pin_fingerprint(&pin);
 
