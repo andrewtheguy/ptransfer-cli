@@ -15,6 +15,7 @@ import {
   mkdtemp,
   readFile,
 } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import {
   dirname,
@@ -28,9 +29,10 @@ const CLI_ROOT = resolve(SCRIPT_DIR, '..');
 const WEB_ROOT = resolve(
   process.env.SECURE_SEND_WEB_ROOT ?? join(CLI_ROOT, '..', 'secure-send-web'),
 );
-const WEB_URL = new URL(
+const REQUESTED_WEB_URL = new URL(
   process.env.SECURE_SEND_WEB_URL ?? 'http://127.0.0.1:4173',
 );
+let webUrl = REQUESTED_WEB_URL;
 const CLI = join(CLI_ROOT, 'target', 'debug', 'secure-send-cli');
 const CACHE_ROOT = resolve(
   process.env.SECURE_SEND_E2E_CACHE
@@ -73,10 +75,24 @@ async function runCommand(command, args, options = {}) {
     env: { ...process.env, ...options.env },
     stdio: 'inherit',
   });
-  const result = await new Promise((resolvePromise, reject) => {
+  activeClis.add(child);
+  const exit = new Promise((resolvePromise, reject) => {
     child.once('error', reject);
     child.once('exit', (code, signal) => resolvePromise({ code, signal }));
   });
+  let result;
+  try {
+    result = await withTimeout(
+      exit,
+      options.timeoutMs ?? 10 * 60_000,
+      `${command} setup command`,
+    );
+  } catch (error) {
+    await terminate(child);
+    throw error;
+  } finally {
+    activeClis.delete(child);
+  }
   if (result.code !== 0) {
     throw new Error(
       `${command} exited with code ${result.code ?? 'null'}, signal ${result.signal ?? 'none'}`,
@@ -102,35 +118,93 @@ async function assertProtocolVersionMatches() {
     );
   }
   console.log(`[setup] protocol version secure-send-web ${webPackage.version}`);
+  return webPackage;
 }
 
-async function isReachable(url) {
+async function probeWebServer(url, expectedPackageName) {
+  let reachable = false;
   try {
     const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
+    reachable = true;
     await response.body?.cancel();
-    return true;
+    if (!response.ok) {
+      return { reachable, version: null };
+    }
+
+    const packageResponse = await fetch(new URL('/package.json', url), {
+      signal: AbortSignal.timeout(2_000),
+    });
+    if (!packageResponse.ok) {
+      await packageResponse.body?.cancel();
+      return { reachable, version: null };
+    }
+    const servedPackage = await packageResponse.json();
+    const version = servedPackage.name === expectedPackageName
+      && typeof servedPackage.version === 'string'
+      ? servedPackage.version
+      : null;
+    return { reachable, version };
   } catch {
-    return false;
+    return { reachable, version: null };
   }
 }
 
-async function ensureWebServer() {
-  if (await isReachable(WEB_URL)) {
-    console.log(`[setup] using existing web server at ${WEB_URL.origin}`);
+async function availableLoopbackUrl() {
+  const port = await new Promise((resolvePromise, reject) => {
+    const server = createServer();
+    server.unref();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        server.close();
+        reject(new Error('Failed to allocate an isolated web-server port'));
+        return;
+      }
+      server.close((error) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolvePromise(address.port);
+        }
+      });
+    });
+  });
+  return new URL(`http://127.0.0.1:${port}`);
+}
+
+async function ensureWebServer(expectedPackage) {
+  const existing = await probeWebServer(
+    REQUESTED_WEB_URL,
+    expectedPackage.name,
+  );
+  if (existing.version === expectedPackage.version) {
+    webUrl = REQUESTED_WEB_URL;
+    console.log(
+      `[setup] using verified secure-send-web ${existing.version} at ${webUrl.origin}`,
+    );
     return;
   }
 
-  if (WEB_URL.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(WEB_URL.hostname)) {
-    throw new Error(
-      `Cannot start a local Vite server for ${WEB_URL.origin}; start that URL manually`,
+  if (existing.reachable) {
+    console.log(
+      `[setup] not reusing ${REQUESTED_WEB_URL.origin}: expected secure-send-web `
+      + `${expectedPackage.version}, found ${existing.version ?? 'an unverified response'}`,
     );
   }
   await access(join(WEB_ROOT, 'node_modules', '.bin', 'vite'), fsConstants.X_OK).catch(() => {
     throw new Error(`Missing web dependencies; run npm install in ${WEB_ROOT}`);
   });
 
-  const port = WEB_URL.port || '80';
-  console.log(`[setup] starting secure-send-web at ${WEB_URL.origin}`);
+  const requestedIsAvailableLoopback = !existing.reachable
+    && REQUESTED_WEB_URL.protocol === 'http:'
+    && ['127.0.0.1', 'localhost'].includes(REQUESTED_WEB_URL.hostname);
+  webUrl = requestedIsAvailableLoopback
+    ? REQUESTED_WEB_URL
+    : await availableLoopbackUrl();
+
+  const port = webUrl.port || '80';
+  console.log(`[setup] starting secure-send-web ${expectedPackage.version} at ${webUrl.origin}`);
   ownedWebServer = spawn(
     'npm',
     [
@@ -138,7 +212,7 @@ async function ensureWebServer() {
       'dev',
       '--',
       '--host',
-      WEB_URL.hostname,
+      webUrl.hostname,
       '--port',
       port,
       '--strictPort',
@@ -159,12 +233,15 @@ async function ensureWebServer() {
     if (ownedWebServer.exitCode !== null || ownedWebServer.signalCode !== null) {
       throw new Error('secure-send-web exited before becoming ready');
     }
-    if (await isReachable(WEB_URL)) {
+    const probe = await probeWebServer(webUrl, expectedPackage.name);
+    if (probe.version === expectedPackage.version) {
       return;
     }
     await sleep(250);
   }
-  throw new Error(`secure-send-web did not become ready at ${WEB_URL.origin}`);
+  throw new Error(
+    `secure-send-web ${expectedPackage.version} did not become ready at ${webUrl.origin}`,
+  );
 }
 
 async function loadChromium() {
@@ -381,7 +458,7 @@ async function cliToWeb() {
     );
     console.log(`[e2e] CLI sender PIN: ${pin}`);
 
-    await page.goto(new URL('/receive', WEB_URL).href, {
+    await page.goto(new URL('/receive', webUrl).href, {
       waitUntil: 'domcontentloaded',
     });
     await page.getByRole('textbox', { name: 'PIN', exact: true }).fill(pin);
@@ -416,7 +493,7 @@ async function webToCli() {
     const source = join(CLI_ROOT, 'docs', 'USE_CASES.md');
     const outputDir = await mkdtemp(join(ARTIFACTS, 'web-to-cli-'));
 
-    await page.goto(new URL('/send', WEB_URL).href, {
+    await page.goto(new URL('/send', webUrl).href, {
       waitUntil: 'domcontentloaded',
     });
     await page.locator('input[type="file"]').first().setInputFiles(source);
@@ -509,11 +586,11 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 }
 
 try {
-  await assertProtocolVersionMatches();
+  const expectedWebPackage = await assertProtocolVersionMatches();
   await runCommand('cargo', ['build', '--all-features'], { cwd: CLI_ROOT });
   const chromium = await loadChromium();
   const executablePath = await findBrowser();
-  await ensureWebServer();
+  await ensureWebServer(expectedWebPackage);
   browser = await chromium.launch({
     executablePath,
     headless: true,

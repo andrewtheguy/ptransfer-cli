@@ -231,16 +231,19 @@ pub async fn prompt_confirmation_code() -> Result<String> {
         let result = std::io::stdin()
             .read_line(&mut input)
             .map_err(anyhow::Error::from)
-            .and_then(|_| {
-                if input.is_empty() {
-                    Err(anyhow!("no confirmation code entered"))
-                } else {
-                    Ok(input.trim().to_string())
-                }
-            });
+            .and_then(|_| validate_confirmation_code_input(&input));
         let _ = reply.send(result);
     });
     rx.await.map_err(|_| anyhow!("confirmation input closed"))?
+}
+
+fn validate_confirmation_code_input(input: &str) -> Result<String> {
+    let input = input.trim();
+    if input.is_empty() {
+        Err(anyhow!("no confirmation code entered"))
+    } else {
+        Ok(input.to_string())
+    }
 }
 
 /// Stop displaying the PIN: a receiver claimed the transfer, so every shown
@@ -333,4 +336,23 @@ pub async fn prompt_code(prompt: &str) -> Result<String> {
     }
 
     Ok(collected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_code_input_rejects_whitespace_only() {
+        let error = validate_confirmation_code_input(" \t\r\n ").unwrap_err();
+        assert_eq!(error.to_string(), "no confirmation code entered");
+    }
+
+    #[test]
+    fn confirmation_code_input_returns_trimmed_value() {
+        assert_eq!(
+            validate_confirmation_code_input("  A4BC-D9ZT \n").unwrap(),
+            "A4BC-D9ZT"
+        );
+    }
 }
