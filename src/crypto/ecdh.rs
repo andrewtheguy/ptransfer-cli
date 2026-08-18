@@ -5,10 +5,8 @@
 //! `HKDF-SHA256(ikm = ECDH shared X coordinate, salt = 16-byte transfer salt,
 //!  info = "secure-send-mutual", len = 32)`.
 //!
-//! Nostr (Auto Exchange) mode derives two session keys off the same shared
-//! secret with distinct info labels (`secure-send:nostr-session:v2:signals` /
-//! `:content`), so relay-carried signaling and P2P file content never reuse
-//! the same AES-GCM key.
+//! Nostr (Auto Exchange) mode derives two session keys and a human confirmation
+//! code off the same shared secret with distinct info labels.
 
 use anyhow::{Result, bail};
 use hkdf::Hkdf;
@@ -16,6 +14,7 @@ use p256::PublicKey;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::Sha256;
 
+use super::base32::{CONFIRMATION_CODE_BYTES, encode_crockford_base32};
 use super::chunk::fill_random;
 
 /// HKDF `info` string for the mutual (manual-mode) content key.
@@ -24,6 +23,8 @@ const HKDF_INFO_MUTUAL: &[u8] = b"secure-send-mutual";
 const HKDF_INFO_NOSTR_SIGNALS: &[u8] = b"secure-send:nostr-session:v2:signals";
 /// HKDF `info` string for the Nostr-mode content key (`kdf.ts`).
 const HKDF_INFO_NOSTR_CONTENT: &[u8] = b"secure-send:nostr-session:v2:content";
+/// Prefix of the transcript-bound Nostr confirmation-code info string.
+const HKDF_INFO_NOSTR_CONFIRMATION: &str = "secure-send:nostr-session:v2:confirmation";
 /// Transfer salt length (`SALT_LENGTH`).
 pub const SALT_LEN: usize = 16;
 /// Uncompressed P-256 public key length (`0x04 || X || Y`).
@@ -37,6 +38,14 @@ pub struct NostrSessionKeys {
     pub signals: [u8; 32],
     /// Encrypts P2P file content chunks on the data channel.
     pub content: [u8; 32],
+}
+
+/// Handshake values bound into the ECDH confirmation code.
+pub struct ConfirmationCodeBinding<'a> {
+    pub transfer_id: &'a str,
+    pub sender_nonce: &'a str,
+    pub receiver_nonce: &'a str,
+    pub transcript_hash: &'a str,
 }
 
 /// An ephemeral ECDH key pair. The secret scalar never leaves this struct.
@@ -92,6 +101,18 @@ impl EcdhKeyPair {
         })
     }
 
+    /// Derive the eight-character confirmation code the receiver reads to the
+    /// sender before the sender publishes its confirm event.
+    pub fn derive_confirmation_code(
+        &self,
+        peer_public_key: &[u8],
+        salt: &[u8],
+        binding: &ConfirmationCodeBinding<'_>,
+    ) -> Result<String> {
+        let hk = self.shared_secret_hkdf(peer_public_key, salt)?;
+        derive_confirmation_code_from_hkdf(&hk, binding)
+    }
+
     /// Run ECDH against the peer's public key and prepare the salted HKDF the
     /// per-purpose keys expand from.
     fn shared_secret_hkdf(&self, peer_public_key: &[u8], salt: &[u8]) -> Result<Hkdf<Sha256>> {
@@ -108,6 +129,23 @@ impl EcdhKeyPair {
         // input keying material; `raw_secret_bytes()` is exactly that X coordinate.
         Ok(Hkdf::<Sha256>::new(Some(salt), shared.raw_secret_bytes()))
     }
+}
+
+fn derive_confirmation_code_from_hkdf(
+    hkdf: &Hkdf<Sha256>,
+    binding: &ConfirmationCodeBinding<'_>,
+) -> Result<String> {
+    let info = format!(
+        "{HKDF_INFO_NOSTR_CONFIRMATION}|{}|{}|{}|{}",
+        binding.transfer_id,
+        binding.sender_nonce,
+        binding.receiver_nonce,
+        binding.transcript_hash
+    );
+    let mut bytes = [0_u8; CONFIRMATION_CODE_BYTES];
+    hkdf.expand(info.as_bytes(), &mut bytes)
+        .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
+    Ok(encode_crockford_base32(&bytes))
 }
 
 fn expand_key(hk: &Hkdf<Sha256>, info: &[u8]) -> Result<[u8; 32]> {
@@ -183,6 +221,46 @@ mod tests {
         assert_eq!(ka.signals, kb.signals);
         assert_eq!(ka.content, kb.content);
         assert_ne!(ka.signals, ka.content);
+    }
+
+    #[test]
+    fn both_sides_derive_same_confirmation_code() {
+        let sender = EcdhKeyPair::generate().unwrap();
+        let receiver = EcdhKeyPair::generate().unwrap();
+        let salt = generate_salt().unwrap();
+        let binding = ConfirmationCodeBinding {
+            transfer_id: "a1b2c3d4e5f60718",
+            sender_nonce: "c2VuZGVyLW5vbmNlLTAwMDAwMDA=",
+            receiver_nonce: "cmVjZWl2ZXItbm9uY2UtMDAwMDA=",
+            transcript_hash: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        };
+
+        let sender_code = sender
+            .derive_confirmation_code(&receiver.public_key_bytes, &salt, &binding)
+            .unwrap();
+        let receiver_code = receiver
+            .derive_confirmation_code(&sender.public_key_bytes, &salt, &binding)
+            .unwrap();
+
+        assert_eq!(sender_code, receiver_code);
+        assert_eq!(sender_code.len(), 8);
+    }
+
+    #[test]
+    fn confirmation_code_matches_fixed_hkdf_vector() {
+        let ikm: Vec<u8> = (0_u8..32).collect();
+        let hkdf = Hkdf::<Sha256>::new(Some(&[7_u8; 16]), &ikm);
+        let binding = ConfirmationCodeBinding {
+            transfer_id: "a1b2c3d4e5f60718",
+            sender_nonce: "c2VuZGVyLW5vbmNlLTAwMDAwMDA=",
+            receiver_nonce: "cmVjZWl2ZXItbm9uY2UtMDAwMDA=",
+            transcript_hash: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        };
+
+        assert_eq!(
+            derive_confirmation_code_from_hkdf(&hkdf, &binding).unwrap(),
+            "S9MP3G4D"
+        );
     }
 
     #[test]

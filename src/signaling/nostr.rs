@@ -7,8 +7,8 @@
 //!   (`#h`). The payload is sealed with the PIN-derived rendezvous key.
 //! - **Handshake** (kind 24242, `type=claim|confirm`): the receiver claims the
 //!   transfer, the sender confirms. Payloads are sealed with the PIN-derived
-//!   auth key; the echoed nonces and ECDH public keys bind the handshake to
-//!   one rotation generation and rule out relay man-in-the-middle key swaps.
+//!   auth key; the echoed identities, rendezvous transcript, nonces, and ECDH
+//!   public keys bind the handshake to exactly what each peer accepted.
 //! - **Signal** (kind 24242, `type=signal`): WebRTC offer/answer/candidates,
 //!   sealed with the ECDH-derived session signaling key.
 
@@ -19,6 +19,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::crypto::aes;
 use crate::crypto::chunk::fill_random;
@@ -82,6 +83,12 @@ pub struct ClaimPayload {
     pub receiver_ecdh_public_key: String,
     /// Echo of the sender's ECDH public key the receiver will run ECDH against.
     pub sender_ecdh_public_key: String,
+    /// Sender identity from the rendezvous event author.
+    pub sender_pubkey: String,
+    /// Receiver identity, which must match the claim event author.
+    pub receiver_pubkey: String,
+    /// SHA-256 digest of the canonical rendezvous transcript.
+    pub transcript_hash: String,
 }
 
 /// Confirm payload (sender -> receiver), sealed with the same PIN-derived auth
@@ -97,6 +104,41 @@ pub struct ConfirmPayload {
     pub receiver_nonce: String,
     /// Echo of the receiver ECDH public key the sender locked the transfer to.
     pub receiver_ecdh_public_key: String,
+    /// Sender identity, which must match the confirm event author.
+    pub sender_pubkey: String,
+    /// Receiver identity the sender locked onto.
+    pub receiver_pubkey: String,
+    /// Echo of the agreed rendezvous transcript digest.
+    pub transcript_hash: String,
+}
+
+/// Compute secure-send-web's versioned canonical rendezvous transcript digest.
+///
+/// A JSON array fixes field order and JSON escaping prevents field-boundary
+/// ambiguity. `relays` is canonicalized to an empty array when absent.
+pub fn compute_rendezvous_transcript_hash(
+    payload: &RendezvousPayload,
+    salt: &[u8],
+) -> Result<String> {
+    const TRANSCRIPT_LABEL: &str = "secure-send:nostr-rendezvous-transcript:v1";
+
+    let canonical = serde_json::to_vec(&serde_json::json!([
+        TRANSCRIPT_LABEL,
+        payload.payload_type,
+        payload.content_type,
+        payload.transfer_id,
+        payload.sender_pubkey,
+        payload.ecdh_public_key,
+        payload.nonce,
+        payload.relays.as_deref().unwrap_or(&[]),
+        payload.file_name,
+        payload.file_size,
+        payload.file_size_exact,
+        payload.mime_type,
+        hex_lower(salt),
+    ]))?;
+
+    Ok(hex_lower(&Sha256::digest(canonical)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,7 +503,7 @@ pub fn rendezvous_filter(hints: &[String]) -> Filter {
             SingleLetterTag::lowercase(Alphabet::H),
             hints.iter().cloned(),
         )
-        .limit(10)
+        .limit(50)
 }
 
 /// Kind-24242 events addressed to `recipient` for this transfer. The sender
@@ -501,6 +543,16 @@ fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
         .iter()
         .find(|tag| tag.as_slice().first().is_some_and(|k| k == name))
         .and_then(|tag| tag.content())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -594,6 +646,9 @@ mod tests {
             receiver_nonce: "rn".to_string(),
             receiver_ecdh_public_key: "rk".to_string(),
             sender_ecdh_public_key: "sk".to_string(),
+            sender_pubkey: "spk".to_string(),
+            receiver_pubkey: "rpk".to_string(),
+            transcript_hash: "th".to_string(),
         };
         let sealed = seal_handshake_payload(&key, &claim).unwrap();
         let opened: ClaimPayload = open_handshake_payload(&key, &sealed).unwrap();
@@ -604,6 +659,8 @@ mod tests {
         assert_eq!(json["type"], "claim");
         assert!(json.get("senderEcdhPublicKey").is_some());
         assert!(json.get("receiverNonce").is_some());
+        assert_eq!(json["receiverPubkey"], "rpk");
+        assert_eq!(json["transcriptHash"], "th");
 
         // Wrong key must fail to open.
         let wrong = [4u8; aes::AES_KEY_LEN];
@@ -654,5 +711,30 @@ mod tests {
         assert_eq!(json["ecdhPublicKey"], "ek");
         assert_eq!(json["fileSize"], 42);
         assert_eq!(json["fileSizeExact"], true);
+    }
+
+    #[test]
+    fn rendezvous_transcript_matches_web_fixed_vector() {
+        let payload = RendezvousPayload {
+            payload_type: "rendezvous".to_string(),
+            content_type: "file".to_string(),
+            transfer_id: "a1b2c3d4e5f60718".to_string(),
+            sender_pubkey: "a".repeat(64),
+            ecdh_public_key: "BApublicKeyBase64==".to_string(),
+            nonce: "c2VuZGVyLW5vbmNlLTAwMDAwMDA=".to_string(),
+            relays: Some(vec![
+                "wss://relay.one".to_string(),
+                "wss://relay.two".to_string(),
+            ]),
+            file_name: "quarterly-report.pdf".to_string(),
+            file_size: 1_048_576,
+            file_size_exact: true,
+            mime_type: "application/pdf".to_string(),
+        };
+
+        assert_eq!(
+            compute_rendezvous_transcript_hash(&payload, &[7_u8; 32]).unwrap(),
+            "87c2371953bb20ab03e79edc083f0033b6b739550155de7639d793ea48a3e818"
+        );
     }
 }

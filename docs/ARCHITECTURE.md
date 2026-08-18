@@ -14,23 +14,21 @@ exchange.
 **PIN and PIN root.** The PIN is 12 case-sensitive characters (11 data + 1
 position-weighted checksum) from a 69-character alphabet that excludes
 ambiguous `0`, `1`, `I`, `O`, `i`, `l`, and `o`. Entry preserves exact case
-and filters unsupported characters. The PIN root is
-`PBKDF2-SHA256(pin, "secure-send:pin-root:v2", 600k)`; every PIN-scoped value
-is an HKDF-SHA256 expansion off it (salt
-`secure-send:pin:v2`) with a distinct info label:
+and filters unsupported characters. Its leading three characters are a public
+locator segment used only for relay lookup. The PIN root is
+`PBKDF2-SHA256(pin, "secure-send:pin-root:v2", 600k)`.
 
-- `hint:<bucket>` — 8-hex-char event lookup tag, scoped to the 5-minute
-  rotation bucket (`floor(now_ms / 300000)`).
-- `auth` — AES-256-GCM key sealing the claim/confirm handshake payloads.
-- `rendezvous` — AES-256-GCM key sealing the rendezvous payload.
-- `fingerprint` — 12 lowercase hex chars, shown locally on both sides for a
-  human visual check; never published.
+- `hint:<bucket>` — 8-hex-character event lookup tag, derived by HKDF-SHA256
+  directly from the public locator and scoped to the 2-minute rotation bucket
+  (`floor(now_ms / 120000)`). It is a candidate filter, not an authenticator.
+- `auth` — AES-256-GCM key expanded from the PIN root, sealing claim/confirm.
+- `rendezvous` — AES-256-GCM key expanded from the PIN root, sealing metadata.
 
-**Rotation.** The sender mints and publishes a fresh PIN every 5 minutes
+**Rotation.** The sender mints and publishes a fresh PIN every 2 minutes
 (`PIN_ROTATION_MS`), honors only PINs minted in its current or immediately
 previous bucket, and attaches a NIP-40 expiration at the end of the PIN's
 second bucket. The receiver derives hints for its current and previous buckets
-and refuses rendezvous events older than the 10-minute maximum (`PIN_TTL_MS`).
+and refuses rendezvous events older than the 4-minute maximum (`PIN_TTL_MS`).
 The TUI `r` key (and the web app's
 refresh button) mints a fresh PIN immediately, dropping all retained
 generations. The sender keeps rotating for up to 30 minutes — a resource
@@ -50,18 +48,28 @@ backstop, not a security bound — before giving up.
    the freshest candidate, and validates that the sealed payload names the
    event's own author and transfer id (a copied ciphertext republished under
    another identity is rejected).
-3. Receiver publishes a kind `24242` claim (`type=claim`, tags `p=<sender>`,
-   `t`) sealed with the auth key: it echoes the sender's nonce and ECDH key,
-   and contributes a fresh receiver nonce and the receiver's ECDH public key.
+3. Receiver computes a versioned SHA-256 transcript over the rendezvous type,
+   content type, transfer id, sender identity and ECDH key, sender nonce,
+   relays, every file-metadata field, and the salt. It publishes a kind `24242`
+   claim (`type=claim`, tags `p=<sender>`, `t`) sealed with the auth key. The
+   claim echoes the sender nonce and ECDH key, contributes a fresh receiver
+   nonce and ECDH key, and binds both Nostr identities plus the transcript hash.
 4. Sender verifies the claim against every retained PIN generation, locks the
-   transfer to the first valid claimant, stops rotating, and replies with a
-   kind `24242` confirm (`type=confirm`) sealed with the same auth key,
-   echoing both nonces and the receiver's ECDH key.
-5. Both sides run ECDH and derive the session keys with HKDF-SHA256 over the
+   transfer to the first valid claimant, stops rotating, and derives the same
+   ECDH secret as the receiver. Both sides derive an 8-character Crockford
+   Base32 confirmation code from 40 HKDF-SHA256 bits with info
+   `secure-send:nostr-session:v2:confirmation|<transfer-id>|<sender-nonce>|<receiver-nonce>|<transcript-hash>`.
+   The receiver displays it and the sender waits up to 150 seconds for its
+   operator to enter a normalized match. A mismatch is retryable.
+5. Only after the code matches, the sender publishes a kind `24242` confirm
+   (`type=confirm`) sealed with the same auth key. It echoes the transcript,
+   both identities and nonces, and the receiver ECDH key. The receiver allows
+   180 seconds for this human-gated confirm and verifies every echoed field.
+6. Both sides derive the session keys with HKDF-SHA256 over the
    shared X coordinate and the public transfer salt:
    `secure-send:nostr-session:v2:signals` (relay-carried WebRTC signaling) and
    `secure-send:nostr-session:v2:content` (P2P file chunks).
-6. Sender and receiver exchange kind `24242` WebRTC signal events (`offer`,
+7. Sender and receiver exchange kind `24242` WebRTC signal events (`offer`,
    `answer`, `candidate`), encrypted with the session signals key.
    - Signal events use tags `t`, `p=<sender pubkey>`, and `type=signal`.
    - Sender-side answer subscriptions filter by `t`, `p=<sender pubkey>`, and
@@ -72,7 +80,7 @@ backstop, not a security bound — before giving up.
      pending so relay misses do not strand the session, and each bundle's
      events are published concurrently so one slow relay does not serialize
      the exchange.
-7. File bytes transfer directly over the WebRTC data channel using the session
+8. File bytes transfer directly over the WebRTC data channel using the session
    content key. Completion is the data channel `ACK`; no relay event is
    published after signaling.
 

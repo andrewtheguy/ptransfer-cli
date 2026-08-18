@@ -31,8 +31,9 @@ secure-send-cli test receive <PIN> --output ./downloads
 ## CLI to CLI
 
 Run the wizard on both machines — **Send** on one, **Receive** on the other —
-and enter the sender's PIN on the receiving side. The PIN fingerprint shown on
-both screens should match.
+and enter the sender's PIN on the receiving side. Read the receiver's
+8-character confirmation code back to the sender and enter it there to start
+the transfer.
 
 Test mode:
 

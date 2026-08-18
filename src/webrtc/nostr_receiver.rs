@@ -2,8 +2,8 @@
 //!
 //! Handshake: derive the PIN root, locate the sender's rendezvous event via
 //! rotation-bucket hints, claim the transfer with a payload sealed under the
-//! PIN auth key, wait for the sender's confirm, then derive the ECDH session
-//! keys and receive the file over a direct WebRTC data channel.
+//! PIN auth key, show the ECDH-derived confirmation code, wait for the sender's
+//! gated confirm, then receive over a direct WebRTC data channel.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -18,17 +18,17 @@ use rtc::peer_connection::sdp::RTCSessionDescription;
 
 use crate::crypto::aes;
 use crate::crypto::chunk::MAX_MESSAGE_SIZE;
-use crate::crypto::ecdh::{EcdhKeyPair, NostrSessionKeys};
+use crate::crypto::ecdh::{ConfirmationCodeBinding, EcdhKeyPair, NostrSessionKeys};
 use crate::crypto::pin::{
     PIN_HINT_LOOKBACK_BUCKETS, PIN_TTL_MS, PinRoot, is_valid_pin, now_ms, pin_bucket,
-    pin_fingerprint,
+    pin_hint_for_bucket, pin_locator,
 };
 use crate::signaling::nostr::{
     CandidatePayload, ClaimPayload, ConfirmPayload, HandshakeType, NostrClient, RendezvousPayload,
-    Signal, addressed_filter_from_author, create_handshake_event, create_signal_event,
-    generate_handshake_nonce, open_handshake_payload, parse_handshake_event,
-    parse_rendezvous_event, parse_signal_event, rendezvous_filter, seal_handshake_payload,
-    signal_filter_from_sender,
+    Signal, addressed_filter_from_author, compute_rendezvous_transcript_hash,
+    create_handshake_event, create_signal_event, generate_handshake_nonce, open_handshake_payload,
+    parse_handshake_event, parse_rendezvous_event, parse_signal_event, rendezvous_filter,
+    seal_handshake_payload, signal_filter_from_sender,
 };
 use crate::transfer::run_receiver;
 use crate::ui;
@@ -39,10 +39,8 @@ use crate::webrtc::{add_ice_candidate_safely, advertise_max_message_size, candid
 /// Time to establish the WebRTC data channel after the handshake completes.
 /// Mirrors the sender's timeout.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
-/// Time to wait for the sender's confirm after publishing the claim. The
-/// sender confirms immediately upon verifying a claim, so a missing confirm
-/// means the sender is gone or the transfer was claimed by someone else.
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+/// Human-sized window for the sender to receive and type the displayed code.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(180);
 /// Backstop poll for a confirm a relay stored before our subscription landed.
 const CONFIRM_POLL_INTERVAL: Duration = Duration::from_secs(3);
 const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -71,11 +69,10 @@ pub async fn receive_file_nostr(
         bail!("Invalid PIN: check for typos and try again");
     }
     let pin = pin.to_string();
+    let locator = pin_locator(&pin).to_string();
 
-    let fingerprint = pin_fingerprint(&pin);
-
-    // One PBKDF2 stretch per PIN; every lookup hint and handshake key is a
-    // cheap HKDF expansion off this root.
+    // One PBKDF2 stretch per PIN for the sealed-payload keys. Public lookup
+    // hints derive separately from the locator segment below.
     let step = Instant::now();
     ui::status("Deriving PIN lookup keys...");
     let root = tokio::task::spawn_blocking(move || PinRoot::derive(&pin))
@@ -84,15 +81,13 @@ pub async fn receive_file_nostr(
     // Mirror the sender's rule by deriving the current and previous buckets.
     let current_bucket = pin_bucket(now_ms());
     let hints: Vec<String> = (0..=PIN_HINT_LOOKBACK_BUCKETS)
-        .map(|offset| root.hint_for_bucket(current_bucket.saturating_sub(offset)))
+        .map(|offset| {
+            pin_hint_for_bucket(&locator, current_bucket.saturating_sub(offset))
+        })
         .collect();
     let rendezvous_key = root.rendezvous_key();
     let auth_key = root.auth_key();
     ui::status_timed("Derived PIN lookup keys", step.elapsed());
-
-    ui::status(&format!(
-        "PIN fingerprint: {fingerprint} (should match the sender's)"
-    ));
 
     let step = Instant::now();
     ui::status("Connecting to Nostr relays...");
@@ -132,6 +127,23 @@ pub async fn receive_file_nostr(
     let receiver_nonce = generate_handshake_nonce()?;
     let sender_pubkey = rendezvous.sender_pubkey;
     let transfer_id = rendezvous.transfer_id.clone();
+    let receiver_pubkey = client.public_key_hex();
+    let transcript_hash =
+        compute_rendezvous_transcript_hash(&rendezvous.payload, &rendezvous.salt)?;
+
+    // The authenticated rendezvous already commits us to the sender's ECDH
+    // key. Derive and display the human code before publishing the claim; the
+    // sender will not confirm or signal until its operator enters this value.
+    let confirmation_code = ecdh.derive_confirmation_code(
+        &rendezvous.sender_ecdh_public_key,
+        &rendezvous.salt,
+        &ConfirmationCodeBinding {
+            transfer_id: &transfer_id,
+            sender_nonce: &rendezvous.payload.nonce,
+            receiver_nonce: &receiver_nonce,
+            transcript_hash: &transcript_hash,
+        },
+    )?;
 
     let claim = ClaimPayload {
         payload_type: "claim".to_string(),
@@ -140,6 +152,9 @@ pub async fn receive_file_nostr(
         receiver_nonce: receiver_nonce.clone(),
         receiver_ecdh_public_key: receiver_ecdh_public_key_b64.clone(),
         sender_ecdh_public_key: rendezvous.payload.ecdh_public_key.clone(),
+        sender_pubkey: sender_pubkey.to_hex(),
+        receiver_pubkey: receiver_pubkey.clone(),
+        transcript_hash: transcript_hash.clone(),
     };
     let claim_event = create_handshake_event(
         &client,
@@ -149,7 +164,8 @@ pub async fn receive_file_nostr(
         &seal_handshake_payload(&auth_key, &claim)?,
     )?;
 
-    wait_for_confirm(
+    ui::show_confirmation_code(&confirmation_code);
+    let confirm_result = wait_for_confirm(
         &client,
         claim_event,
         &auth_key,
@@ -158,8 +174,12 @@ pub async fn receive_file_nostr(
         &rendezvous.payload.nonce,
         &receiver_nonce,
         &receiver_ecdh_public_key_b64,
+        &receiver_pubkey,
+        &transcript_hash,
     )
-    .await?;
+    .await;
+    ui::hide_confirmation_code();
+    confirm_result?;
 
     // Session keys come from the ephemeral ECDH exchange the PIN just
     // authenticated — the PIN derives no content or signaling keys.
@@ -441,7 +461,8 @@ async fn find_rendezvous_event(
 /// Publish the claim and wait for the sender's confirm, verified under the
 /// same PIN auth key. Subscribes before publishing so the response cannot
 /// slip past, and polls as a backstop for relays that stored the confirm
-/// before the subscription landed.
+/// before the subscription landed. The wait includes time for the two humans
+/// to exchange the displayed confirmation code.
 #[allow(clippy::too_many_arguments)]
 async fn wait_for_confirm(
     client: &NostrClient,
@@ -452,6 +473,8 @@ async fn wait_for_confirm(
     sender_nonce: &str,
     receiver_nonce: &str,
     receiver_ecdh_public_key_b64: &str,
+    receiver_pubkey: &str,
+    transcript_hash: &str,
 ) -> Result<()> {
     let our_pubkey = client.public_key();
     let confirm_filter = addressed_filter_from_author(transfer_id, &our_pubkey, *sender_pubkey);
@@ -463,7 +486,7 @@ async fn wait_for_confirm(
     client.publish(&claim_event).await?;
     ui::status_timed("Published claim to Nostr", step.elapsed());
 
-    ui::status("Waiting for sender confirmation...");
+    ui::status("Waiting for the sender to enter the confirmation code...");
     let mut seen = HashSet::new();
 
     let verify = |event: &Event| -> bool {
@@ -486,6 +509,9 @@ async fn wait_for_confirm(
             && payload.sender_nonce == sender_nonce
             && payload.receiver_nonce == receiver_nonce
             && payload.receiver_ecdh_public_key == receiver_ecdh_public_key_b64
+            && payload.sender_pubkey == sender_pubkey.to_hex()
+            && payload.receiver_pubkey == receiver_pubkey
+            && payload.transcript_hash == transcript_hash
     };
 
     let mut poll = tokio::time::interval(CONFIRM_POLL_INTERVAL);
