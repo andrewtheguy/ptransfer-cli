@@ -12,7 +12,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Stylize;
 use ratatui::widgets::Paragraph;
 
-use crate::crypto::pin::{PIN_LENGTH, is_valid_pin, pin_char, pin_fingerprint};
+use crate::crypto::pin::{PIN_LENGTH, is_valid_pin, pin_char};
 
 use super::dir_picker::{DirPicker, DirPickerStep};
 use super::file_browser::{Browser, BrowserStep};
@@ -28,9 +28,6 @@ pub enum WizardPlan {
     /// Stays in the TUI.
     ReceiveNostr {
         pin: String,
-        /// Fingerprint of `pin`, computed during entry and kept on screen for
-        /// the visual check against the sender's.
-        fingerprint: String,
         output: PathBuf,
     },
     /// Leaves the TUI so the SS03 blobs can be copy/pasted.
@@ -63,9 +60,6 @@ enum Screen {
         input: String,
         /// Insertion point in `input` (0..=len): standard line editing.
         cursor: usize,
-        /// Fingerprint of a complete, valid `input`, shown for comparison
-        /// with the sender's before the user confirms with Enter.
-        fingerprint: Option<String>,
         error: Option<String>,
     },
 }
@@ -133,7 +127,6 @@ fn handle_key(screen: Screen, key: KeyEvent) -> Step {
                         output,
                         input: String::new(),
                         cursor: 0,
-                        fingerprint: None,
                         error: None,
                     })
                 }
@@ -143,9 +136,8 @@ fn handle_key(screen: Screen, key: KeyEvent) -> Step {
             output,
             input,
             cursor,
-            fingerprint,
             error,
-        } => pin_entry_key(output, input, cursor, fingerprint, error, key),
+        } => pin_entry_key(output, input, cursor, error, key),
     }
 }
 
@@ -212,7 +204,6 @@ fn pin_entry_key(
     output: PathBuf,
     mut input: String,
     mut cursor: usize,
-    mut fingerprint: Option<String>,
     mut error: Option<String>,
     key: KeyEvent,
 ) -> Step {
@@ -220,10 +211,8 @@ fn pin_entry_key(
     match key.code {
         KeyCode::Enter => {
             if is_valid_pin(&input) {
-                let fingerprint = fingerprint.unwrap_or_else(|| pin_fingerprint(&input));
                 return Step::Finish(WizardPlan::ReceiveNostr {
                     pin: input,
-                    fingerprint,
                     output,
                 });
             }
@@ -268,17 +257,12 @@ fn pin_entry_key(
 
     if edited {
         error = None;
-        // Shown for the visual check against the sender's fingerprint before
-        // Enter confirms.
-        fingerprint =
-            (input.len() == PIN_LENGTH && is_valid_pin(&input)).then(|| pin_fingerprint(&input));
     }
 
     Step::Continue(Screen::PinEntry {
         output,
         input,
         cursor,
-        fingerprint,
         error,
     })
 }
@@ -299,14 +283,10 @@ fn handle_paste(screen: Screen, pasted: &str) -> Step {
             invalid = true;
         }
     }
-    let fingerprint =
-        (input.len() == PIN_LENGTH && is_valid_pin(&input)).then(|| pin_fingerprint(&input));
-
     Step::Continue(Screen::PinEntry {
         output,
         cursor: input.len(),
         input,
-        fingerprint,
         error: invalid.then(|| "Unsupported characters were removed".to_string()),
     })
 }
@@ -383,7 +363,6 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
         Screen::PinEntry {
             input,
             cursor,
-            fingerprint,
             error,
             ..
         } => {
@@ -402,10 +381,9 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
             widgets::input_line(f, line, "PIN: ", input, *cursor);
             if let Some(error) = error {
                 widgets::error_line(f, extra, error);
-            } else if let Some(fp) = fingerprint {
-                // Dimmed so the hex fingerprint is never mistaken for the PIN.
+            } else if input.len() == PIN_LENGTH && is_valid_pin(input) {
                 f.render_widget(
-                    Paragraph::new(format!("PIN fingerprint: {fp} (should match the sender's)"))
+                    Paragraph::new("After you start, read the confirmation code to the sender.")
                         .dim(),
                     extra,
                 );
@@ -425,14 +403,12 @@ mod tests {
             output: PathBuf::from("."),
             input: "old".to_string(),
             cursor: 3,
-            fingerprint: None,
             error: None,
         };
 
         let Step::Continue(Screen::PinEntry {
             input,
             cursor,
-            fingerprint,
             error,
             ..
         }) = handle_paste(screen, "AB*CD EFGHJKLc")
@@ -442,7 +418,6 @@ mod tests {
 
         assert_eq!(input, "ABCDEFGHJKLc");
         assert_eq!(cursor, PIN_LENGTH);
-        assert!(fingerprint.is_some());
         assert_eq!(
             error.as_deref(),
             Some("Unsupported characters were removed")

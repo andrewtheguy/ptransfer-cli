@@ -51,11 +51,17 @@ pub enum UiEvent {
         file_name: String,
         size: u64,
         pin: String,
-        fingerprint: String,
     },
     /// The PIN is no longer valid (a receiver claimed the transfer); stop
     /// displaying it.
     HidePin,
+    /// Receiver-side code the user must read to the sender.
+    ShowConfirmationCode(String),
+    HideConfirmationCode,
+    /// Sender-side request for the code being shown by the receiver.
+    ConfirmationCodeInput {
+        reply: oneshot::Sender<String>,
+    },
     Incoming {
         file_name: String,
         size: u64,
@@ -165,15 +171,13 @@ pub fn progress_end() {
     }
 }
 
-/// Present the sender's PIN (stdout in plain mode, panel in the TUI) along
-/// with what is being sent and the fingerprint for visual verification.
-pub fn show_pin(file_name: &str, file_size: u64, pin: &str, fingerprint: &str) {
+/// Present the sender's PIN (stdout in plain mode, panel in the TUI).
+pub fn show_pin(file_name: &str, file_size: u64, pin: &str) {
     if let Some(tx) = sink() {
         let _ = tx.send(UiEvent::ShowPin {
             file_name: file_name.to_string(),
             size: file_size,
             pin: pin.to_string(),
-            fingerprint: fingerprint.to_string(),
         });
         return;
     }
@@ -182,11 +186,64 @@ pub fn show_pin(file_name: &str, file_size: u64, pin: &str, fingerprint: &str) {
         format_bytes(file_size)
     );
     println!("{pin}");
-    eprintln!("PIN fingerprint: {fingerprint} (should match the receiver's)");
+    eprintln!("After the receiver enters it, ask them for their confirmation code.");
     eprintln!(
         "(a fresh PIN is printed every {} min)",
         crate::crypto::pin::PIN_ROTATION_MS / 60_000
     );
+}
+
+/// Display the ECDH-derived code the receiver must read to the sender.
+pub fn show_confirmation_code(code: &str) {
+    if let Some(tx) = sink() {
+        let _ = tx.send(UiEvent::ShowConfirmationCode(code.to_string()));
+        return;
+    }
+    eprintln!("Read this confirmation code to the sender:");
+    println!("{code}");
+    let _ = std::io::stdout().flush();
+}
+
+/// Stop displaying the receiver's confirmation code once confirm arrives.
+pub fn hide_confirmation_code() {
+    if let Some(tx) = sink() {
+        let _ = tx.send(UiEvent::HideConfirmationCode);
+    }
+}
+
+/// Read one sender-side confirmation-code attempt.
+pub async fn prompt_confirmation_code() -> Result<String> {
+    if let Some(tx) = sink() {
+        let (reply, rx) = oneshot::channel();
+        tx.send(UiEvent::ConfirmationCodeInput { reply })
+            .map_err(|_| anyhow!("TUI closed"))?;
+        return rx.await.map_err(|_| anyhow!("TUI closed"));
+    }
+
+    eprint!("Enter the receiver's 8-character confirmation code: ");
+    std::io::stderr().flush()?;
+    // A detached OS thread keeps the read from blocking Tokio runtime shutdown
+    // if the surrounding 150-second confirmation deadline expires. Tokio's
+    // blocking pool waits for stuck stdin reads when the runtime is dropped.
+    let (reply, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let mut input = String::new();
+        let result = std::io::stdin()
+            .read_line(&mut input)
+            .map_err(anyhow::Error::from)
+            .and_then(|_| validate_confirmation_code_input(&input));
+        let _ = reply.send(result);
+    });
+    rx.await.map_err(|_| anyhow!("confirmation input closed"))?
+}
+
+fn validate_confirmation_code_input(input: &str) -> Result<String> {
+    let input = input.trim();
+    if input.is_empty() {
+        Err(anyhow!("no confirmation code entered"))
+    } else {
+        Ok(input.to_string())
+    }
 }
 
 /// Stop displaying the PIN: a receiver claimed the transfer, so every shown
@@ -279,4 +336,23 @@ pub async fn prompt_code(prompt: &str) -> Result<String> {
     }
 
     Ok(collected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_code_input_rejects_whitespace_only() {
+        let error = validate_confirmation_code_input(" \t\r\n ").unwrap_err();
+        assert_eq!(error.to_string(), "no confirmation code entered");
+    }
+
+    #[test]
+    fn confirmation_code_input_returns_trimmed_value() {
+        assert_eq!(
+            validate_confirmation_code_input("  A4BC-D9ZT \n").unwrap(),
+            "A4BC-D9ZT"
+        );
+    }
 }

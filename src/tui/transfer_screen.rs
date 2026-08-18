@@ -15,6 +15,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::crypto::base32::{CONFIRMATION_CODE_LENGTH, normalize_crockford_base32};
 use crate::crypto::pin::{PIN_ROTATION_MS, PIN_WAIT_TIMEOUT_MS};
 use crate::ui::{Direction, FileExistsChoice, UiEvent};
 use crate::util::{OnConflict, calc_percent, format_bytes};
@@ -44,6 +45,10 @@ pub async fn run(terminal: &mut DefaultTerminal, plan: WizardPlan) -> Result<()>
 
             maybe_event = events.next() => {
                 let event = maybe_event.ok_or_else(|| anyhow!("input stream closed"))??;
+                if let Event::Paste(text) = event {
+                    state.paste_confirmation_code(&text);
+                    continue;
+                }
                 let Event::Key(key) = event else { continue };
                 if key.kind != KeyEventKind::Press {
                     continue;
@@ -64,6 +69,8 @@ pub async fn run(terminal: &mut DefaultTerminal, plan: WizardPlan) -> Result<()>
                     {
                         let _ = reply.send(choice);
                     }
+                } else if state.confirmation_prompt.is_some() {
+                    state.confirmation_code_key(key.code);
                 } else if state.outcome.is_some() {
                     // Any key on the final screen exits with the transfer's result.
                     return state.outcome.take().expect("checked above");
@@ -113,9 +120,6 @@ async fn run_plan(plan: WizardPlan) -> Result<()> {
 
 struct State {
     title: &'static str,
-    /// PIN + fingerprint panel: sender gets everything from
-    /// [`UiEvent::ShowPin`]; receiver shows the fingerprint of the PIN
-    /// entered in the wizard.
     outgoing: Option<String>,
     pin: Option<String>,
     /// When the displayed PIN was minted; restarts the rotation countdown on
@@ -124,21 +128,27 @@ struct State {
     /// When the first PIN appeared: start of the overall wait window, stable
     /// across rotations.
     wait_started_at: Option<Instant>,
-    fingerprint: Option<String>,
     incoming: Option<String>,
+    /// Receiver-side code to read to the sender.
+    confirmation_code: Option<String>,
+    /// Sender-side text entry while the transfer task waits for an attempt.
+    confirmation_prompt: Option<ConfirmationPrompt>,
     status_log: Vec<String>,
     progress: Option<(Direction, u64, u64)>,
     modal: Option<(PathBuf, oneshot::Sender<FileExistsChoice>)>,
     outcome: Option<Result<()>>,
 }
 
+struct ConfirmationPrompt {
+    input: String,
+    reply: oneshot::Sender<String>,
+}
+
 impl State {
     fn new(plan: &WizardPlan) -> Self {
-        let (title, fingerprint) = match plan {
-            WizardPlan::SendNostr(_) => ("sending", None),
-            WizardPlan::ReceiveNostr { fingerprint, .. } => {
-                ("receiving", Some(fingerprint.clone()))
-            }
+        let title = match plan {
+            WizardPlan::SendNostr(_) => "sending",
+            WizardPlan::ReceiveNostr { .. } => "receiving",
             WizardPlan::SendManual(_) | WizardPlan::ReceiveManual { .. } => {
                 unreachable!("manual plans run outside the TUI")
             }
@@ -149,8 +159,9 @@ impl State {
             pin: None,
             pin_shown_at: None,
             wait_started_at: None,
-            fingerprint,
             incoming: None,
+            confirmation_code: None,
+            confirmation_prompt: None,
             status_log: Vec::new(),
             progress: None,
             modal: None,
@@ -179,19 +190,24 @@ impl State {
                 file_name,
                 size,
                 pin,
-                fingerprint,
             } => {
                 self.outgoing = Some(format!("{file_name} ({})", format_bytes(size)));
                 self.pin = Some(pin);
                 self.pin_shown_at = Some(Instant::now());
                 self.wait_started_at.get_or_insert_with(Instant::now);
-                self.fingerprint = Some(fingerprint);
             }
             UiEvent::HidePin => {
                 self.pin = None;
                 self.pin_shown_at = None;
                 self.wait_started_at = None;
-                self.fingerprint = None;
+            }
+            UiEvent::ShowConfirmationCode(code) => self.confirmation_code = Some(code),
+            UiEvent::HideConfirmationCode => self.confirmation_code = None,
+            UiEvent::ConfirmationCodeInput { reply } => {
+                self.confirmation_prompt = Some(ConfirmationPrompt {
+                    input: String::new(),
+                    reply,
+                });
             }
             UiEvent::Incoming { file_name, size } => {
                 self.incoming = Some(format!("{file_name} ({})", format_bytes(size)));
@@ -200,7 +216,45 @@ impl State {
         }
     }
 
+    fn confirmation_code_key(&mut self, key: KeyCode) {
+        let Some(prompt) = self.confirmation_prompt.as_mut() else {
+            return;
+        };
+
+        match key {
+            KeyCode::Enter if prompt.input.len() == CONFIRMATION_CODE_LENGTH => {
+                let prompt = self
+                    .confirmation_prompt
+                    .take()
+                    .expect("confirmation prompt checked above");
+                let _ = prompt.reply.send(prompt.input);
+            }
+            KeyCode::Backspace => {
+                prompt.input.pop();
+            }
+            KeyCode::Char(character) if prompt.input.len() < CONFIRMATION_CODE_LENGTH => {
+                let normalized = normalize_crockford_base32(&character.to_string());
+                if let Some(character) = normalized.chars().next() {
+                    prompt.input.push(character);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn paste_confirmation_code(&mut self, pasted: &str) {
+        let Some(prompt) = self.confirmation_prompt.as_mut() else {
+            return;
+        };
+        prompt.input = normalize_crockford_base32(pasted)
+            .chars()
+            .take(CONFIRMATION_CODE_LENGTH)
+            .collect();
+    }
+
     fn finish(&mut self, outcome: Result<()>) {
+        self.confirmation_prompt = None;
+        self.confirmation_code = None;
         let line = match &outcome {
             Ok(()) => "Done — press any key to exit".to_string(),
             Err(e) => format!("Failed: {e:#} — press any key to exit"),
@@ -227,6 +281,8 @@ impl State {
             "press any key to exit"
         } else if self.modal.is_some() {
             "o overwrite · r rename · c cancel"
+        } else if self.confirmation_prompt.is_some() {
+            "type the code · Enter submit · Ctrl-C abort"
         } else if self.pin.is_some() {
             "r new PIN · Ctrl-C abort"
         } else {
@@ -236,6 +292,8 @@ impl State {
 
         if let Some((path, _)) = &self.modal {
             self.render_modal(f, inner, path);
+        } else if let Some(prompt) = &self.confirmation_prompt {
+            self.render_confirmation_prompt(f, inner, &prompt.input);
         }
     }
 
@@ -248,11 +306,11 @@ impl State {
             // Label, PIN, rotation countdown, wait backstop.
             height += 4;
         }
-        if self.fingerprint.is_some() {
-            height += 1;
-        }
         if self.incoming.is_some() {
             height += 1;
+        }
+        if self.confirmation_code.is_some() {
+            height += 3;
         }
         if height > 0 { height + 1 } else { 0 }
     }
@@ -270,16 +328,13 @@ impl State {
             lines.push(self.rotation_line());
             lines.push(self.wait_backstop_line());
         }
-        if let Some(fp) = &self.fingerprint {
-            // Dimmed so the hex fingerprint is never mistaken for the PIN.
-            lines.push(
-                format!("PIN fingerprint: {fp} (should match the other side)")
-                    .dim()
-                    .into(),
-            );
-        }
         if let Some(incoming) = &self.incoming {
             lines.push(format!("Incoming file: {incoming}").bold().into());
+        }
+        if let Some(code) = &self.confirmation_code {
+            lines.push("Read this confirmation code to the sender:".bold().into());
+            lines.push(code.clone().green().bold().into());
+            lines.push("The sender must enter it before anything is sent.".dim().into());
         }
         if !lines.is_empty() {
             f.render_widget(Paragraph::new(lines), area);
@@ -378,5 +433,48 @@ impl State {
             .wrap(Wrap { trim: false }),
             body,
         );
+    }
+
+    fn render_confirmation_prompt(&self, f: &mut Frame, inner: Rect, input: &str) {
+        let area = widgets::centered(inner, 58, 7);
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Confirmation code ");
+        let body = block.inner(area);
+        f.render_widget(block, area);
+        let padded = format!(
+            "{}{}",
+            input,
+            "_".repeat(CONFIRMATION_CODE_LENGTH.saturating_sub(input.len()))
+        );
+        f.render_widget(
+            Paragraph::new(format!(
+                "Enter the code shown by the receiver:\n\n{padded}\n\nEnter submits when all 8 characters are present."
+            )),
+            body,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn confirmation_prompt_normalizes_paste_before_submitting() {
+        let mut state = State::new(&WizardPlan::SendNostr(Vec::new()));
+        let (reply, received) = oneshot::channel();
+        state.apply(UiEvent::ConfirmationCodeInput { reply });
+
+        state.paste_confirmation_code("a4bc-d9zt");
+        assert_eq!(
+            state.confirmation_prompt.as_ref().unwrap().input,
+            "A4BCD9ZT"
+        );
+        state.confirmation_code_key(KeyCode::Enter);
+
+        assert_eq!(received.await.unwrap(), "A4BCD9ZT");
+        assert!(state.confirmation_prompt.is_none());
     }
 }

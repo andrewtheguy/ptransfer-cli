@@ -1,9 +1,8 @@
 //! Nostr Auto Exchange sender compatible with secure-send-web.
 //!
 //! Handshake: publish a rendezvous event per PIN rotation, wait for a
-//! receiver's claim sealed with a still-honored PIN generation, lock the
-//! transfer to that receiver with a confirm, then derive the ECDH session
-//! keys and stream the file over a direct WebRTC data channel.
+//! receiver's claim sealed with a still-honored PIN generation, require the
+//! receiver's ECDH-derived confirmation code, then confirm and transfer.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -17,17 +16,21 @@ use rtc::peer_connection::sdp::RTCSessionDescription;
 
 use crate::archive::SendSource;
 use crate::crypto::aes;
+use crate::crypto::base32::{constant_time_equal, normalize_crockford_base32};
 use crate::crypto::chunk::MAX_MESSAGE_SIZE;
-use crate::crypto::ecdh::{EcdhKeyPair, NostrSessionKeys, generate_salt};
+use crate::crypto::ecdh::{
+    ConfirmationCodeBinding, EcdhKeyPair, NostrSessionKeys, generate_salt,
+};
 use crate::crypto::pin::{
     PIN_ROTATION_MS, PIN_WAIT_TIMEOUT_MS, PinRoot, generate_pin, generate_transfer_id,
-    is_pin_bucket_active, now_ms, pin_bucket, pin_fingerprint,
+    is_pin_bucket_active, now_ms, pin_bucket, pin_hint_for_bucket, pin_locator,
 };
 use crate::signaling::nostr::{
     self, CandidatePayload, ClaimPayload, ConfirmPayload, HandshakeType, NostrClient,
     RendezvousPayload, Signal, addressed_filter, addressed_filter_from_author,
-    create_handshake_event, create_rendezvous_event, create_signal_event, generate_handshake_nonce,
-    open_handshake_payload, parse_handshake_event, parse_signal_event, seal_handshake_payload,
+    compute_rendezvous_transcript_hash, create_handshake_event, create_rendezvous_event,
+    create_signal_event, generate_handshake_nonce, open_handshake_payload, parse_handshake_event,
+    parse_signal_event, seal_handshake_payload,
 };
 use crate::transfer::run_sender;
 use crate::ui;
@@ -38,6 +41,8 @@ use crate::webrtc::{add_ice_candidate_safely, advertise_max_message_size, candid
 /// Total time the sender keeps rotating/waiting before giving up
 /// ([`PIN_WAIT_TIMEOUT_MS`]).
 const WAIT_FOR_RECEIVER_TIMEOUT: Duration = Duration::from_millis(PIN_WAIT_TIMEOUT_MS);
+/// Human confirmation entry window; shorter than the receiver's confirm wait.
+const CONFIRM_CODE_ENTRY_TIMEOUT: Duration = Duration::from_secs(150);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 const OFFER_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -48,6 +53,7 @@ struct PinGeneration {
     auth_key: [u8; aes::AES_KEY_LEN],
     nonce: String,
     bucket: u64,
+    transcript_hash: String,
 }
 
 /// A verified receiver claim: the transfer is locked to this peer.
@@ -119,14 +125,34 @@ pub async fn send_file_nostr(source: &SendSource) -> Result<()> {
     ui::hide_pin();
     ui::status("Receiver claim verified.");
 
+    // Derive the session and human confirmation code from the same ephemeral
+    // ECDH secret. Nothing is confirmed or signaled until the operator enters
+    // the code shown by the receiver.
+    let session_keys: NostrSessionKeys =
+        ecdh.derive_nostr_session_keys(&claim.receiver_ecdh_public_key, &salt)?;
+    let expected_confirmation_code = ecdh.derive_confirmation_code(
+        &claim.receiver_ecdh_public_key,
+        &salt,
+        &ConfirmationCodeBinding {
+            transfer_id: &transfer_id,
+            sender_nonce: &claim.payload.sender_nonce,
+            receiver_nonce: &claim.payload.receiver_nonce,
+            transcript_hash: &claim.payload.transcript_hash,
+        },
+    )?;
+    wait_for_confirmation_code(&expected_confirmation_code).await?;
+
     // Mutual proof: confirm under the same PIN-derived auth key that sealed
-    // the claim, echoing both nonces and the receiver key we locked onto.
+    // the claim, echoing the transcript, identities, nonces, and receiver key.
     let confirm = ConfirmPayload {
         payload_type: "confirm".to_string(),
         transfer_id: transfer_id.clone(),
         sender_nonce: claim.payload.sender_nonce.clone(),
         receiver_nonce: claim.payload.receiver_nonce.clone(),
         receiver_ecdh_public_key: claim.payload.receiver_ecdh_public_key.clone(),
+        sender_pubkey: client.public_key_hex(),
+        receiver_pubkey: claim.receiver_pubkey.to_hex(),
+        transcript_hash: claim.payload.transcript_hash.clone(),
     };
     let confirm_event = create_handshake_event(
         &client,
@@ -139,11 +165,6 @@ pub async fn send_file_nostr(source: &SendSource) -> Result<()> {
     ui::status("Publishing confirmation to Nostr...");
     client.publish(&confirm_event).await?;
     ui::status_timed("Published confirmation to Nostr", step.elapsed());
-
-    // Session keys come from the ephemeral ECDH exchange the PIN just
-    // authenticated — the PIN derives no content or signaling keys.
-    let session_keys: NostrSessionKeys =
-        ecdh.derive_nostr_session_keys(&claim.receiver_ecdh_public_key, &salt)?;
 
     ui::status("Creating P2P connection...");
     let mut peer = WebRtcPeer::new(ICE_GATHER_TIMEOUT).await?;
@@ -272,6 +293,29 @@ pub async fn send_file_nostr(source: &SendSource) -> Result<()> {
     Ok(())
 }
 
+async fn wait_for_confirmation_code(expected: &str) -> Result<()> {
+    ui::status("Ask the receiver for the confirmation code shown on their screen.");
+
+    let entry = async {
+        loop {
+            let entered = ui::prompt_confirmation_code().await?;
+            let normalized = normalize_crockford_base32(&entered);
+            if constant_time_equal(&normalized, expected) {
+                return Ok::<(), anyhow::Error>(());
+            }
+            ui::status("Confirmation code did not match. Check it and try again.");
+        }
+    };
+
+    tokio::time::timeout(CONFIRM_CODE_ENTRY_TIMEOUT, entry)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("Confirmation code was not entered in time. Start a new transfer.")
+        })??;
+    ui::status("Confirmation code matched.");
+    Ok(())
+}
+
 /// Everything a rendezvous publication needs; stable across rotations.
 struct RendezvousContext<'a> {
     client: &'a NostrClient,
@@ -314,28 +358,25 @@ impl RendezvousContext<'_> {
             file_size_exact: self.file_size_exact,
             mime_type: self.mime_type.to_string(),
         };
+        let transcript_hash = compute_rendezvous_transcript_hash(&payload, self.salt)?;
         let encrypted = aes::encrypt(&root.rendezvous_key(), &serde_json::to_vec(&payload)?)?;
         let event = create_rendezvous_event(
             self.client,
             &encrypted,
             self.salt,
             self.transfer_id,
-            &root.hint_for_bucket(bucket),
+            &pin_hint_for_bucket(pin_locator(&pin), bucket),
             bucket,
         )?;
         self.client.publish(&event).await?;
 
-        ui::show_pin(
-            self.file_name,
-            self.file_size,
-            &pin,
-            &pin_fingerprint(&pin),
-        );
+        ui::show_pin(self.file_name, self.file_size, &pin);
 
         Ok(PinGeneration {
             auth_key: root.auth_key(),
             nonce,
             bucket,
+            transcript_hash,
         })
     }
 }
@@ -407,7 +448,13 @@ async fn wait_for_verified_claim(
                     continue;
                 }
                 if let Some(claim) =
-                    verify_claim(&event, &generations, rendezvous.transfer_id, rendezvous.ecdh_public_key_b64)
+                    verify_claim(
+                        &event,
+                        &generations,
+                        rendezvous.transfer_id,
+                        rendezvous.ecdh_public_key_b64,
+                        sender_pubkey,
+                    )
                 {
                     break claim;
                 }
@@ -427,6 +474,7 @@ fn verify_claim(
     generations: &[PinGeneration],
     transfer_id: &str,
     sender_ecdh_public_key_b64: &str,
+    sender_pubkey: &PublicKey,
 ) -> Option<VerifiedClaim> {
     let handshake = parse_handshake_event(event)?;
     if handshake.handshake_type != HandshakeType::Claim || handshake.transfer_id != transfer_id {
@@ -453,6 +501,9 @@ fn verify_claim(
             || payload.sender_nonce != generation.nonce
             || payload.receiver_nonce.is_empty()
             || payload.sender_ecdh_public_key != sender_ecdh_public_key_b64
+            || payload.sender_pubkey != sender_pubkey.to_hex()
+            || payload.receiver_pubkey != event.pubkey.to_hex()
+            || payload.transcript_hash != generation.transcript_hash
             || !is_pin_bucket_active(generation.bucket, now_ms())
         {
             return None;
