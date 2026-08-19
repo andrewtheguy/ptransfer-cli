@@ -234,14 +234,18 @@ impl PakeRun {
         if bool::from(unblinded.is_identity()) {
             bail!("invalid PAKE message: unblinds to the identity");
         }
-        let shared = compress(&(unblinded * *self.ephemeral))?;
+        let mut shared = compress(&(unblinded * *self.ephemeral))?;
 
         let (pa, pb) = match self.role {
             PakeRole::Sender => (&self.message[..], peer_message),
             PakeRole::Receiver => (peer_message, &self.message[..]),
         };
 
-        let mut transcript = Vec::new();
+        // Hash incrementally instead of buffering: the transcript's last two
+        // fields are the shared element K and the password scalar w, and a
+        // growing Vec copies them into successively larger allocations, leaving
+        // both in freed heap blocks that the final wipe cannot reach.
+        let mut transcript = Sha256::new();
         push_framed(
             &mut transcript,
             format!("{PAKE_CONTEXT}|{}", identities.transfer_id).as_bytes(),
@@ -253,17 +257,17 @@ impl PakeRun {
         push_framed(&mut transcript, &shared);
         push_framed(&mut transcript, &self.secret);
 
-        let digest = Sha256::digest(&transcript);
-        transcript.fill(0);
+        let digest = transcript.finalize();
+        shared.fill(0);
         Ok(PakeRoot::from_digest(digest.into()))
     }
 }
 
-/// Append one transcript field with RFC 9382's 8-byte little-endian length
+/// Absorb one transcript field with RFC 9382's 8-byte little-endian length
 /// framing, so no field can shift bytes into a neighbor.
-fn push_framed(out: &mut Vec<u8>, data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u64).to_le_bytes());
-    out.extend_from_slice(data);
+fn push_framed(out: &mut Sha256, data: &[u8]) {
+    out.update((data.len() as u64).to_le_bytes());
+    out.update(data);
 }
 
 fn compress(point: &ProjectivePoint) -> Result<[u8; PAKE_MESSAGE_LEN]> {

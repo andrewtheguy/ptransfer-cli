@@ -32,8 +32,12 @@ file/folder selection, signaling mode, output directory, and PIN entry.
   than route file bytes through a relay server.
 - No QR code support in the CLI.
 
-The file bytes flow over the WebRTC data channel. Nostr relays carry only
-encrypted handshake metadata and WebRTC signaling events.
+The file bytes flow over the WebRTC data channel. Nostr relays carry only the
+handshake and WebRTC signaling events. The rendezvous event that advertises a
+transfer is plaintext JSON — a blinded SPAKE2 element and routing fields, with
+no file metadata — because encrypting it under a PIN-derived key would
+reintroduce the offline guessing target the PAKE removes. The claim, confirm
+(which carries the file metadata), and signaling payloads are all encrypted.
 
 ## Install
 

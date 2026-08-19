@@ -497,7 +497,12 @@ fn build_claims(
         let Ok(root) = pake.finish(&candidate.pake_message, &identities) else {
             continue;
         };
-        let seal_keys = root.handshake_seal_keys(&candidate.salt)?;
+        // Same treatment: the salt rides on an unauthenticated rendezvous event,
+        // so a forged one carrying a short salt must cost that candidate, not
+        // the whole receive.
+        let Ok(seal_keys) = root.handshake_seal_keys(&candidate.salt) else {
+            continue;
+        };
 
         // Hash the rendezvous we actually acted on. The sender compares it with
         // the one it published and drops the claim on any difference, so a
@@ -562,8 +567,23 @@ async fn wait_for_confirm(
 
     let step = Instant::now();
     ui::status("Publishing claim to Nostr...");
+    // Most candidates are hint collisions or forgeries; only one can be our
+    // sender, and we cannot tell which. A relay refusing any single claim (a
+    // burst of up to MAX_CLAIM_CANDIDATES events invites rate limiting) must
+    // not strand the rest, so keep going and fail only if none landed.
+    let mut published = 0usize;
+    let mut last_failure = None;
     for claim in &claims {
-        client.publish(&claim.claim_event).await?;
+        match client.publish(&claim.claim_event).await {
+            Ok(()) => published += 1,
+            Err(error) => last_failure = Some(error),
+        }
+    }
+    if published == 0 {
+        client.unsubscribe(&sub_id).await;
+        return Err(last_failure
+            .unwrap_or_else(|| anyhow::anyhow!("no claim was published"))
+            .context("Failed to publish any claim to Nostr"));
     }
     ui::status_timed("Published claim to Nostr", step.elapsed());
 
@@ -579,17 +599,17 @@ async fn wait_for_confirm(
                 event = next_event(&mut notifications) => {
                     let event = event?;
                     if seen.insert(event.id)
-                        && let Some(index) = match_confirm(&event, &claims, receiver_pubkey)
+                        && let Some(matched) = match_confirm(&event, &claims, receiver_pubkey)
                     {
-                        return Ok::<_, anyhow::Error>(index);
+                        return Ok::<_, anyhow::Error>(matched);
                     }
                 }
                 _ = poll.tick() => {
                     for event in client.fetch(filter.clone()).await? {
                         if seen.insert(event.id)
-                            && let Some(index) = match_confirm(&event, &claims, receiver_pubkey)
+                            && let Some(matched) = match_confirm(&event, &claims, receiver_pubkey)
                         {
-                            return Ok(index);
+                            return Ok(matched);
                         }
                     }
                 }
