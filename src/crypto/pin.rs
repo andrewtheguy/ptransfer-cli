@@ -1,38 +1,40 @@
-//! Rotating short PIN and PIN-root key derivation for secure-send-web's
-//! Nostr "Auto Exchange" mode.
+//! Rotating short PIN for secure-send-web's Nostr "Auto Exchange" mode.
 //!
 //! The PIN is 12 case-sensitive characters (11 data + 1 checksum). The sender
 //! mints a fresh PIN every [`PIN_ROTATION_MS`] and honors PINs minted in the
 //! current or immediately previous wall-clock bucket, so any single PIN is
 //! valid for roughly 2–4 minutes.
 //!
-//! The public rendezvous hint is an HKDF derivation from the PIN's leading
-//! three-character locator. The sealed rendezvous and handshake payloads use
-//! keys derived from a PBKDF2-SHA-256 stretch of the whole PIN. The PIN derives
-//! no content-encryption keys — those come from the ephemeral ECDH exchange it
-//! authenticates (see [`crate::crypto::ecdh`]).
+//! The PIN has exactly two jobs: its leading three-character locator derives
+//! the public rendezvous hint, and the whole PIN reduces to the SPAKE2 password
+//! scalar that authenticates the key exchange (see [`crate::crypto::spake2`]).
+//! It derives no content or signaling keys — those are HKDF derivations off the
+//! PAKE root, which requires ephemeral scalars both peers discard. There is
+//! deliberately no key stretching: stretching only helps when something permits
+//! offline guessing, and with a balanced PAKE nothing does.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use hkdf::Hkdf;
-use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 
-use super::aes::AES_KEY_LEN;
 use super::chunk::fill_random;
 
 /// Total PIN length, including the trailing checksum character.
 pub const PIN_LENGTH: usize = 12;
 const PIN_CHECKSUM_LENGTH: usize = 1;
-/// Leading characters used to derive the public rendezvous lookup hint.
+/// Leading characters used to derive the public rendezvous lookup hint. They
+/// are public by construction: a hint has at most `PIN_CHARSET.len() ** 3`
+/// preimages per rotation bucket, so anyone can enumerate locator -> hint and
+/// read the locator straight off a relay event. The remaining data characters
+/// are the only entropy the SPAKE2 handshake rests on.
 pub const PIN_LOCATOR_LENGTH: usize = 3;
 
-/// Case-sensitive alphabet excluding ambiguous `0`, `1`, `I`, `O`, `i`, `l`,
-/// and `o`, with symbols available on the iOS "123" keyboard. Matches
-/// secure-send-web's `PIN_CHARSET`.
-const PIN_CHARSET: &[u8] =
-    b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789-/:;()$&@?!.,\"";
+/// Case-sensitive alphabet of letters and digits excluding ambiguous `0`, `1`,
+/// `I`, `O`, `i`, `l`, and `o`. 55 characters, no symbols, so the PIN types
+/// cleanly on any mobile keyboard. Matches secure-send-web's `PIN_CHARSET`.
+const PIN_CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
 
 /// How often the sender mints and publishes a fresh PIN.
 pub const PIN_ROTATION_MS: u64 = 120_000;
@@ -51,14 +53,39 @@ pub const PIN_TTL_MS: u64 = PIN_ROTATION_MS * PIN_ACTIVE_BUCKETS;
 /// mirrors the sender's exact current-or-previous-bucket acceptance rule.
 pub const PIN_HINT_LOOKBACK_BUCKETS: u64 = PIN_ACTIVE_BUCKETS - 1;
 
-const PBKDF2_ITERATIONS: u32 = 600_000;
-/// Domain-separation salt for the PBKDF2 PIN-root derivation (public).
-const PIN_ROOT_SALT: &str = "secure-send:pin-root:v2";
-/// HKDF salt shared by every PIN-scoped derivation.
-const PIN_HKDF_SALT: &str = "secure-send:pin:v2";
+/// How many SPAKE2 claim verifications the sender runs per PIN generation.
+/// With a balanced PAKE the only way to test a PIN guess is to publish a claim
+/// and have the sender try to verify it, so this cap — not any key stretching —
+/// is the online guessing bound. Every published element is single-use, so each
+/// failed verification also costs the sender one replacement rendezvous
+/// publish; the budget bounds that churn too. Exhausting it stalls that
+/// generation; rotation mints a fresh budget with the next PIN.
+pub const CLAIM_VERIFY_LIMIT: u32 = 100;
 
-/// PIN hint length in hex characters (32 bits): the Nostr `#h` filter tag.
+/// How many rendezvous candidates the receiver claims per attempt. The hint is
+/// keyed by the public locator alone, so unrelated transfers collide on it and
+/// a plaintext rendezvous cannot be told apart locally. Each claim hands
+/// whoever published that candidate one online guess at our PIN, so the cap
+/// also bounds what a flood of forged rendezvous events can extract.
+pub const MAX_CLAIM_CANDIDATES: usize = 8;
+
+/// Total claims one receive attempt may publish: the initial candidates plus
+/// re-claims against replacement rendezvous events (the sender's elements are
+/// single-use, so a claim that lost the race to a spent element must be redone
+/// against its replacement). This cap is what bounds the online guesses a
+/// claimed candidate's author can milk by rotating replacement elements at us.
+pub const MAX_CLAIM_ATTEMPTS: usize = 16;
+
+/// HKDF salt for the locator-keyed rendezvous hint derivation. A public
+/// constant for domain separation only: the hint is keyed by the public locator
+/// segment and never by any PIN secret.
+const PIN_HINT_HKDF_SALT: &str = "secure-send:pin:v4";
+
+/// PIN hint length in hex characters: the Nostr `#h` filter tag. It carries at
+/// most log2(55³) ≈ 17.3 bits regardless of width, because it is a function of
+/// the locator alone.
 const PIN_HINT_LENGTH: usize = 8;
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -140,11 +167,16 @@ pub fn pin_locator(pin: &str) -> &str {
 
 /// Compute the public, per-bucket rendezvous hint from the locator segment.
 ///
-/// The locator is intentionally the only input key material: publishing a
-/// value derived from the full PIN would create a cheap oracle for guesses at
-/// its secret characters.
+/// The locator is intentionally the only input key material: publishing a value
+/// derived from the full PIN would hand an attacker a cheap oracle for
+/// confirming guesses at its secret characters — the one offline foothold the
+/// SPAKE2 handshake otherwise eliminates.
+///
+/// With roughly 17.3 bits behind it the hint is a filter, not an identifier.
+/// Unrelated transfers in the same bucket do collide, and callers must be
+/// prepared to walk several candidates.
 pub fn pin_hint_for_bucket(locator: &str, bucket: u64) -> String {
-    let hkdf = Hkdf::<Sha256>::new(Some(PIN_HKDF_SALT.as_bytes()), locator.as_bytes());
+    let hkdf = Hkdf::<Sha256>::new(Some(PIN_HINT_HKDF_SALT.as_bytes()), locator.as_bytes());
     let mut bytes = [0_u8; PIN_HINT_LENGTH / 2];
     hkdf.expand(format!("hint:{bucket}").as_bytes(), &mut bytes)
         .expect("HKDF output length is always valid here");
@@ -155,55 +187,6 @@ pub fn generate_transfer_id() -> Result<String> {
     let mut bytes = [0u8; 8];
     fill_random(&mut bytes)?;
     Ok(hex_lower(&bytes))
-}
-
-/// The PIN root: the PBKDF2-SHA-256 stretch of the PIN, ready for cheap HKDF
-/// expansions. The expensive stretch runs exactly once per PIN; brute-forcing
-/// any derived value still costs the full PBKDF2 work factor per PIN guess.
-///
-/// CPU-bound (~600k PBKDF2 iterations): call [`PinRoot::derive`] from
-/// `spawn_blocking` in async contexts.
-pub struct PinRoot {
-    hkdf: Hkdf<Sha256>,
-}
-
-impl PinRoot {
-    pub fn derive(pin: &str) -> Self {
-        let mut root = [0u8; 32];
-        pbkdf2_hmac::<Sha256>(
-            pin.as_bytes(),
-            PIN_ROOT_SALT.as_bytes(),
-            PBKDF2_ITERATIONS,
-            &mut root,
-        );
-        Self {
-            hkdf: Hkdf::new(Some(PIN_HKDF_SALT.as_bytes()), &root),
-        }
-    }
-
-    fn expand(&self, info: &str, out: &mut [u8]) {
-        self.hkdf
-            .expand(info.as_bytes(), out)
-            .expect("HKDF output length is always valid here");
-    }
-
-    fn aes_key(&self, info: &str) -> [u8; AES_KEY_LEN] {
-        let mut key = [0u8; AES_KEY_LEN];
-        self.expand(info, &mut key);
-        key
-    }
-
-    /// The AES-GCM key that seals the claim/confirm handshake payloads. A
-    /// payload that decrypts under this key proves the author knows the PIN.
-    pub fn auth_key(&self) -> [u8; AES_KEY_LEN] {
-        self.aes_key("auth")
-    }
-
-    /// The AES-GCM key for the rendezvous event payload (transfer id, sender
-    /// ECDH public key, handshake nonce, file metadata).
-    pub fn rendezvous_key(&self) -> [u8; AES_KEY_LEN] {
-        self.aes_key("rendezvous")
-    }
 }
 
 /// The wall-clock PIN bucket at `now_ms`.
@@ -240,54 +223,51 @@ mod tests {
     }
 
     #[test]
+    fn charset_carries_no_symbols_or_ambiguous_characters() {
+        assert_eq!(PIN_CHARSET.len(), 55);
+        assert!(
+            PIN_CHARSET
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() && !b"01".contains(b))
+        );
+        for ambiguous in b"01IOilo" {
+            assert!(!PIN_CHARSET.contains(ambiguous));
+        }
+    }
+
+    #[test]
     fn checksum_rejects_typo_and_transposition() {
-        // Fixed vector: checksum of "ABCDEFGHJKL" is 'c',
+        // Fixed vector: checksum of "ABCDEFGHJKL" is 'A',
         // verified against secure-send-web's computeChecksum.
-        assert!(is_valid_pin("ABCDEFGHJKLc"));
-        assert!(!is_valid_pin("ABCDefGHJKLc")); // substitution
-        assert!(!is_valid_pin("BACDEFGHJKLc")); // transposition
+        assert!(is_valid_pin("ABCDEFGHJKLA"));
+        assert!(!is_valid_pin("ABCDefGHJKLA")); // substitution
+        assert!(!is_valid_pin("BACDEFGHJKLA")); // transposition
         assert!(!is_valid_pin("ABCDEFGHJKL")); // too short
     }
 
     #[test]
     fn validation_is_case_sensitive() {
-        assert!(is_valid_pin("AbCDefGHJKL&"));
-        assert!(!is_valid_pin("ABCDEFGHJKL&"));
+        assert!(is_valid_pin("AbCDefGhjkmQ"));
+        assert!(!is_valid_pin("ABCDEFGHJKMQ"));
     }
 
     #[test]
     fn pin_char_preserves_supported_characters() {
         assert_eq!(pin_char('a'), Some('a'));
         assert_eq!(pin_char('A'), Some('A'));
-        assert_eq!(pin_char('-'), Some('-'));
-        assert_eq!(pin_char('"'), Some('"'));
+        assert_eq!(pin_char('9'), Some('9'));
         assert_eq!(pin_char('0'), None);
         assert_eq!(pin_char('o'), None);
+        assert_eq!(pin_char('-'), None);
         assert_eq!(pin_char('*'), None);
     }
 
     #[test]
-    fn pin_root_matches_web_vectors() {
-        // Parity with secure-send-web's importPinRoot + HKDF derivations,
-        // verified against the Web Crypto API (PBKDF2-SHA-256, 600k
-        // iterations, salt "secure-send:pin-root:v2"; HKDF-SHA-256, salt
-        // "secure-send:pin:v2").
-        let root = PinRoot::derive("ABCDEFGHJKLc");
-        assert_eq!(
-            hex_lower(&root.auth_key()),
-            "65528de3152b27ac4282046a042074e9bc595422338b2815eec855ee38669db0"
-        );
-        assert_eq!(
-            hex_lower(&root.rendezvous_key()),
-            "dbb7e0aaf348bdfa69967e0d2cad4dea985f709c9c07234c836f2aba541cb6e4"
-        );
-    }
-
-    #[test]
     fn locator_hint_depends_only_on_locator_and_bucket() {
+        // Fixed vector from secure-send-web's computePinHintFromLocator.
         let bucket = 36_947_145;
-        assert_eq!(pin_locator("ABCDEFGHJKLc"), "ABC");
-        assert_eq!(pin_hint_for_bucket("ABC", bucket), "92c523ee");
+        assert_eq!(pin_locator("ABCDEFGHJKLA"), "ABC");
+        assert_eq!(pin_hint_for_bucket("ABC", bucket), "ae4c9f57");
         assert_eq!(
             pin_hint_for_bucket("ABC", bucket),
             pin_hint_for_bucket(pin_locator("ABCzzzzzzzzQ"), bucket)

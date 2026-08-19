@@ -1,7 +1,7 @@
 //! Sans-I/O WebRTC peer and data-channel adapter.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -589,20 +589,50 @@ async fn run_peer(
     }
 }
 
-fn discover_local_ip() -> IpAddr {
-    let fallback = IpAddr::V4(Ipv4Addr::LOCALHOST);
-    let Ok(socket) = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
-        return fallback;
-    };
-    if socket.connect((Ipv4Addr::new(1, 1, 1, 1), 3478)).is_err() {
-        return fallback;
-    }
-    socket.local_addr().map(|addr| addr.ip()).unwrap_or(fallback)
+/// The address the OS would route to the internet over, one per IP family.
+///
+/// This is an ordering hint only: [`bind_candidate_sockets`] appends every
+/// other usable address from `if_addrs`, so coverage never depends on it. It
+/// exists so a host with several interfaces (VPN, container bridge, WSL) leads
+/// with the one that actually reaches the internet.
+///
+/// Both families are probed because a host may route over only one of them, and
+/// an unroutable family must contribute nothing rather than a placeholder — a
+/// fabricated loopback address would be published to the peer as a host
+/// candidate that can never connect. An empty result is fine: `if_addrs` still
+/// supplies the addresses, and `bind_candidate_sockets` has its own last-resort
+/// loopback bind for a host with no usable interface at all.
+///
+/// No packets are sent. `connect` on a UDP socket is a local route lookup, so
+/// this stays safe offline.
+fn discover_local_ips() -> Vec<IpAddr> {
+    const PROBES: [(IpAddr, IpAddr); 2] = [
+        (
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        ),
+        (
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+        ),
+    ];
+
+    PROBES
+        .iter()
+        .filter_map(|(bind_addr, probe_addr)| {
+            let socket = std::net::UdpSocket::bind(SocketAddr::new(*bind_addr, 0)).ok()?;
+            socket.connect(SocketAddr::new(*probe_addr, 3478)).ok()?;
+            socket.local_addr().ok().map(|addr| addr.ip())
+        })
+        // A host that blackholes the probe address over `lo` would otherwise
+        // hand back a loopback address, which is the one thing this must never
+        // contribute.
+        .filter(|ip| !ip.is_loopback())
+        .collect()
 }
 
 async fn bind_candidate_sockets() -> Result<Vec<Arc<UdpSocket>>> {
-    let preferred_ip = discover_local_ip();
-    let mut ips = vec![preferred_ip];
+    let mut ips = discover_local_ips();
     match if_addrs::get_if_addrs() {
         Ok(interfaces) => {
             for interface in interfaces {
@@ -922,4 +952,36 @@ pub async fn open_and_detach(
     })
     .await
     .map_err(|_| anyhow::anyhow!("Timed out waiting for the data channel to open"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The probe is an ordering hint, so an offline or single-stack host must
+    /// simply contribute fewer addresses — never a placeholder. A loopback or
+    /// duplicated entry here would be published to the peer as a host candidate
+    /// that can never connect.
+    #[test]
+    fn discovered_ips_are_routable_and_one_per_family() {
+        let ips = discover_local_ips();
+
+        assert!(ips.len() <= 2, "at most one address per IP family");
+        assert!(ips.iter().all(|ip| !ip.is_loopback()));
+        assert!(ips.iter().all(|ip| !ip.is_unspecified()));
+        assert!(ips.iter().filter(|ip| ip.is_ipv4()).count() <= 1);
+        assert!(ips.iter().filter(|ip| ip.is_ipv6()).count() <= 1);
+    }
+
+    /// Every address the probe returns must be bindable, since
+    /// `bind_candidate_sockets` turns each one into a UDP socket and a host
+    /// candidate.
+    #[tokio::test]
+    async fn discovered_ips_are_bindable() {
+        for ip in discover_local_ips() {
+            UdpSocket::bind(SocketAddr::new(ip, 0))
+                .await
+                .unwrap_or_else(|error| panic!("probe returned unbindable {ip}: {error}"));
+        }
+    }
 }

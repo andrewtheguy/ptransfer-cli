@@ -14,10 +14,11 @@ file/folder selection, signaling mode, output directory, and PIN entry.
 
 - Nostr PIN signaling by default, compatible with the web app's Auto Exchange
   mode: a case-sensitive 12-character PIN (fresh every 2 minutes; the sender
-  can also mint a new one on demand with `r`) authenticates an ephemeral ECDH
-  exchange that derives the actual signaling and content keys. The receiver
-  then reads an 8-character confirmation code to the sender; nothing is sent
-  until the sender enters a match.
+  can also mint a new one on demand with `r`) drives a SPAKE2
+  password-authenticated key exchange that derives the actual signaling and
+  content keys. Nothing published to a relay can test a PIN guess offline. The
+  receiver then reads an 8-character confirmation code to the sender; nothing
+  is sent until the sender enters a match.
 - Manual SS03 copy/paste signaling, compatible with the web app's manual
   exchange codes. When chosen in the wizard, the TUI exits back to the normal
   terminal so the offer/response codes can be copy/pasted.
@@ -31,8 +32,12 @@ file/folder selection, signaling mode, output directory, and PIN entry.
   than route file bytes through a relay server.
 - No QR code support in the CLI.
 
-The file bytes flow over the WebRTC data channel. Nostr relays carry only
-encrypted handshake metadata and WebRTC signaling events.
+The file bytes flow over the WebRTC data channel. Nostr relays carry only the
+handshake and WebRTC signaling events. The rendezvous event that advertises a
+transfer is plaintext JSON — a blinded SPAKE2 element and routing fields, with
+no file metadata — because encrypting it under a PIN-derived key would
+reintroduce the offline guessing target the PAKE removes. The claim, confirm
+(which carries the file metadata), and signaling payloads are all encrypted.
 
 ## Install
 
@@ -136,20 +141,27 @@ receiver takes the offer code as an argument and prints a response code.
 The CLI follows `secure-send-web` as the source of truth:
 
 - Rendezvous event: Nostr kind `24243`, tagged with a rotation-bucket-scoped
-  PIN hint and a NIP-40 expiration; payload sealed with the PIN-derived
-  rendezvous key.
+  PIN hint and a NIP-40 expiration. The payload is plaintext JSON carrying a
+  blinded SPAKE2 element — nothing in it is PIN-testable, and file metadata is
+  deliberately absent.
 - Claim/confirm handshake and WebRTC signal events: Nostr kind `24242`.
 - Default relays match `secure-send-web`.
-- The PIN root is PBKDF2-SHA256 (600k iterations, salt
-  `secure-send:pin-root:v2`); the handshake auth and rendezvous keys are HKDF
-  expansions off that root. The public lookup hint is derived only from the
-  PIN's leading 3-character locator. The PIN derives no content keys —
-  signaling, content, and the 8-character confirmation code come from an
-  ephemeral P-256 ECDH exchange authenticated by the claim/confirm handshake.
+- The PIN reduces to the SPAKE2 password scalar `w` (HKDF-SHA256 to 384 bits,
+  reduced mod the P-256 order); there is no key stretching because nothing
+  published permits offline guessing. The public lookup hint is derived only
+  from the PIN's leading 3-character locator. Every key — the claim/confirm
+  seals, signaling, content, and the 8-character confirmation code — is an HKDF
+  expansion off the SPAKE2 transcript root, which requires ephemeral scalars
+  both peers discard.
 - Claim and confirm payloads bind both Nostr identities and a versioned SHA-256
-  digest of the complete rendezvous transcript. The sender publishes no
-  confirm or WebRTC signal until its operator enters the receiver's matching
-  ECDH-derived confirmation code.
+  digest of the complete rendezvous transcript; the confirm additionally
+  delivers the file metadata, whose own digest is bound into the confirmation
+  code. The sender publishes its confirm as soon as a claim verifies, then
+  publishes no WebRTC signal and no file byte until its operator enters the
+  receiver's matching confirmation code.
+- Online guessing is metered rather than stretched: the sender runs at most 100
+  claim verifications per PIN generation, and the receiver claims at most 8
+  hint-colliding rendezvous candidates per attempt.
 - PIN rotation: fresh PIN every 2 minutes; only PINs minted in the current or
   immediately previous bucket are honored (roughly 2–4 minutes). The sender
   waits up to 30 minutes for a receiver before giving up.

@@ -1,9 +1,14 @@
 //! Nostr Auto Exchange receiver compatible with secure-send-web.
 //!
-//! Handshake: derive the PIN root, locate the sender's rendezvous event via
-//! rotation-bucket hints, claim the transfer with a payload sealed under the
-//! PIN auth key, show the ECDH-derived confirmation code, wait for the sender's
-//! gated confirm, then receive over a direct WebRTC data channel.
+//! Handshake: reduce the PIN to its SPAKE2 password scalar, locate candidate
+//! rendezvous events via rotation-bucket hints, run the receiver side of the
+//! PAKE against each candidate and publish one sealed claim per candidate,
+//! wait for the confirm that opens under one of those sessions (which delivers
+//! the file metadata) while re-claiming any replacement rendezvous the sender
+//! publishes (its elements are single-use, so a claim that lost a race to a
+//! spent element is answered with a fresh element instead of a confirm),
+//! display the confirmation code, then receive over a direct WebRTC data
+//! channel once the sender's operator has typed it.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -18,17 +23,20 @@ use rtc::peer_connection::sdp::RTCSessionDescription;
 
 use crate::crypto::aes;
 use crate::crypto::chunk::MAX_MESSAGE_SIZE;
-use crate::crypto::ecdh::{ConfirmationCodeBinding, EcdhKeyPair, NostrSessionKeys};
+use crate::crypto::kdf::{ConfirmationCodeBinding, HandshakeSealKeys, NostrSessionKeys, PakeRoot};
 use crate::crypto::pin::{
-    PIN_HINT_LOOKBACK_BUCKETS, PIN_TTL_MS, PinRoot, is_valid_pin, now_ms, pin_bucket,
-    pin_hint_for_bucket, pin_locator,
+    MAX_CLAIM_ATTEMPTS, MAX_CLAIM_CANDIDATES, PIN_HINT_LOOKBACK_BUCKETS, PIN_TTL_MS, is_valid_pin,
+    now_ms, pin_bucket, pin_hint_for_bucket, pin_locator,
+};
+use crate::crypto::spake2::{
+    PakeIdentities, PakeRole, PakeRun, derive_pake_secret, is_valid_pake_message,
 };
 use crate::signaling::nostr::{
     CandidatePayload, ClaimPayload, ConfirmPayload, HandshakeType, NostrClient, RendezvousPayload,
-    Signal, addressed_filter_from_author, compute_rendezvous_transcript_hash,
-    create_handshake_event, create_signal_event, generate_handshake_nonce, open_handshake_payload,
-    parse_handshake_event, parse_rendezvous_event, parse_signal_event, rendezvous_filter,
-    seal_handshake_payload, signal_filter_from_sender,
+    Signal, TransferMetadata, compute_rendezvous_transcript_hash, compute_transfer_metadata_hash,
+    confirm_filter, create_handshake_event, create_signal_event, generate_handshake_nonce,
+    open_handshake_payload, parse_handshake_event, parse_rendezvous_event, parse_signal_event,
+    rendezvous_filter, rendezvous_kind, seal_handshake_payload, signal_filter_from_sender,
 };
 use crate::transfer::run_receiver;
 use crate::ui;
@@ -36,28 +44,51 @@ use crate::util::{OnConflict, format_bytes, resolve_destination};
 use crate::webrtc::common::{DcMessenger, WebRtcPeer, open_and_detach};
 use crate::webrtc::{add_ice_candidate_safely, advertise_max_message_size, candidate_strings};
 
-/// Time to establish the WebRTC data channel after the handshake completes.
+/// Time to establish the WebRTC data channel once signaling has started.
 /// Mirrors the sender's timeout.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
-/// Human-sized window for the sender to receive and type the displayed code.
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(180);
+/// Wait for the sender's confirm after the claims are published. The sender
+/// confirms as soon as a claim verifies — no human is in that leg — so this only
+/// needs to cover relay latency. It is also where a mistyped-but-checksum-valid
+/// PIN surfaces.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
+/// Wait for the sender's first WebRTC signal after its confirm. Generous
+/// because a human is in the loop: the sender publishes nothing until its
+/// operator types the code this side is displaying.
+const OFFER_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
 /// Backstop poll for a confirm a relay stored before our subscription landed.
 const CONFIRM_POLL_INTERVAL: Duration = Duration::from_secs(3);
 const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 const ANSWER_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// A decrypted, validated rendezvous event.
-struct RendezvousMatch {
+/// A structurally valid rendezvous event, before any PAKE work.
+struct RendezvousCandidate {
     payload: RendezvousPayload,
     salt: Vec<u8>,
-    transfer_id: String,
     sender_pubkey: PublicKey,
-    sender_ecdh_public_key: Vec<u8>,
+    pake_message: Vec<u8>,
 }
 
-fn decode_ecdh_public_key(b64: &str) -> Option<Vec<u8>> {
-    let bytes = STANDARD.decode(b64).ok()?;
-    (bytes.len() == 65 && bytes[0] == 0x04).then_some(bytes)
+/// One rendezvous candidate the receiver has run its side of the PAKE against
+/// and claimed. The hint is a filter, not an identifier, and the rendezvous is
+/// plaintext, so the receiver cannot know which candidate is its sender until a
+/// confirm opens under one of these sessions' keys.
+struct ClaimCandidate {
+    transfer_id: String,
+    sender_pubkey: PublicKey,
+    sender_nonce: String,
+    receiver_nonce: String,
+    salt: Vec<u8>,
+    transcript_hash: String,
+    root: PakeRoot,
+    seal_keys: HandshakeSealKeys,
+    claim_event: Event,
+}
+
+/// The candidate whose sender confirmed, plus the metadata that confirm carried.
+struct ConfirmedSession {
+    candidate: ClaimCandidate,
+    metadata: TransferMetadata,
 }
 
 pub async fn receive_file_nostr(
@@ -68,26 +99,18 @@ pub async fn receive_file_nostr(
     if !is_valid_pin(pin) {
         bail!("Invalid PIN: check for typos and try again");
     }
-    let pin = pin.to_string();
-    let locator = pin_locator(&pin).to_string();
+    let locator = pin_locator(pin).to_string();
 
-    // One PBKDF2 stretch per PIN for the sealed-payload keys. Public lookup
-    // hints derive separately from the locator segment below.
-    let step = Instant::now();
-    ui::status("Deriving PIN lookup keys...");
-    let root = tokio::task::spawn_blocking(move || PinRoot::derive(&pin))
-        .await
-        .context("PIN derivation task failed")?;
-    // Mirror the sender's rule by deriving the current and previous buckets.
+    // Nothing here waits on a key stretch — with the PAKE there is none. The
+    // PIN reduces to its password scalar and derives the public lookup hints
+    // from its locator segment.
+    let pake_secret = derive_pake_secret(pin);
+    // Mirror the sender's acceptance rule by deriving the current and previous
+    // buckets.
     let current_bucket = pin_bucket(now_ms());
     let hints: Vec<String> = (0..=PIN_HINT_LOOKBACK_BUCKETS)
-        .map(|offset| {
-            pin_hint_for_bucket(&locator, current_bucket.saturating_sub(offset))
-        })
+        .map(|offset| pin_hint_for_bucket(&locator, current_bucket.saturating_sub(offset)))
         .collect();
-    let rendezvous_key = root.rendezvous_key();
-    let auth_key = root.auth_key();
-    ui::status_timed("Derived PIN lookup keys", step.elapsed());
 
     let step = Instant::now();
     ui::status("Connecting to Nostr relays...");
@@ -95,100 +118,79 @@ pub async fn receive_file_nostr(
     ui::status_timed("Connected to Nostr relays", step.elapsed());
 
     ui::status("Searching for sender...");
-    let rendezvous = find_rendezvous_event(&client, &hints, &rendezvous_key).await?;
+    let candidates = find_rendezvous_candidates(&client, &hints).await?;
 
-    let file_name = rendezvous.payload.file_name.clone();
-    let file_size = rendezvous.payload.file_size;
-    let file_size_exact = rendezvous.payload.file_size_exact;
-    let mime_type = rendezvous.payload.mime_type.clone();
+    // Claim every candidate: run our side of the SPAKE2 exchange against each
+    // one's element and seal a claim under the resulting session's claim key.
+    // Only the candidate our sender actually published can ever answer with a
+    // confirm that opens under its session's confirm key.
+    let receiver_pubkey = client.public_key_hex();
+    let claims = build_claims(&client, candidates, &pake_secret, &receiver_pubkey)?;
+    if claims.is_empty() {
+        bail!(
+            "No claimable transfer found for this PIN. Check the code currently shown on the sender."
+        );
+    }
 
-    if file_size_exact && file_size == 0 {
+    let session =
+        wait_for_confirm(&client, claims, &receiver_pubkey, &pake_secret, &hints).await?;
+    let metadata = &session.metadata;
+
+    if metadata.content_type != "file" {
+        bail!("Transfer describes unsupported content");
+    }
+    if metadata.file_size_exact && metadata.file_size == 0 {
         bail!("Transfer describes an empty file");
     }
-    if file_size > MAX_MESSAGE_SIZE {
+    if metadata.file_size > MAX_MESSAGE_SIZE {
         bail!(
             "Transfer is {}, which exceeds the {} limit",
-            format_bytes(file_size),
+            format_bytes(metadata.file_size),
             format_bytes(MAX_MESSAGE_SIZE)
         );
     }
 
-    ui::incoming(&file_name, file_size, Some(&mime_type));
-    let Some(dest) = resolve_destination(output_dir, &file_name, on_conflict).await? else {
-        ui::status("Cancelled.");
-        client.disconnect().await;
-        return Ok(());
-    };
-
-    // Claim the transfer: prove PIN knowledge and bind our ephemeral ECDH key
-    // (and the sender's) into the sealed payload.
-    let ecdh = EcdhKeyPair::generate()?;
-    let receiver_ecdh_public_key_b64 = STANDARD.encode(ecdh.public_key_bytes);
-    let receiver_nonce = generate_handshake_nonce()?;
-    let sender_pubkey = rendezvous.sender_pubkey;
-    let transfer_id = rendezvous.transfer_id.clone();
-    let receiver_pubkey = client.public_key_hex();
-    let transcript_hash =
-        compute_rendezvous_transcript_hash(&rendezvous.payload, &rendezvous.salt)?;
-
-    // The authenticated rendezvous already commits us to the sender's ECDH
-    // key. Derive and display the human code before publishing the claim; the
-    // sender will not confirm or signal until its operator enters this value.
-    let confirmation_code = ecdh.derive_confirmation_code(
-        &rendezvous.sender_ecdh_public_key,
-        &rendezvous.salt,
+    // The confirm proved the sender ran our PAKE session, and its sealed
+    // metadata is now on the table. The sender publishes nothing further — no
+    // WebRTC offer, no file byte — until its operator types this code. Someone
+    // who front-ran us with a stolen PIN holds a different SPAKE2 session, so
+    // the code on their screen is not the one the sender is about to be told.
+    let candidate = &session.candidate;
+    let metadata_hash = compute_transfer_metadata_hash(metadata)?;
+    let confirmation_code = candidate.root.confirmation_code(
+        &candidate.salt,
         &ConfirmationCodeBinding {
-            transfer_id: &transfer_id,
-            sender_nonce: &rendezvous.payload.nonce,
-            receiver_nonce: &receiver_nonce,
-            transcript_hash: &transcript_hash,
+            transfer_id: &candidate.transfer_id,
+            sender_nonce: &candidate.sender_nonce,
+            receiver_nonce: &candidate.receiver_nonce,
+            transcript_hash: &candidate.transcript_hash,
+            metadata_hash: &metadata_hash,
         },
     )?;
-
-    let claim = ClaimPayload {
-        payload_type: "claim".to_string(),
-        transfer_id: transfer_id.clone(),
-        sender_nonce: rendezvous.payload.nonce.clone(),
-        receiver_nonce: receiver_nonce.clone(),
-        receiver_ecdh_public_key: receiver_ecdh_public_key_b64.clone(),
-        sender_ecdh_public_key: rendezvous.payload.ecdh_public_key.clone(),
-        sender_pubkey: sender_pubkey.to_hex(),
-        receiver_pubkey: receiver_pubkey.clone(),
-        transcript_hash: transcript_hash.clone(),
-    };
-    let claim_event = create_handshake_event(
-        &client,
-        &sender_pubkey,
-        &transfer_id,
-        HandshakeType::Claim,
-        &seal_handshake_payload(&auth_key, &claim)?,
-    )?;
-
     ui::show_confirmation_code(&confirmation_code);
-    let confirm_result = wait_for_confirm(
-        &client,
-        claim_event,
-        &auth_key,
-        &transfer_id,
-        &sender_pubkey,
-        &rendezvous.payload.nonce,
-        &receiver_nonce,
-        &receiver_ecdh_public_key_b64,
-        &receiver_pubkey,
-        &transcript_hash,
-    )
-    .await;
-    ui::hide_confirmation_code();
-    confirm_result?;
 
-    // Session keys come from the ephemeral ECDH exchange the PIN just
-    // authenticated — the PIN derives no content or signaling keys.
-    let session_keys: NostrSessionKeys =
-        ecdh.derive_nostr_session_keys(&rendezvous.sender_ecdh_public_key, &rendezvous.salt)?;
+    let file_name = metadata.file_name.clone();
+    let file_size = metadata.file_size;
+    let file_size_exact = metadata.file_size_exact;
+    ui::incoming(&file_name, file_size, Some(&metadata.mime_type));
+    let dest = match resolve_destination(output_dir, &file_name, on_conflict).await? {
+        Some(dest) => dest,
+        None => {
+            ui::hide_confirmation_code();
+            ui::status("Cancelled.");
+            client.disconnect().await;
+            return Ok(());
+        }
+    };
 
-    let connection_deadline = Instant::now() + CONNECTION_TIMEOUT;
+    // Session keys are HKDF derivations off the same SPAKE2 root — the PIN
+    // authenticated the exchange, and the exchange's fresh ephemeral scalars
+    // supply the entropy.
+    let session_keys: NostrSessionKeys = candidate.root.session_keys(&candidate.salt)?;
+    let transfer_id = candidate.transfer_id.clone();
+    let sender_pubkey = candidate.sender_pubkey;
 
-    ui::status("Waiting for sender P2P offer...");
+    ui::status("Waiting for the sender to enter the confirmation code...");
     let signal_filter = signal_filter_from_sender(&transfer_id, sender_pubkey);
     let mut notifications = client.notifications();
     let sub_id = client.subscribe(signal_filter.clone()).await?;
@@ -211,7 +213,8 @@ pub async fn receive_file_nostr(
         }
     }
 
-    tokio::time::timeout(remaining_connection_timeout(connection_deadline)?, async {
+    // The sender's first signal is what says the operator's code matched.
+    let offer_wait = tokio::time::timeout(OFFER_WAIT_TIMEOUT, async {
         while offer_sdp.is_none() {
             let event = next_event(&mut notifications).await?;
             handle_pre_offer_signal(
@@ -226,10 +229,14 @@ pub async fn receive_file_nostr(
         }
         Ok::<(), anyhow::Error>(())
     })
-    .await
-    .map_err(|_| anyhow::anyhow!("WebRTC connection timeout"))??;
+    .await;
+    ui::hide_confirmation_code();
+    offer_wait.map_err(|_| {
+        anyhow::anyhow!("The sender did not enter the confirmation code in time. Start a new transfer.")
+    })??;
 
     let offer_sdp = offer_sdp.context("missing sender offer")?;
+    let connection_deadline = Instant::now() + CONNECTION_TIMEOUT;
 
     ui::status("Creating P2P answer...");
     let mut peer = WebRtcPeer::new(ICE_GATHER_TIMEOUT).await?;
@@ -374,16 +381,17 @@ fn remaining_connection_timeout(deadline: Instant) -> Result<Duration> {
     Ok(remaining)
 }
 
-/// Locate and decrypt the sender's rendezvous event.
+/// Locate structurally valid rendezvous candidates, newest first, one per
+/// transfer id and at most [`MAX_CLAIM_CANDIDATES`].
 ///
-/// Binds the authenticated payload to the plaintext routing data: the payload
-/// must name the event's own author and transfer id, so a copied ciphertext
-/// republished under another identity is rejected.
-async fn find_rendezvous_event(
+/// The rendezvous is plaintext, so nothing here can tell which candidate is our
+/// sender — validation is structural only: the payload must name the event's own
+/// author and transfer id (so a copied payload republished under another
+/// identity is rejected) and carry a valid non-identity curve point.
+async fn find_rendezvous_candidates(
     client: &NostrClient,
     hints: &[String],
-    rendezvous_key: &[u8; aes::AES_KEY_LEN],
-) -> Result<RendezvousMatch> {
+) -> Result<Vec<RendezvousCandidate>> {
     let step = Instant::now();
     ui::status("Fetching rendezvous events from Nostr...");
     let mut events = client.fetch(rendezvous_filter(hints)).await?;
@@ -400,136 +408,267 @@ async fn find_rendezvous_event(
 
     events.sort_by_key(|event| std::cmp::Reverse(event.created_at.as_secs()));
 
-    ui::status("Decrypting candidate transfer metadata...");
-    let decrypt_start = Instant::now();
     let mut saw_expired = false;
-    let mut candidates_checked = 0usize;
+    let mut candidates: Vec<RendezvousCandidate> = Vec::new();
+
     for event in events {
+        if candidates.len() >= MAX_CLAIM_CANDIDATES {
+            break;
+        }
+
         // A rendezvous event is only claimable while the sender still honors
-        // its PIN generation.
+        // its PIN generation. Tracked here (not in the shared helper) so the
+        // "PIN expired" message can distinguish stale transfers.
         let created_at_ms = event.created_at.as_secs() * 1000;
         if now_ms().saturating_sub(created_at_ms) > PIN_TTL_MS {
             saw_expired = true;
             continue;
         }
 
-        let Some((_hint, salt, transfer_id, encrypted_payload)) = parse_rendezvous_event(&event)
-        else {
+        let Some(candidate) = parse_claimable_rendezvous(&event) else {
             continue;
         };
-        candidates_checked += 1;
-
-        // Not sealed with our PIN (stale event sharing the hint tag)? Try the
-        // next candidate.
-        let Ok(decrypted) = aes::decrypt(rendezvous_key, &encrypted_payload) else {
-            continue;
-        };
-        let Ok(payload) = serde_json::from_slice::<RendezvousPayload>(&decrypted) else {
-            continue;
-        };
-
-        let Some(sender_ecdh_public_key) = decode_ecdh_public_key(&payload.ecdh_public_key) else {
-            continue;
-        };
-        if payload.payload_type != "rendezvous"
-            || payload.transfer_id != transfer_id
-            || payload.sender_pubkey != event.pubkey.to_hex()
-            || payload.nonce.is_empty()
+        // The sender's current and previous rotation both match our hints and
+        // share a transfer id — claim only the newest generation.
+        if candidates
+            .iter()
+            .any(|existing| existing.payload.transfer_id == candidate.payload.transfer_id)
         {
             continue;
         }
 
-        ui::status_timed(
-            &format!("Matched sender after {candidates_checked} candidate event(s)"),
-            decrypt_start.elapsed(),
-        );
-        return Ok(RendezvousMatch {
-            payload,
-            salt,
-            transfer_id,
-            sender_pubkey: event.pubkey,
-            sender_ecdh_public_key,
-        });
+        candidates.push(candidate);
     }
 
-    if saw_expired {
-        bail!("This PIN has expired. Enter the code currently shown on the sender.");
+    if candidates.is_empty() {
+        if saw_expired {
+            bail!("This PIN has expired. Enter the code currently shown on the sender.");
+        }
+        bail!(
+            "No claimable transfer found for this PIN. Check the code currently shown on the sender."
+        );
     }
-    bail!("Could not decrypt transfer. Wrong PIN?");
+
+    ui::status(&format!(
+        "Claiming {} candidate transfer(s)...",
+        candidates.len()
+    ));
+    Ok(candidates)
 }
 
-/// Publish the claim and wait for the sender's confirm, verified under the
-/// same PIN auth key. Subscribes before publishing so the response cannot
-/// slip past, and polls as a backstop for relays that stored the confirm
-/// before the subscription landed. The wait includes time for the two humans
-/// to exchange the displayed confirmation code.
-#[allow(clippy::too_many_arguments)]
+/// Structural validation of a rendezvous event, shared by the initial fetch
+/// and the replacement events that arrive while waiting for the confirm: the
+/// event must be fresh, its payload must name the event's own author and
+/// transfer id, and its element must be a valid non-identity curve point.
+fn parse_claimable_rendezvous(event: &Event) -> Option<RendezvousCandidate> {
+    let created_at_ms = event.created_at.as_secs() * 1000;
+    if now_ms().saturating_sub(created_at_ms) > PIN_TTL_MS {
+        return None;
+    }
+    let parsed = parse_rendezvous_event(event)?;
+    let payload = parsed.payload;
+    if payload.payload_type != "rendezvous"
+        || payload.transfer_id != parsed.transfer_id
+        || payload.sender_pubkey != event.pubkey.to_hex()
+        || payload.nonce.is_empty()
+    {
+        return None;
+    }
+    let pake_message = STANDARD.decode(&payload.pake_message).ok()?;
+    if !is_valid_pake_message(&pake_message) {
+        return None;
+    }
+    Some(RendezvousCandidate {
+        payload,
+        salt: parsed.salt,
+        sender_pubkey: event.pubkey,
+        pake_message,
+    })
+}
+
+/// Run the receiver side of the PAKE against one candidate's element — a fresh
+/// ephemeral scalar per claim — and seal a claim under the resulting session's
+/// claim key. The transcript hash of the rendezvous we actually acted on rides
+/// twice: sealed (the sender compares it with what it published and drops the
+/// claim on any difference, so a republished rendezvous with any altered field
+/// never reaches the point where the two humans compare codes) and in
+/// plaintext as the claim's target, routing it to the single-use element it
+/// was derived against.
+///
+/// Returns `Ok(None)` for a candidate whose element or salt fails the PAKE —
+/// a forged candidate must cost itself, not the whole receive.
+fn build_claim(
+    client: &NostrClient,
+    candidate: RendezvousCandidate,
+    pake_secret: &[u8; 32],
+    receiver_pubkey: &str,
+) -> Result<Option<ClaimCandidate>> {
+    let sender_pubkey_hex = candidate.sender_pubkey.to_hex();
+    let identities = PakeIdentities {
+        transfer_id: &candidate.payload.transfer_id,
+        sender_pubkey: &sender_pubkey_hex,
+        receiver_pubkey,
+    };
+
+    let Ok(pake) = PakeRun::start(PakeRole::Receiver, pake_secret) else {
+        return Ok(None);
+    };
+    let own_element = *pake.message();
+    let Ok(root) = pake.finish(&candidate.pake_message, &identities) else {
+        return Ok(None);
+    };
+    let Ok(seal_keys) = root.handshake_seal_keys(&candidate.salt) else {
+        return Ok(None);
+    };
+
+    let transcript_hash = compute_rendezvous_transcript_hash(&candidate.payload, &candidate.salt)?;
+    let receiver_nonce = generate_handshake_nonce()?;
+
+    let claim = ClaimPayload {
+        payload_type: "claim".to_string(),
+        transfer_id: candidate.payload.transfer_id.clone(),
+        sender_nonce: candidate.payload.nonce.clone(),
+        receiver_nonce: receiver_nonce.clone(),
+        sender_pubkey: sender_pubkey_hex,
+        receiver_pubkey: receiver_pubkey.to_string(),
+        transcript_hash: transcript_hash.clone(),
+    };
+    let claim_event = create_handshake_event(
+        client,
+        &candidate.sender_pubkey,
+        &candidate.payload.transfer_id,
+        HandshakeType::Claim,
+        &seal_handshake_payload(&seal_keys.claim, &claim)?,
+        Some(&own_element),
+        Some(&transcript_hash),
+    )?;
+
+    Ok(Some(ClaimCandidate {
+        transfer_id: candidate.payload.transfer_id,
+        sender_pubkey: candidate.sender_pubkey,
+        sender_nonce: candidate.payload.nonce,
+        receiver_nonce,
+        salt: candidate.salt,
+        transcript_hash,
+        root,
+        seal_keys,
+        claim_event,
+    }))
+}
+
+/// Run the receiver side of the PAKE against every candidate and seal one claim
+/// each. Each claim hands whoever authored that candidate one online PIN guess —
+/// inherent to any PAKE, bounded here by [`MAX_CLAIM_CANDIDATES`] initial
+/// claims and [`MAX_CLAIM_ATTEMPTS`] total including re-claims.
+fn build_claims(
+    client: &NostrClient,
+    candidates: Vec<RendezvousCandidate>,
+    pake_secret: &[u8; 32],
+    receiver_pubkey: &str,
+) -> Result<Vec<ClaimCandidate>> {
+    let mut claims = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if let Some(claim) = build_claim(client, candidate, pake_secret, receiver_pubkey)? {
+            claims.push(claim);
+        }
+    }
+    Ok(claims)
+}
+
+/// Publish every claim and wait for the first confirm that opens under one of
+/// the claimed sessions' confirm keys — that is what decides which candidate was
+/// real. Subscribes before publishing so the response cannot slip past, and
+/// polls as a backstop for relays that stored the confirm before the
+/// subscription landed.
+///
+/// Also watches for replacement rendezvous events: the sender's elements are
+/// single-use, so if a junk claim spent the element we claimed, the sender
+/// publishes a fresh one and our claim must be redone against it.
 async fn wait_for_confirm(
     client: &NostrClient,
-    claim_event: Event,
-    auth_key: &[u8; aes::AES_KEY_LEN],
-    transfer_id: &str,
-    sender_pubkey: &PublicKey,
-    sender_nonce: &str,
-    receiver_nonce: &str,
-    receiver_ecdh_public_key_b64: &str,
+    mut claims: Vec<ClaimCandidate>,
     receiver_pubkey: &str,
-    transcript_hash: &str,
-) -> Result<()> {
+    pake_secret: &[u8; 32],
+    hints: &[String],
+) -> Result<ConfirmedSession> {
     let our_pubkey = client.public_key();
-    let confirm_filter = addressed_filter_from_author(transfer_id, &our_pubkey, *sender_pubkey);
+    let filter = confirm_filter(
+        claims.iter().map(|claim| claim.transfer_id.as_str()),
+        &our_pubkey,
+        claims.iter().map(|claim| claim.sender_pubkey),
+    );
     let mut notifications = client.notifications();
-    let sub_id = client.subscribe(confirm_filter.clone()).await?;
+    let sub_id = client.subscribe(filter.clone()).await?;
+    // Re-claims never add a (transfer, author) pair, so the confirm filter
+    // above stays valid for every claim this wait can accumulate.
+    let rendezvous_sub_id = client.subscribe(rendezvous_filter(hints)).await?;
 
     let step = Instant::now();
     ui::status("Publishing claim to Nostr...");
-    client.publish(&claim_event).await?;
+    // Most candidates are hint collisions or forgeries; only one can be our
+    // sender, and we cannot tell which. A relay refusing any single claim (a
+    // burst of up to MAX_CLAIM_CANDIDATES events invites rate limiting) must
+    // not strand the rest, so keep going and fail only if none landed.
+    let mut published = 0usize;
+    let mut last_failure = None;
+    for claim in &claims {
+        match client.publish(&claim.claim_event).await {
+            Ok(()) => published += 1,
+            Err(error) => last_failure = Some(error),
+        }
+    }
+    if published == 0 {
+        client.unsubscribe(&sub_id).await;
+        client.unsubscribe(&rendezvous_sub_id).await;
+        return Err(last_failure
+            .unwrap_or_else(|| anyhow::anyhow!("no claim was published"))
+            .context("Failed to publish any claim to Nostr"));
+    }
     ui::status_timed("Published claim to Nostr", step.elapsed());
 
-    ui::status("Waiting for the sender to enter the confirmation code...");
+    ui::status("Waiting for the sender to verify...");
     let mut seen = HashSet::new();
-
-    let verify = |event: &Event| -> bool {
-        let Some(handshake) = parse_handshake_event(event) else {
-            return false;
-        };
-        if handshake.handshake_type != HandshakeType::Confirm
-            || handshake.transfer_id != transfer_id
-            || handshake.author != *sender_pubkey
-        {
-            return false;
-        }
-        let Ok(payload) =
-            open_handshake_payload::<ConfirmPayload>(auth_key, &handshake.sealed_payload)
-        else {
-            return false; // Not sealed with our PIN
-        };
-        payload.payload_type == "confirm"
-            && payload.transfer_id == transfer_id
-            && payload.sender_nonce == sender_nonce
-            && payload.receiver_nonce == receiver_nonce
-            && payload.receiver_ecdh_public_key == receiver_ecdh_public_key_b64
-            && payload.sender_pubkey == sender_pubkey.to_hex()
-            && payload.receiver_pubkey == receiver_pubkey
-            && payload.transcript_hash == transcript_hash
-    };
+    let mut claim_attempts = claims.len();
+    let mut claimed_hashes: HashSet<String> = claims
+        .iter()
+        .map(|claim| claim.transcript_hash.clone())
+        .collect();
 
     let mut poll = tokio::time::interval(CONFIRM_POLL_INTERVAL);
     poll.tick().await; // consume the immediate first tick
 
+    let claims = &mut claims;
     let wait = async {
         loop {
             tokio::select! {
                 event = next_event(&mut notifications) => {
                     let event = event?;
-                    if seen.insert(event.id) && verify(&event) {
-                        return Ok::<(), anyhow::Error>(());
+                    if !seen.insert(event.id) {
+                        continue;
+                    }
+                    if event.kind == rendezvous_kind() {
+                        try_reclaim(
+                            client,
+                            &event,
+                            claims,
+                            &mut claimed_hashes,
+                            &mut claim_attempts,
+                            pake_secret,
+                            receiver_pubkey,
+                        )
+                        .await;
+                        continue;
+                    }
+                    if let Some(matched) = match_confirm(&event, claims, receiver_pubkey) {
+                        return Ok::<_, anyhow::Error>(matched);
                     }
                 }
                 _ = poll.tick() => {
-                    for event in client.fetch(confirm_filter.clone()).await? {
-                        if seen.insert(event.id) && verify(&event) {
-                            return Ok(());
+                    for event in client.fetch(filter.clone()).await? {
+                        if seen.insert(event.id)
+                            && let Some(matched) = match_confirm(&event, claims, receiver_pubkey)
+                        {
+                            return Ok(matched);
                         }
                     }
                 }
@@ -539,15 +678,117 @@ async fn wait_for_confirm(
 
     let result = tokio::time::timeout(CONFIRM_TIMEOUT, wait).await;
     client.unsubscribe(&sub_id).await;
-    match result {
+    client.unsubscribe(&rendezvous_sub_id).await;
+    let (index, metadata) = match result {
         Ok(inner) => inner?,
         Err(_) => bail!(
-            "Sender did not confirm. The transfer may have been claimed by another device, or the sender went offline."
+            "Sender did not confirm. The transfer may have been claimed by another device, the sender may have gone offline, or the PIN was mistyped."
         ),
-    }
+    };
 
     ui::status("Sender confirmed the claim.");
-    Ok(())
+    if index >= claims.len() {
+        bail!("confirmed candidate disappeared");
+    }
+    Ok(ConfirmedSession {
+        candidate: claims.swap_remove(index),
+        metadata,
+    })
+}
+
+/// Re-claim a replacement rendezvous. Only an event authored by the same key
+/// that published a rendezvous we already claimed counts — a forged
+/// "replacement" under another identity is just another candidate we never
+/// claimed. Each re-claim still hands its author one online PIN guess, so the
+/// total is capped: a claimed candidate's author rotating elements at us gets
+/// at most [`MAX_CLAIM_ATTEMPTS`] guesses per receive attempt, not an
+/// unbounded stream. Failures are silent by design — a malformed replacement
+/// must not kill the confirm wait.
+async fn try_reclaim(
+    client: &NostrClient,
+    event: &Event,
+    claims: &mut Vec<ClaimCandidate>,
+    claimed_hashes: &mut HashSet<String>,
+    claim_attempts: &mut usize,
+    pake_secret: &[u8; 32],
+    receiver_pubkey: &str,
+) {
+    let Some(candidate) = parse_claimable_rendezvous(event) else {
+        return;
+    };
+    if !claims.iter().any(|claim| {
+        claim.transfer_id == candidate.payload.transfer_id
+            && claim.sender_pubkey == candidate.sender_pubkey
+    }) {
+        return;
+    }
+    let Ok(transcript_hash) =
+        compute_rendezvous_transcript_hash(&candidate.payload, &candidate.salt)
+    else {
+        return;
+    };
+    if claimed_hashes.contains(&transcript_hash) || *claim_attempts >= MAX_CLAIM_ATTEMPTS {
+        return;
+    }
+    *claim_attempts += 1;
+    claimed_hashes.insert(transcript_hash);
+
+    let Ok(Some(claim)) = build_claim(client, candidate, pake_secret, receiver_pubkey) else {
+        return;
+    };
+    ui::status("Sender replaced its element — re-claiming...");
+    if let Err(error) = client.publish(&claim.claim_event).await {
+        ui::status(&format!("Failed to publish re-claim: {error}"));
+    }
+    // Retained even if the publish partially failed: a relay may still have
+    // accepted it, and the confirm subscription covers this claim already.
+    claims.push(claim);
+}
+
+/// Try to open a confirm event under each claimed session's confirm key.
+/// Returns the index of the winning candidate and the metadata it delivered.
+///
+/// A re-claim shares its transfer id and author with the claim it replaced, so
+/// several retained claims can match one confirm event — only the session the
+/// sender actually verified holds the key that opens it, so every match must be
+/// tried, not just the first.
+fn match_confirm(
+    event: &Event,
+    claims: &[ClaimCandidate],
+    receiver_pubkey: &str,
+) -> Option<(usize, TransferMetadata)> {
+    let handshake = parse_handshake_event(event)?;
+    if handshake.handshake_type != HandshakeType::Confirm {
+        return None;
+    }
+
+    claims
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.transfer_id == handshake.transfer_id
+                && candidate.sender_pubkey == event.pubkey
+        })
+        .find_map(|(index, candidate)| {
+            let payload = open_handshake_payload::<ConfirmPayload>(
+                &candidate.seal_keys.confirm,
+                &handshake.sealed_payload,
+            )
+            .ok()?; // Not sealed by our PAKE peer for this candidate
+
+            if payload.payload_type != "confirm"
+                || payload.transfer_id != candidate.transfer_id
+                || payload.sender_nonce != candidate.sender_nonce
+                || payload.receiver_nonce != candidate.receiver_nonce
+                || payload.sender_pubkey != event.pubkey.to_hex()
+                || payload.receiver_pubkey != receiver_pubkey
+                || payload.transcript_hash != candidate.transcript_hash
+            {
+                return None;
+            }
+
+            Some((index, payload.metadata))
+        })
 }
 
 async fn publish_answer_and_candidates(
@@ -639,6 +880,118 @@ async fn handle_receiver_candidate(
         add_ice_candidate_safely(peer, &candidate.candidate).await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::signaling::nostr::data_kind;
+
+    const TRANSFER_ID: &str = "a1b2c3d4e5f60718";
+    const SALT: &[u8] = b"0123456789abcdef";
+
+    /// Run a full SPAKE2 exchange against a fresh sender element and build the
+    /// receiver's view of the resulting claim, the way [`build_claim`] would.
+    fn claimed_session(
+        secret: &[u8; 32],
+        sender_keys: &Keys,
+        receiver_pubkey: &str,
+        label: &str,
+    ) -> ClaimCandidate {
+        let sender_pubkey_hex = sender_keys.public_key().to_hex();
+        let identities = PakeIdentities {
+            transfer_id: TRANSFER_ID,
+            sender_pubkey: &sender_pubkey_hex,
+            receiver_pubkey,
+        };
+        let sender_run = PakeRun::start(PakeRole::Sender, secret).expect("sender run");
+        let sender_element = *sender_run.message();
+        let receiver_run = PakeRun::start(PakeRole::Receiver, secret).expect("receiver run");
+        let root = receiver_run
+            .finish(&sender_element, &identities)
+            .expect("receiver finish");
+        let seal_keys = root.handshake_seal_keys(SALT).expect("seal keys");
+
+        // match_confirm never reads the claim event; any signed event will do.
+        let claim_event = EventBuilder::new(data_kind(), "")
+            .sign_with_keys(&Keys::generate())
+            .expect("claim event");
+
+        ClaimCandidate {
+            transfer_id: TRANSFER_ID.to_string(),
+            sender_pubkey: sender_keys.public_key(),
+            sender_nonce: format!("sender-nonce-{label}"),
+            receiver_nonce: format!("receiver-nonce-{label}"),
+            salt: SALT.to_vec(),
+            transcript_hash: format!("transcript-hash-{label}"),
+            root,
+            seal_keys,
+            claim_event,
+        }
+    }
+
+    /// Seal a confirm for one candidate under that session's confirm key and
+    /// wrap it in a handshake event authored by the sender.
+    fn confirm_event(
+        sender_keys: &Keys,
+        candidate: &ClaimCandidate,
+        receiver_pubkey: &str,
+    ) -> Event {
+        let payload = ConfirmPayload {
+            payload_type: "confirm".to_string(),
+            transfer_id: candidate.transfer_id.clone(),
+            sender_nonce: candidate.sender_nonce.clone(),
+            receiver_nonce: candidate.receiver_nonce.clone(),
+            sender_pubkey: sender_keys.public_key().to_hex(),
+            receiver_pubkey: receiver_pubkey.to_string(),
+            transcript_hash: candidate.transcript_hash.clone(),
+            metadata: TransferMetadata {
+                content_type: "file".to_string(),
+                file_name: "quarterly-report.pdf".to_string(),
+                file_size: 1_048_576,
+                file_size_exact: true,
+                mime_type: "application/pdf".to_string(),
+            },
+        };
+        let sealed =
+            seal_handshake_payload(&candidate.seal_keys.confirm, &payload).expect("seal confirm");
+        let content = format!(r#"{{"sealed":"{}"}}"#, STANDARD.encode(sealed));
+        EventBuilder::new(data_kind(), content)
+            .tags([
+                Tag::parse(["p", receiver_pubkey]).expect("p tag"),
+                Tag::parse(["t", &candidate.transfer_id]).expect("t tag"),
+                Tag::parse(["type", "confirm"]).expect("type tag"),
+            ])
+            .sign_with_keys(sender_keys)
+            .expect("confirm event")
+    }
+
+    /// A re-claim shares its transfer id and author with the claim it replaced.
+    /// A confirm sealed under the re-claim's session must still match even
+    /// though the older claim sorts first — a first-match lookup would try only
+    /// the stale key and drop the confirm.
+    #[test]
+    fn match_confirm_tries_every_claim_for_the_same_sender() {
+        let secret = [7_u8; 32];
+        let sender_keys = Keys::generate();
+        let receiver_pubkey = Keys::generate().public_key().to_hex();
+
+        let original = claimed_session(&secret, &sender_keys, &receiver_pubkey, "original");
+        let reclaim = claimed_session(&secret, &sender_keys, &receiver_pubkey, "reclaim");
+        let event = confirm_event(&sender_keys, &reclaim, &receiver_pubkey);
+
+        let claims = vec![original, reclaim];
+        let (index, metadata) = match_confirm(&event, &claims, &receiver_pubkey)
+            .expect("confirm sealed for the re-claim must match");
+        assert_eq!(index, 1);
+        assert_eq!(metadata.file_name, "quarterly-report.pdf");
+
+        // The original claim still matches when the confirm is sealed for it.
+        let event = confirm_event(&sender_keys, &claims[0], &receiver_pubkey);
+        let (index, _) = match_confirm(&event, &claims, &receiver_pubkey)
+            .expect("confirm sealed for the original claim must match");
+        assert_eq!(index, 0);
+    }
 }
 
 async fn next_event(
