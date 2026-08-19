@@ -38,7 +38,7 @@ lookup, so effective strength is 55⁸ ≈ 46.3 bits.
 rendezvous candidate it claims. The sender does not: it picks one `x` per PIN
 generation, publishes `pA = x·G + w·M` once, and finishes that same run against
 every claim the generation receives — up to `CLAIM_VERIFY_LIMIT` (100) times
-within a 2-minute bucket. RFC 9382 §6 states that "Randomly generated values,
+within a 2-minute bucket. RFC 9382 §7 states that "Randomly generated values,
 e.g., x and y, MUST NOT be reused; such reuse violates the security assumptions
 of the protocol and results in significant insecurity." This deployment
 knowingly deviates.

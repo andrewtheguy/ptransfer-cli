@@ -158,7 +158,7 @@ pub struct PakeIdentities<'a> {
 /// [`crate::crypto::pin::CLAIM_VERIFY_LIMIT`] times inside one rotation
 /// bucket. `finish` takes `&self` for exactly that reason.
 ///
-/// That reuse is a deliberate deviation from RFC 9382 §6 ("Randomly generated
+/// That reuse is a deliberate deviation from RFC 9382 §7 ("Randomly generated
 /// values, e.g., x and y, MUST NOT be reused"). It is forced by the rendezvous
 /// shape: `pA` is published before any claimant exists, and each claim is
 /// sealed under a transcript committing to the `pA` its author saw, so a fresh
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn uses_the_rfc_9382_p256_constants() {
-        // Known-answer vectors from RFC 9382 §4. An edited or home-grown
+        // Known-answer vectors from RFC 9382 §6. An edited or home-grown
         // constant breaks the security argument (an attacker who knows
         // dlog(M)/dlog(N) can unblind an element), so pin the exact encodings.
         assert_eq!(
