@@ -747,6 +747,11 @@ async fn try_reclaim(
 
 /// Try to open a confirm event under each claimed session's confirm key.
 /// Returns the index of the winning candidate and the metadata it delivered.
+///
+/// A re-claim shares its transfer id and author with the claim it replaced, so
+/// several retained claims can match one confirm event — only the session the
+/// sender actually verified holds the key that opens it, so every match must be
+/// tried, not just the first.
 fn match_confirm(
     event: &Event,
     claims: &[ClaimCandidate],
@@ -757,29 +762,33 @@ fn match_confirm(
         return None;
     }
 
-    let (index, candidate) = claims.iter().enumerate().find(|(_, candidate)| {
-        candidate.transfer_id == handshake.transfer_id && candidate.sender_pubkey == event.pubkey
-    })?;
+    claims
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.transfer_id == handshake.transfer_id
+                && candidate.sender_pubkey == event.pubkey
+        })
+        .find_map(|(index, candidate)| {
+            let payload = open_handshake_payload::<ConfirmPayload>(
+                &candidate.seal_keys.confirm,
+                &handshake.sealed_payload,
+            )
+            .ok()?; // Not sealed by our PAKE peer for this candidate
 
-    let Ok(payload) = open_handshake_payload::<ConfirmPayload>(
-        &candidate.seal_keys.confirm,
-        &handshake.sealed_payload,
-    ) else {
-        return None; // Not sealed by our PAKE peer for this candidate
-    };
+            if payload.payload_type != "confirm"
+                || payload.transfer_id != candidate.transfer_id
+                || payload.sender_nonce != candidate.sender_nonce
+                || payload.receiver_nonce != candidate.receiver_nonce
+                || payload.sender_pubkey != event.pubkey.to_hex()
+                || payload.receiver_pubkey != receiver_pubkey
+                || payload.transcript_hash != candidate.transcript_hash
+            {
+                return None;
+            }
 
-    if payload.payload_type != "confirm"
-        || payload.transfer_id != candidate.transfer_id
-        || payload.sender_nonce != candidate.sender_nonce
-        || payload.receiver_nonce != candidate.receiver_nonce
-        || payload.sender_pubkey != event.pubkey.to_hex()
-        || payload.receiver_pubkey != receiver_pubkey
-        || payload.transcript_hash != candidate.transcript_hash
-    {
-        return None;
-    }
-
-    Some((index, payload.metadata))
+            Some((index, payload.metadata))
+        })
 }
 
 async fn publish_answer_and_candidates(
@@ -871,6 +880,118 @@ async fn handle_receiver_candidate(
         add_ice_candidate_safely(peer, &candidate.candidate).await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::signaling::nostr::data_kind;
+
+    const TRANSFER_ID: &str = "a1b2c3d4e5f60718";
+    const SALT: &[u8] = b"0123456789abcdef";
+
+    /// Run a full SPAKE2 exchange against a fresh sender element and build the
+    /// receiver's view of the resulting claim, the way [`build_claim`] would.
+    fn claimed_session(
+        secret: &[u8; 32],
+        sender_keys: &Keys,
+        receiver_pubkey: &str,
+        label: &str,
+    ) -> ClaimCandidate {
+        let sender_pubkey_hex = sender_keys.public_key().to_hex();
+        let identities = PakeIdentities {
+            transfer_id: TRANSFER_ID,
+            sender_pubkey: &sender_pubkey_hex,
+            receiver_pubkey,
+        };
+        let sender_run = PakeRun::start(PakeRole::Sender, secret).expect("sender run");
+        let sender_element = *sender_run.message();
+        let receiver_run = PakeRun::start(PakeRole::Receiver, secret).expect("receiver run");
+        let root = receiver_run
+            .finish(&sender_element, &identities)
+            .expect("receiver finish");
+        let seal_keys = root.handshake_seal_keys(SALT).expect("seal keys");
+
+        // match_confirm never reads the claim event; any signed event will do.
+        let claim_event = EventBuilder::new(data_kind(), "")
+            .sign_with_keys(&Keys::generate())
+            .expect("claim event");
+
+        ClaimCandidate {
+            transfer_id: TRANSFER_ID.to_string(),
+            sender_pubkey: sender_keys.public_key(),
+            sender_nonce: format!("sender-nonce-{label}"),
+            receiver_nonce: format!("receiver-nonce-{label}"),
+            salt: SALT.to_vec(),
+            transcript_hash: format!("transcript-hash-{label}"),
+            root,
+            seal_keys,
+            claim_event,
+        }
+    }
+
+    /// Seal a confirm for one candidate under that session's confirm key and
+    /// wrap it in a handshake event authored by the sender.
+    fn confirm_event(
+        sender_keys: &Keys,
+        candidate: &ClaimCandidate,
+        receiver_pubkey: &str,
+    ) -> Event {
+        let payload = ConfirmPayload {
+            payload_type: "confirm".to_string(),
+            transfer_id: candidate.transfer_id.clone(),
+            sender_nonce: candidate.sender_nonce.clone(),
+            receiver_nonce: candidate.receiver_nonce.clone(),
+            sender_pubkey: sender_keys.public_key().to_hex(),
+            receiver_pubkey: receiver_pubkey.to_string(),
+            transcript_hash: candidate.transcript_hash.clone(),
+            metadata: TransferMetadata {
+                content_type: "file".to_string(),
+                file_name: "quarterly-report.pdf".to_string(),
+                file_size: 1_048_576,
+                file_size_exact: true,
+                mime_type: "application/pdf".to_string(),
+            },
+        };
+        let sealed =
+            seal_handshake_payload(&candidate.seal_keys.confirm, &payload).expect("seal confirm");
+        let content = format!(r#"{{"sealed":"{}"}}"#, STANDARD.encode(sealed));
+        EventBuilder::new(data_kind(), content)
+            .tags([
+                Tag::parse(["p", receiver_pubkey]).expect("p tag"),
+                Tag::parse(["t", &candidate.transfer_id]).expect("t tag"),
+                Tag::parse(["type", "confirm"]).expect("type tag"),
+            ])
+            .sign_with_keys(sender_keys)
+            .expect("confirm event")
+    }
+
+    /// A re-claim shares its transfer id and author with the claim it replaced.
+    /// A confirm sealed under the re-claim's session must still match even
+    /// though the older claim sorts first — a first-match lookup would try only
+    /// the stale key and drop the confirm.
+    #[test]
+    fn match_confirm_tries_every_claim_for_the_same_sender() {
+        let secret = [7_u8; 32];
+        let sender_keys = Keys::generate();
+        let receiver_pubkey = Keys::generate().public_key().to_hex();
+
+        let original = claimed_session(&secret, &sender_keys, &receiver_pubkey, "original");
+        let reclaim = claimed_session(&secret, &sender_keys, &receiver_pubkey, "reclaim");
+        let event = confirm_event(&sender_keys, &reclaim, &receiver_pubkey);
+
+        let claims = vec![original, reclaim];
+        let (index, metadata) = match_confirm(&event, &claims, &receiver_pubkey)
+            .expect("confirm sealed for the re-claim must match");
+        assert_eq!(index, 1);
+        assert_eq!(metadata.file_name, "quarterly-report.pdf");
+
+        // The original claim still matches when the confirm is sealed for it.
+        let event = confirm_event(&sender_keys, &claims[0], &receiver_pubkey);
+        let (index, _) = match_confirm(&event, &claims, &receiver_pubkey)
+            .expect("confirm sealed for the original claim must match");
+        assert_eq!(index, 0);
+    }
 }
 
 async fn next_event(
