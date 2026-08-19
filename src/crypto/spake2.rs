@@ -30,8 +30,8 @@ pub const PAKE_MESSAGE_LEN: usize = 33;
 pub const PAKE_SECRET_LEN: usize = 32;
 
 /// Versioned domain separators. Bump with any change to the transcript layout.
-const PAKE_CONTEXT: &str = "secure-send:spake2-p256:v3";
-const PAKE_SECRET_SALT: &str = "secure-send:spake2-w:v3";
+const PAKE_CONTEXT: &str = "secure-send:spake2-p256:v4";
+const PAKE_SECRET_SALT: &str = "secure-send:spake2-w:v4";
 
 /// RFC 9382 nothing-up-my-sleeve constant `M` for P-256 (compressed SEC1).
 const M_BYTES: [u8; PAKE_MESSAGE_LEN] = [
@@ -151,20 +151,13 @@ pub struct PakeIdentities<'a> {
 /// One side of one SPAKE2 run: an ephemeral scalar, its blinded element, and
 /// the password scalar the run is authenticated by.
 ///
-/// The receiver starts one per rendezvous candidate it claims, so its `y` and
-/// `pB` really are single-use. The sender starts one per PIN generation and
-/// [`PakeRun::finish`]es it against *every* claim that generation sees, so its
-/// `x` and `pA` are reused up to
-/// [`crate::crypto::pin::CLAIM_VERIFY_LIMIT`] times inside one rotation
-/// bucket. `finish` takes `&self` for exactly that reason.
-///
-/// That reuse is a deliberate deviation from RFC 9382 §7 ("Randomly generated
-/// values, e.g., x and y, MUST NOT be reused"). It is forced by the rendezvous
-/// shape: `pA` is published before any claimant exists, and each claim is
-/// sealed under a transcript committing to the `pA` its author saw, so a fresh
-/// scalar per claim would need a third round trip. See "SPAKE2 scalar reuse"
-/// in `docs/ARCHITECTURE.md` for why it does not hand an attacker more than
-/// the metered one guess per claim — and for the limits of that argument.
+/// Every run is single-use on both sides, per RFC 9382 §7 ("Randomly generated
+/// values, e.g., x and y, MUST NOT be reused"): the receiver starts one per
+/// claim it publishes, and the sender starts one per rendezvous element it
+/// publishes — the first claim targeting an element consumes its run, verified
+/// or not, and a failed verification makes the sender publish a replacement
+/// element rather than reuse the scalar. [`PakeRun::finish`] takes `self` so
+/// the type system enforces exactly that.
 pub struct PakeRun {
     role: PakeRole,
     secret: [u8; PAKE_SECRET_LEN],
@@ -220,12 +213,15 @@ impl PakeRun {
     /// `TT = len‖Context ‖ len‖idA ‖ len‖idB ‖ len‖pA ‖ len‖pB ‖ len‖K ‖ len‖w`
     /// into the session root key.
     ///
+    /// Consumes the run: an ephemeral scalar is finished against exactly one
+    /// peer element, ever (RFC 9382 §7).
+    ///
     /// Fails on any invalid peer element (wrong length, not on the curve, or
     /// one whose unblinding lands on the identity). A wrong PIN does *not*
     /// fail here — both sides simply derive different roots, and the mismatch
     /// surfaces when a sealed claim or confirm refuses to open.
     pub fn finish(
-        &self,
+        self,
         peer_message: &[u8],
         identities: &PakeIdentities<'_>,
     ) -> Result<PakeRoot> {
@@ -315,6 +311,23 @@ mod tests {
         }
     }
 
+    /// Build a run with a deterministic ephemeral scalar, so a test that
+    /// needs to finish "the same run" several times can rebuild it — `finish`
+    /// consumes the run, and production code never finishes a scalar twice.
+    fn fixed_run(role: PakeRole, secret: &[u8; PAKE_SECRET_LEN], byte: u8) -> PakeRun {
+        let w = read_pake_scalar(secret).unwrap();
+        let ephemeral = *SecretKey::from_slice(&[byte; 32])
+            .unwrap()
+            .to_nonzero_scalar();
+        PakeRun {
+            role,
+            secret: *secret,
+            ephemeral: NonZeroScalar::new(ephemeral).unwrap(),
+            message: compress(&(ProjectivePoint::GENERATOR * ephemeral + role.own_constant() * w))
+                .unwrap(),
+        }
+    }
+
     #[test]
     fn uses_the_rfc_9382_p256_constants() {
         // Known-answer vectors from RFC 9382 §6. An edited or home-grown
@@ -335,7 +348,7 @@ mod tests {
         // secure-send-web's derivePakeSecret("ABCDEFGHJKLA").
         assert_eq!(
             hex_lower(&derive_pake_secret("ABCDEFGHJKLA")),
-            "a225404eecf6539849b7bc7c69290489d50c99cf8baa4d46f0ee1485ff555b2b"
+            "4ff171f7e73e59d95a9a0be87e8ad79384876092b0f7b99cce2f1820ee5fb7ce"
         );
         // Deterministic across the two peers entering the same PIN.
         assert_eq!(
@@ -351,44 +364,27 @@ mod tests {
     #[test]
     fn transcript_matches_web_fixed_vector() {
         let w = derive_pake_secret("ABCDEFGHJKLA");
-        let w_scalar = read_pake_scalar(&w).unwrap();
-
-        let fixed = |byte: u8| {
-            *SecretKey::from_slice(&[byte; 32])
-                .unwrap()
-                .to_nonzero_scalar()
-        };
-        let (x, y) = (fixed(0x11), fixed(0x22));
-
-        let sender = PakeRun {
-            role: PakeRole::Sender,
-            secret: w,
-            ephemeral: NonZeroScalar::new(x).unwrap(),
-            message: compress(&(ProjectivePoint::GENERATOR * x + *pake_m() * w_scalar)).unwrap(),
-        };
-        let receiver = PakeRun {
-            role: PakeRole::Receiver,
-            secret: w,
-            ephemeral: NonZeroScalar::new(y).unwrap(),
-            message: compress(&(ProjectivePoint::GENERATOR * y + *pake_n() * w_scalar)).unwrap(),
-        };
+        let sender = fixed_run(PakeRole::Sender, &w, 0x11);
+        let receiver = fixed_run(PakeRole::Receiver, &w, 0x22);
+        let sender_message = *sender.message();
+        let receiver_message = *receiver.message();
 
         assert_eq!(
-            hex_lower(sender.message()),
-            "02da2c0682f872084a64f331a946a607caff3ccef9c1e1ef0e2e73037cd8f6df19"
+            hex_lower(&sender_message),
+            "021bec667675583d7e32b092248fe0f1da12e1e876cfad21d9073ba4b837f27a93"
         );
         assert_eq!(
-            hex_lower(receiver.message()),
-            "020b00a820bc8c8e2cbb52af2282998d090036f3abd4ccb09b52b8c4e83367d4f9"
+            hex_lower(&receiver_message),
+            "023e76f17bd01a193b307ba174e1839a69a21d1f71951225262a6cd11ec90db37f"
         );
 
-        let root = sender.finish(receiver.message(), &identities()).unwrap();
+        let root = sender.finish(&receiver_message, &identities()).unwrap();
         assert_eq!(
             hex_lower(root.ikm()),
-            "7ac9af6119570923bff87cad72b536e6aee2e4c5f11ff01d0e1c34682840ad1f"
+            "71af683d0cda14a5883f729efb953625d2d9d5f1a2498efa0176a8d4aab7672d"
         );
         // Both roles land on the same root from opposite sides of the wire.
-        let mirrored = receiver.finish(sender.message(), &identities()).unwrap();
+        let mirrored = receiver.finish(&sender_message, &identities()).unwrap();
         assert_eq!(mirrored.ikm(), root.ikm());
     }
 
@@ -397,9 +393,11 @@ mod tests {
         let w = derive_pake_secret("ABCDEFGHJKLA");
         let sender = PakeRun::start(PakeRole::Sender, &w).unwrap();
         let receiver = PakeRun::start(PakeRole::Receiver, &w).unwrap();
+        let sender_message = *sender.message();
+        let receiver_message = *receiver.message();
 
-        let a = sender.finish(receiver.message(), &identities()).unwrap();
-        let b = receiver.finish(sender.message(), &identities()).unwrap();
+        let a = sender.finish(&receiver_message, &identities()).unwrap();
+        let b = receiver.finish(&sender_message, &identities()).unwrap();
         assert_eq!(a.ikm(), b.ikm());
     }
 
@@ -418,18 +416,24 @@ mod tests {
         let sender = PakeRun::start(PakeRole::Sender, &derive_pake_secret("ABCDEFGHJKLA")).unwrap();
         let receiver =
             PakeRun::start(PakeRole::Receiver, &derive_pake_secret("ABCDEFGHJKLZ")).unwrap();
+        let sender_message = *sender.message();
+        let receiver_message = *receiver.message();
 
-        let a = sender.finish(receiver.message(), &identities()).unwrap();
-        let b = receiver.finish(sender.message(), &identities()).unwrap();
+        let a = sender.finish(&receiver_message, &identities()).unwrap();
+        let b = receiver.finish(&sender_message, &identities()).unwrap();
         assert_ne!(a.ikm(), b.ikm());
     }
 
     #[test]
     fn root_is_bound_to_the_transfer_id_and_both_identities() {
+        // Fixed scalars so the run can be rebuilt per variant: only the
+        // identity under test differs between the base and variant roots.
         let w = derive_pake_secret("ABCDEFGHJKLA");
-        let sender = PakeRun::start(PakeRole::Sender, &w).unwrap();
-        let receiver = PakeRun::start(PakeRole::Receiver, &w).unwrap();
-        let base = sender.finish(receiver.message(), &identities()).unwrap();
+        let sender_message = *fixed_run(PakeRole::Sender, &w, 0x11).message();
+        let receiver_message = *fixed_run(PakeRole::Receiver, &w, 0x22).message();
+        let base = fixed_run(PakeRole::Sender, &w, 0x11)
+            .finish(&receiver_message, &identities())
+            .unwrap();
 
         let changed = [
             PakeIdentities {
@@ -446,7 +450,9 @@ mod tests {
             },
         ];
         for variant in changed {
-            let other = receiver.finish(sender.message(), &variant).unwrap();
+            let other = fixed_run(PakeRole::Receiver, &w, 0x22)
+                .finish(&sender_message, &variant)
+                .unwrap();
             assert_ne!(base.ikm(), other.ikm());
         }
     }
@@ -460,25 +466,26 @@ mod tests {
         let receiver = PakeRun::start(PakeRole::Receiver, &w).unwrap();
         let attacker =
             PakeRun::start(PakeRole::Receiver, &derive_pake_secret("ABCDEFGHJKLZ")).unwrap();
+        let sender_message = *sender.message();
 
         let a = sender.finish(attacker.message(), &identities()).unwrap();
-        let b = receiver.finish(sender.message(), &identities()).unwrap();
+        let b = receiver.finish(&sender_message, &identities()).unwrap();
         assert_ne!(a.ikm(), b.ikm());
     }
 
     #[test]
     fn rejects_malformed_and_invalid_peer_elements() {
         let w = derive_pake_secret("ABCDEFGHJKLA");
-        let sender = PakeRun::start(PakeRole::Sender, &w).unwrap();
+        let sender = || PakeRun::start(PakeRole::Sender, &w).unwrap();
 
-        assert!(sender.finish(&[0u8; 32], &identities()).is_err());
+        assert!(sender().finish(&[0u8; 32], &identities()).is_err());
         let mut junk = [0xffu8; PAKE_MESSAGE_LEN];
         junk[0] = 0x02;
-        assert!(sender.finish(&junk, &identities()).is_err());
+        assert!(sender().finish(&junk, &identities()).is_err());
         // Its own element unblinds to the identity for the peer role only, so
         // check the explicit identity guard with w·N reflected back.
         let reflected = compress(&(*pake_n() * read_pake_scalar(&w).unwrap())).unwrap();
-        assert!(sender.finish(&reflected, &identities()).is_err());
+        assert!(sender().finish(&reflected, &identities()).is_err());
     }
 
     #[test]
@@ -497,10 +504,12 @@ mod tests {
         let w = derive_pake_secret("ABCDEFGHJKLA");
         let sender = PakeRun::start(PakeRole::Sender, &w).unwrap();
         let receiver = PakeRun::start(PakeRole::Receiver, &w).unwrap();
+        let sender_message = *sender.message();
+        let receiver_message = *receiver.message();
         let salt = generate_salt().unwrap();
 
-        let a = sender.finish(receiver.message(), &identities()).unwrap();
-        let b = receiver.finish(sender.message(), &identities()).unwrap();
+        let a = sender.finish(&receiver_message, &identities()).unwrap();
+        let b = receiver.finish(&sender_message, &identities()).unwrap();
 
         let transcript_hash = "f".repeat(64);
         let metadata_hash = "e".repeat(64);

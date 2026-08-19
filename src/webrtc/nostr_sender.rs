@@ -1,10 +1,12 @@
 //! Nostr Auto Exchange sender compatible with secure-send-web.
 //!
 //! Handshake: publish a plaintext rendezvous event carrying a blinded SPAKE2
-//! element per PIN rotation, finish the PAKE against the first claim that opens
-//! under a still-honored generation, publish the sealed confirm (file metadata
-//! included) immediately, then park until the operator types the confirmation
-//! code the receiver is showing before any WebRTC signal leaves this device.
+//! element per PIN rotation, finish the PAKE against the first claim targeting
+//! the element (every element is single-use — a failed claim consumes it and a
+//! replacement rendezvous is published), publish the sealed confirm (file
+//! metadata included) as soon as a claim verifies, then park until the
+//! operator types the confirmation code the receiver is showing before any
+//! WebRTC signal leaves this device.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -27,7 +29,9 @@ use crate::crypto::pin::{
     CLAIM_VERIFY_LIMIT, PIN_ROTATION_MS, PIN_WAIT_TIMEOUT_MS, generate_pin, generate_transfer_id,
     is_pin_bucket_active, now_ms, pin_bucket, pin_hint_for_bucket, pin_locator,
 };
-use crate::crypto::spake2::{PakeIdentities, PakeRole, PakeRun, derive_pake_secret};
+use crate::crypto::spake2::{
+    PAKE_SECRET_LEN, PakeIdentities, PakeRole, PakeRun, derive_pake_secret,
+};
 use crate::signaling::nostr::{
     self, CandidatePayload, ClaimPayload, ConfirmPayload, HandshakeType, NostrClient,
     RendezvousPayload, Signal, TransferMetadata, addressed_filter, addressed_filter_from_author,
@@ -51,17 +55,42 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 const OFFER_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// One rotation generation of the displayed PIN: its SPAKE2 run, the rendezvous
-/// it published, and the online-guessing budget claims against it may spend.
-struct PinGeneration {
+/// One published SPAKE2 run and the rendezvous fields it rode on. Strictly
+/// single-use (RFC 9382 §7): the first claim targeting it consumes it —
+/// verified or not — and a consumed run is replaced by publishing a
+/// replacement rendezvous with a fresh scalar, never finished twice.
+struct PakeRunState {
     pake: PakeRun,
     nonce: String,
-    bucket: u64,
+    /// Digest of the published rendezvous; claims name it as their target.
     transcript_hash: String,
+}
+
+/// One rotation generation of the displayed PIN: its password scalar, the
+/// currently claimable run, and the online-guessing budget claims against it
+/// may spend.
+struct PinGeneration {
+    pake_secret: [u8; PAKE_SECRET_LEN],
+    bucket: u64,
+    /// Rendezvous hint for this generation's locator and bucket; fixed, so
+    /// replacement publications stay discoverable by the same receiver query.
+    hint: String,
+    /// The currently claimable run, or `None` after a claim consumed it and
+    /// its replacement publish has not landed (or the budget is exhausted).
+    run: Option<PakeRunState>,
     /// Remaining SPAKE2 claim verifications. With a PAKE every verification is
     /// exactly one online PIN guess for whoever authored the claim, so this
-    /// budget — not any key stretching — is the online guessing bound.
+    /// budget — not any key stretching — is the online guessing bound; it also
+    /// caps the replacement publishes a claim flood can force.
     verify_budget: u32,
+}
+
+impl Drop for PinGeneration {
+    fn drop(&mut self) {
+        // Best-effort hygiene, mirroring secure-send-web's wipe when a
+        // generation is retired; the run's own secret wipes itself.
+        self.pake_secret.fill(0);
+    }
 }
 
 /// A verified receiver claim: the transfer is locked to this peer.
@@ -172,6 +201,7 @@ pub async fn send_file_nostr(source: &SendSource) -> Result<()> {
         &transfer_id,
         HandshakeType::Confirm,
         &seal_handshake_payload(&claim.seal_keys.confirm, &confirm)?,
+        None,
         None,
     )?;
     let step = Instant::now();
@@ -342,18 +372,19 @@ struct RendezvousContext<'a> {
 }
 
 impl RendezvousContext<'_> {
-    /// Mint a fresh PIN, start a fresh SPAKE2 run, publish its rendezvous
-    /// event, and display the PIN. Returns the generation the sender must
-    /// retain to verify claims.
-    async fn publish_fresh_pin(&self) -> Result<PinGeneration> {
-        let pin = generate_pin()?;
-        // No key stretching: with a balanced PAKE nothing published can be
-        // ground against offline, so stretching would only add latency.
-        let pake_secret = derive_pake_secret(&pin);
-        let pake = PakeRun::start(PakeRole::Sender, &pake_secret)?;
-
+    /// Start a fresh single-use SPAKE2 run and build the rendezvous event
+    /// publishing its element. The transcript hash covers what is about to be
+    /// published, so a claim can be checked against the rendezvous we actually
+    /// sent rather than the one the claimant says it saw — fresh per
+    /// publication, since the nonce and element are.
+    fn build_rendezvous(
+        &self,
+        pake_secret: &[u8; PAKE_SECRET_LEN],
+        hint: &str,
+        bucket: u64,
+    ) -> Result<(PakeRunState, Event)> {
+        let pake = PakeRun::start(PakeRole::Sender, pake_secret)?;
         let nonce = generate_handshake_nonce()?;
-        let bucket = pin_bucket(now_ms());
         let payload = RendezvousPayload {
             payload_type: "rendezvous".to_string(),
             transfer_id: self.transfer_id.to_string(),
@@ -362,29 +393,56 @@ impl RendezvousContext<'_> {
             nonce: nonce.clone(),
             relays: Some(nostr::default_relays_vec()),
         };
-        // Hash what we are about to publish, so a claim can be checked against
-        // the rendezvous we actually sent rather than the one the claimant says
-        // it saw. Per generation, since the nonce and element are fresh on
-        // every rotation.
         let transcript_hash = compute_rendezvous_transcript_hash(&payload, self.salt)?;
-        let event = create_rendezvous_event(
-            self.client,
-            &payload,
-            self.salt,
-            &pin_hint_for_bucket(pin_locator(&pin), bucket),
-            bucket,
-        )?;
+        let event = create_rendezvous_event(self.client, &payload, self.salt, hint, bucket)?;
+        Ok((
+            PakeRunState {
+                pake,
+                nonce,
+                transcript_hash,
+            },
+            event,
+        ))
+    }
+
+    /// Mint a fresh PIN, start a fresh SPAKE2 run, publish its rendezvous
+    /// event, and display the PIN. Returns the generation the sender must
+    /// retain to verify claims.
+    async fn publish_fresh_pin(&self) -> Result<PinGeneration> {
+        let pin = generate_pin()?;
+        // No key stretching: with a balanced PAKE nothing published can be
+        // ground against offline, so stretching would only add latency.
+        let pake_secret = derive_pake_secret(&pin);
+        let bucket = pin_bucket(now_ms());
+        let hint = pin_hint_for_bucket(pin_locator(&pin), bucket);
+        let (run, event) = self.build_rendezvous(&pake_secret, &hint, bucket)?;
         self.client.publish(&event).await?;
 
         ui::show_pin(self.file_name, self.file_size, &pin);
 
         Ok(PinGeneration {
-            pake,
-            nonce,
+            pake_secret,
             bucket,
-            transcript_hash,
+            hint,
+            run: Some(run),
             verify_budget: CLAIM_VERIFY_LIMIT,
         })
+    }
+
+    /// Replace a consumed element: same PIN, same bucket and hint, fresh
+    /// ephemeral scalar behind a fresh blinded element. Published after every
+    /// failed claim verification so the generation stays claimable — the
+    /// honest receiver that lost the race to a junk claim re-claims against
+    /// this replacement. Skipped once the budget is exhausted or the bucket
+    /// has expired, which is what stalls a flooded generation.
+    async fn publish_replacement(&self, generation: &mut PinGeneration) -> Result<()> {
+        if generation.verify_budget == 0 || !is_pin_bucket_active(generation.bucket, now_ms()) {
+            return Ok(());
+        }
+        let (run, event) =
+            self.build_rendezvous(&generation.pake_secret, &generation.hint, generation.bucket)?;
+        generation.run = Some(run);
+        self.client.publish(&event).await
     }
 }
 
@@ -454,16 +512,29 @@ async fn wait_for_verified_claim(
                 if !seen.insert(event.id) {
                     continue;
                 }
-                if let Some(claim) =
-                    verify_claim(
-                        &event,
-                        &mut generations,
-                        rendezvous.transfer_id,
-                        rendezvous.salt,
-                        sender_pubkey,
-                    )
-                {
-                    break claim;
+                match verify_claim(
+                    &event,
+                    &mut generations,
+                    rendezvous.transfer_id,
+                    rendezvous.salt,
+                    sender_pubkey,
+                ) {
+                    ClaimOutcome::Verified(claim) => break *claim,
+                    ClaimOutcome::Consumed(index) => {
+                        // The failed claim consumed that generation's
+                        // single-use element; publish a replacement so the
+                        // generation stays claimable. Best-effort: a relay
+                        // hiccup here must not kill the transfer, and
+                        // rotation replaces the generation regardless.
+                        if let Err(error) =
+                            rendezvous.publish_replacement(&mut generations[index]).await
+                        {
+                            ui::status(&format!(
+                                "Failed to republish rendezvous: {error}"
+                            ));
+                        }
+                    }
+                    ClaimOutcome::Ignored => {}
                 }
             }
         }
@@ -473,23 +544,61 @@ async fn wait_for_verified_claim(
     Ok(claim)
 }
 
-/// Try every retained, active PIN generation with budget left against a claim
-/// event. Invalid claims are ignored, never fatal: transfer tags are public, so
-/// aborting here would let anyone deny the transfer — but every attempt burns a
-/// unit of the generation's verification budget, which is the online-guessing
-/// meter.
+/// What processing a claim event did to the retained generations.
+enum ClaimOutcome {
+    /// The claim verified; the transfer locks to this receiver.
+    Verified(Box<VerifiedClaim>),
+    /// The claim consumed a generation's single-use element without
+    /// verifying; the generation at this index owes a replacement publish.
+    Consumed(usize),
+    /// The event spent nothing: not a claim, or its target names no retained,
+    /// active, unspent element.
+    Ignored,
+}
+
+/// Route a claim event to the single generation whose current element it
+/// targets, consume that element, and verify. Invalid claims are ignored,
+/// never fatal: transfer tags are public, so aborting here would let anyone
+/// deny the transfer — but every verification burns a unit of the generation's
+/// budget, which is the online-guessing meter. A claim whose target is spent,
+/// expired, or was never ours costs nothing.
 fn verify_claim(
     event: &Event,
     generations: &mut [PinGeneration],
     transfer_id: &str,
     salt: &[u8],
     sender_pubkey: &PublicKey,
-) -> Option<VerifiedClaim> {
-    let handshake = parse_handshake_event(event)?;
+) -> ClaimOutcome {
+    let Some(handshake) = parse_handshake_event(event) else {
+        return ClaimOutcome::Ignored;
+    };
     if handshake.handshake_type != HandshakeType::Claim || handshake.transfer_id != transfer_id {
-        return None;
+        return ClaimOutcome::Ignored;
     }
-    let claim_pake_message = handshake.pake_message?;
+    let (Some(claim_pake_message), Some(target)) = (handshake.pake_message, handshake.target)
+    else {
+        return ClaimOutcome::Ignored;
+    };
+
+    let Some(index) = generations.iter().position(|generation| {
+        is_pin_bucket_active(generation.bucket, now_ms())
+            && generation.verify_budget > 0
+            && generation
+                .run
+                .as_ref()
+                .is_some_and(|run| run.transcript_hash == target)
+    }) else {
+        return ClaimOutcome::Ignored;
+    };
+    let generation = &mut generations[index];
+
+    // Consume the element before verifying: it is single-use, and no outcome
+    // below may finish the same scalar again.
+    let run = generation
+        .run
+        .take()
+        .expect("matched a generation with a current run");
+    generation.verify_budget -= 1;
 
     let identities = PakeIdentities {
         transfer_id,
@@ -497,51 +606,43 @@ fn verify_claim(
         receiver_pubkey: &event.pubkey.to_hex(),
     };
 
-    for generation in generations.iter_mut() {
-        if !is_pin_bucket_active(generation.bucket, now_ms()) || generation.verify_budget == 0 {
-            continue;
-        }
-        generation.verify_budget -= 1;
+    // Finish our side of the SPAKE2 run against the claimant's element, then
+    // try the claim seal. A wrong PIN lands on a different root key and the
+    // seal simply refuses to open.
+    let Ok(root) = run.pake.finish(&claim_pake_message, &identities) else {
+        return ClaimOutcome::Consumed(index); // Invalid element
+    };
+    let Ok(seal_keys) = root.handshake_seal_keys(salt) else {
+        return ClaimOutcome::Consumed(index);
+    };
+    let Ok(payload) =
+        open_handshake_payload::<ClaimPayload>(&seal_keys.claim, &handshake.sealed_payload)
+    else {
+        return ClaimOutcome::Consumed(index); // Sealed by a different PAKE session
+    };
 
-        // Finish our side of the SPAKE2 run against the claimant's element,
-        // then try the claim seal. A wrong PIN (or a different generation)
-        // lands on a different root key and the seal simply refuses to open.
-        let Ok(root) = generation.pake.finish(&claim_pake_message, &identities) else {
-            continue; // Invalid element
-        };
-        let Ok(seal_keys) = root.handshake_seal_keys(salt) else {
-            continue;
-        };
-        let Ok(payload) =
-            open_handshake_payload::<ClaimPayload>(&seal_keys.claim, &handshake.sealed_payload)
-        else {
-            continue; // Sealed by a different PAKE session
-        };
-
-        // The payload opened under this generation's session key; its contents
-        // must bind the proof to this transfer, this rotation's nonce, both
-        // identities, and the rendezvous we actually published.
-        if payload.payload_type != "claim"
-            || payload.transfer_id != transfer_id
-            || payload.sender_nonce != generation.nonce
-            || payload.receiver_nonce.is_empty()
-            || payload.sender_pubkey != sender_pubkey.to_hex()
-            || payload.receiver_pubkey != event.pubkey.to_hex()
-            || payload.transcript_hash != generation.transcript_hash
-            || !is_pin_bucket_active(generation.bucket, now_ms())
-        {
-            return None;
-        }
-
-        return Some(VerifiedClaim {
-            receiver_pubkey: event.pubkey,
-            payload,
-            root,
-            seal_keys,
-        });
+    // The payload opened under this run's session key; its contents must bind
+    // the proof to this transfer, this publication's nonce, both identities,
+    // and the rendezvous we actually published. The plaintext target routed
+    // us here but carries no authority — this sealed echo is what does.
+    if payload.payload_type != "claim"
+        || payload.transfer_id != transfer_id
+        || payload.sender_nonce != run.nonce
+        || payload.receiver_nonce.is_empty()
+        || payload.sender_pubkey != sender_pubkey.to_hex()
+        || payload.receiver_pubkey != event.pubkey.to_hex()
+        || payload.transcript_hash != run.transcript_hash
+        || !is_pin_bucket_active(generations[index].bucket, now_ms())
+    {
+        return ClaimOutcome::Consumed(index);
     }
 
-    None
+    ClaimOutcome::Verified(Box::new(VerifiedClaim {
+        receiver_pubkey: event.pubkey,
+        payload,
+        root,
+        seal_keys,
+    }))
 }
 
 async fn publish_offer_and_candidates(

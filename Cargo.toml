@@ -6,7 +6,7 @@ edition = "2024"
 publish = false
 
 [package.metadata]
-secure-send-web-version = "0.0.19"
+secure-send-web-version = "0.0.20"
 
 [lib]
 name = "secure_send_cli"

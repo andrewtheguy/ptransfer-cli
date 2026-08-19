@@ -17,11 +17,11 @@ use super::chunk::fill_random;
 /// Transfer salt length (`SALT_LENGTH`).
 pub const SALT_LEN: usize = 16;
 
-const LABEL_SIGNALS: &str = "secure-send:nostr-session:v3:signals";
-const LABEL_CONTENT: &str = "secure-send:nostr-session:v3:content";
-const LABEL_CLAIM: &str = "secure-send:nostr-session:v3:claim";
-const LABEL_CONFIRM: &str = "secure-send:nostr-session:v3:confirm";
-const LABEL_CONFIRMATION: &str = "secure-send:nostr-session:v3:confirmation";
+const LABEL_SIGNALS: &str = "secure-send:nostr-session:v4:signals";
+const LABEL_CONTENT: &str = "secure-send:nostr-session:v4:content";
+const LABEL_CLAIM: &str = "secure-send:nostr-session:v4:claim";
+const LABEL_CONFIRM: &str = "secure-send:nostr-session:v4:confirm";
+const LABEL_CONFIRMATION: &str = "secure-send:nostr-session:v4:confirmation";
 
 /// Session keys for Nostr (Auto Exchange) mode. Distinct HKDF info labels
 /// guarantee signaling and content never reuse the same AES-GCM key.
@@ -192,19 +192,19 @@ mod tests {
 
         assert_eq!(
             hex_lower(&session.signals),
-            "3d0385a687bba3e63762e6a045d9c75dc4a4647cbbba8444c8ad19292216ddc7"
+            "6d418e6543fd2d99f8d7587a84884b90e1b765ff03e752bc7b265d6e21f10ab1"
         );
         assert_eq!(
             hex_lower(&session.content),
-            "dc8b46530f0175258e64f4e056fc7d9469f7ef6171bc28e1eee4866f8f43b5ec"
+            "f7e6eb8471d0e274ce7f979d5b35d05742ec85e61a831e9ade6f4811a62bbb1d"
         );
         assert_eq!(
             hex_lower(&seals.claim),
-            "714f4116db7a16eb2ff93aaf4daf613367bd57c7ebfac670e98c67ecf5145d0e"
+            "b5be97d4f23fd9105f32692c71d5964276ce01c997154fa31c124cc6ddb83e22"
         );
         assert_eq!(
             hex_lower(&seals.confirm),
-            "9a3a1814481067c1b35fbf2ec9c752c6229ff5ac62f5cc06ba1d54f6386ad6fe"
+            "581475ee363698d069426c1b36805072573080556f8869f75f3dfc0417252357"
         );
     }
 
@@ -220,10 +220,10 @@ mod tests {
             metadata_hash: &metadata_hash,
         };
 
-        // HKDF bits 9d80522f14 over the fixed root, Crockford Base32 encoded.
+        // HKDF bits 98c41f6f50 over the fixed root, Crockford Base32 encoded.
         assert_eq!(
             fixed_root().confirmation_code(&[7u8; SALT_LEN], &binding).unwrap(),
-            encode_crockford_base32(&[0x9d, 0x80, 0x52, 0x2f, 0x14])
+            encode_crockford_base32(&[0x98, 0xc4, 0x1f, 0x6f, 0x50])
         );
     }
 

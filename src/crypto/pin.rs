@@ -56,8 +56,10 @@ pub const PIN_HINT_LOOKBACK_BUCKETS: u64 = PIN_ACTIVE_BUCKETS - 1;
 /// How many SPAKE2 claim verifications the sender runs per PIN generation.
 /// With a balanced PAKE the only way to test a PIN guess is to publish a claim
 /// and have the sender try to verify it, so this cap — not any key stretching —
-/// is the online guessing bound. Exhausting it stalls that generation; rotation
-/// mints a fresh budget with the next PIN.
+/// is the online guessing bound. Every published element is single-use, so each
+/// failed verification also costs the sender one replacement rendezvous
+/// publish; the budget bounds that churn too. Exhausting it stalls that
+/// generation; rotation mints a fresh budget with the next PIN.
 pub const CLAIM_VERIFY_LIMIT: u32 = 100;
 
 /// How many rendezvous candidates the receiver claims per attempt. The hint is
@@ -67,10 +69,17 @@ pub const CLAIM_VERIFY_LIMIT: u32 = 100;
 /// also bounds what a flood of forged rendezvous events can extract.
 pub const MAX_CLAIM_CANDIDATES: usize = 8;
 
+/// Total claims one receive attempt may publish: the initial candidates plus
+/// re-claims against replacement rendezvous events (the sender's elements are
+/// single-use, so a claim that lost the race to a spent element must be redone
+/// against its replacement). This cap is what bounds the online guesses a
+/// claimed candidate's author can milk by rotating replacement elements at us.
+pub const MAX_CLAIM_ATTEMPTS: usize = 16;
+
 /// HKDF salt for the locator-keyed rendezvous hint derivation. A public
 /// constant for domain separation only: the hint is keyed by the public locator
 /// segment and never by any PIN secret.
-const PIN_HINT_HKDF_SALT: &str = "secure-send:pin:v3";
+const PIN_HINT_HKDF_SALT: &str = "secure-send:pin:v4";
 
 /// PIN hint length in hex characters: the Nostr `#h` filter tag. It carries at
 /// most log2(55³) ≈ 17.3 bits regardless of width, because it is a function of
@@ -258,7 +267,7 @@ mod tests {
         // Fixed vector from secure-send-web's computePinHintFromLocator.
         let bucket = 36_947_145;
         assert_eq!(pin_locator("ABCDEFGHJKLA"), "ABC");
-        assert_eq!(pin_hint_for_bucket("ABC", bucket), "a77b01bb");
+        assert_eq!(pin_hint_for_bucket("ABC", bucket), "ae4c9f57");
         assert_eq!(
             pin_hint_for_bucket("ABC", bucket),
             pin_hint_for_bucket(pin_locator("ABCzzzzzzzzQ"), bucket)

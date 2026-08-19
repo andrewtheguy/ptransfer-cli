@@ -4,15 +4,19 @@
 //!
 //! - **Rendezvous** (kind 24243, `type=rendezvous`): published by the sender
 //!   once per PIN rotation, tagged with the rotation-bucket-scoped PIN hint
-//!   (`#h`). The payload is **plaintext JSON**: the SPAKE2 element it carries is
-//!   password-blinded, so nothing in it can confirm a PIN guess offline, and
-//!   encrypting it under a PIN-derived key would reintroduce exactly the offline
-//!   target the PAKE removes. File metadata is deliberately absent.
+//!   (`#h`), and republished with a fresh element whenever a failed claim
+//!   consumes the current one (every element is single-use). The payload is
+//!   **plaintext JSON**: the SPAKE2 element it carries is password-blinded, so
+//!   nothing in it can confirm a PIN guess offline, and encrypting it under a
+//!   PIN-derived key would reintroduce exactly the offline target the PAKE
+//!   removes. File metadata is deliberately absent.
 //! - **Handshake** (kind 24242, `type=claim|confirm`): the receiver claims the
 //!   transfer, the sender confirms and delivers the file metadata. The content
 //!   is a JSON envelope carrying the sealed body plus — for claims — the
-//!   receiver's SPAKE2 element in plaintext, since the sender must finish its
-//!   side of the PAKE before it can derive the key that opens the seal.
+//!   receiver's SPAKE2 element in plaintext (the sender must finish its side
+//!   of the PAKE before it can derive the key that opens the seal) and the
+//!   transcript hash of the rendezvous the claim targets (the sender must know
+//!   which single-use element the claim spends before doing any curve work).
 //! - **Signal** (kind 24242, `type=signal`): WebRTC offer/answer/candidates,
 //!   encrypted with the PAKE-derived session signaling key.
 
@@ -140,7 +144,7 @@ pub fn compute_rendezvous_transcript_hash(
     payload: &RendezvousPayload,
     salt: &[u8],
 ) -> Result<String> {
-    const TRANSCRIPT_LABEL: &str = "secure-send:nostr-rendezvous-transcript:v3";
+    const TRANSCRIPT_LABEL: &str = "secure-send:nostr-rendezvous-transcript:v4";
 
     let canonical = serde_json::to_vec(&serde_json::json!([
         TRANSCRIPT_LABEL,
@@ -210,15 +214,22 @@ pub struct ParsedHandshakeEvent {
     pub sealed_payload: Vec<u8>,
     /// The claimant's SPAKE2 element, when the envelope carries one.
     pub pake_message: Option<Vec<u8>>,
+    /// Transcript hash of the rendezvous a claim targets, when carried.
+    pub target: Option<String>,
 }
 
-/// Content envelope of a handshake event: the sealed body, plus the claimant's
-/// plaintext SPAKE2 element on claims.
+/// Content envelope of a handshake event: the sealed body, plus — on claims —
+/// the claimant's plaintext SPAKE2 element and the transcript hash of the
+/// rendezvous it targets. The target routes the claim to the single-use
+/// element it was derived against; it carries no authority (the sealed body
+/// echoes the same hash) and leaks nothing (it hashes already-public data).
 #[derive(Debug, Serialize, Deserialize)]
 struct HandshakeEnvelope {
     sealed: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pake: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -481,10 +492,12 @@ pub fn create_handshake_event(
     handshake_type: HandshakeType,
     sealed_payload: &[u8],
     pake_message: Option<&[u8]>,
+    target: Option<&str>,
 ) -> Result<Event> {
     let envelope = HandshakeEnvelope {
         sealed: STANDARD.encode(sealed_payload),
         pake: pake_message.map(|message| STANDARD.encode(message)),
+        target: target.map(str::to_string),
     };
     let tags = vec![
         tag("p", recipient_pubkey.to_hex())?,
@@ -519,6 +532,7 @@ pub fn parse_handshake_event(event: &Event) -> Option<ParsedHandshakeEvent> {
         transfer_id: tag_value(event, "t")?.to_string(),
         sealed_payload: STANDARD.decode(envelope.sealed).ok()?,
         pake_message,
+        target: envelope.target,
     })
 }
 
@@ -838,6 +852,7 @@ mod tests {
             HandshakeType::Claim,
             b"sealed",
             Some(&element),
+            Some("target-hash"),
         )
         .expect("claim event");
 
@@ -850,6 +865,7 @@ mod tests {
         assert_eq!(parsed.transfer_id, "transfer-id");
         assert_eq!(parsed.sealed_payload, b"sealed");
         assert_eq!(parsed.pake_message.as_deref(), Some(&element[..]));
+        assert_eq!(parsed.target.as_deref(), Some("target-hash"));
 
         let confirm = create_handshake_event(
             &client,
@@ -858,16 +874,15 @@ mod tests {
             HandshakeType::Confirm,
             b"sealed",
             None,
+            None,
         )
         .expect("confirm event");
         let wire: serde_json::Value = serde_json::from_str(&confirm.content).expect("envelope");
         assert!(wire.get("pake").is_none());
-        assert!(
-            parse_handshake_event(&confirm)
-                .expect("parses")
-                .pake_message
-                .is_none()
-        );
+        assert!(wire.get("target").is_none());
+        let parsed_confirm = parse_handshake_event(&confirm).expect("parses");
+        assert!(parsed_confirm.pake_message.is_none());
+        assert!(parsed_confirm.target.is_none());
     }
 
     /// Drive a complete PIN handshake through the real event encodings: the
@@ -916,6 +931,7 @@ mod tests {
             receiver_pubkey: &receiver_hex,
         };
         let receiver_pake = PakeRun::start(PakeRole::Receiver, &pake_secret).unwrap();
+        let receiver_element = *receiver_pake.message();
         let receiver_root = receiver_pake.finish(&peer_element, &identities).unwrap();
         let receiver_seals = receiver_root.handshake_seal_keys(&parsed.salt).unwrap();
         let receiver_transcript =
@@ -938,12 +954,15 @@ mod tests {
             transfer_id,
             HandshakeType::Claim,
             &seal_handshake_payload(&receiver_seals.claim, &claim).unwrap(),
-            Some(receiver_pake.message()),
+            Some(&receiver_element),
+            Some(&receiver_transcript),
         )
         .unwrap();
 
-        // Sender: finish against the claimant's element and open the seal.
+        // Sender: route the claim by its plaintext target, then finish against
+        // the claimant's element and open the seal.
         let parsed_claim = parse_handshake_event(&claim_event).expect("parses");
+        assert_eq!(parsed_claim.target.as_deref(), Some(sender_transcript.as_str()));
         let claim_element = parsed_claim.pake_message.expect("claims carry an element");
         let sender_root = sender_pake.finish(&claim_element, &identities).unwrap();
         let sender_seals = sender_root.handshake_seal_keys(&salt).unwrap();
@@ -971,6 +990,7 @@ mod tests {
             transfer_id,
             HandshakeType::Confirm,
             &seal_handshake_payload(&sender_seals.confirm, &confirm).unwrap(),
+            None,
             None,
         )
         .unwrap();
@@ -1021,7 +1041,7 @@ mod tests {
     fn rendezvous_transcript_matches_web_fixed_vector() {
         assert_eq!(
             compute_rendezvous_transcript_hash(&sample_rendezvous(), &[7_u8; 32]).unwrap(),
-            "614d33304b183901aa0a9dae42add9b0b8b843b76b3b22f1f1e890a0d08e7643"
+            "90188f66525ea1ceb4115e7cef91f777d22c5c2e9e6b35793622d1b681a28cc6"
         );
     }
 
