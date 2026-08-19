@@ -34,6 +34,42 @@ lookup, so effective strength is 55⁸ ≈ 46.3 bits.
   generation, and the receiver claims at most `MAX_CLAIM_CANDIDATES` (8)
   rendezvous candidates per attempt.
 
+**SPAKE2 scalar reuse.** The receiver picks a fresh ephemeral `y` for every
+rendezvous candidate it claims. The sender does not: it picks one `x` per PIN
+generation, publishes `pA = x·G + w·M` once, and finishes that same run against
+every claim the generation receives — up to `CLAIM_VERIFY_LIMIT` (100) times
+within a 2-minute bucket. RFC 9382 §6 states that "Randomly generated values,
+e.g., x and y, MUST NOT be reused; such reuse violates the security assumptions
+of the protocol and results in significant insecurity." This deployment
+knowingly deviates.
+
+The deviation is structural, not an oversight. `pA` is published to a relay
+before any claimant exists, and every claim is sealed under a transcript that
+commits to the `pA` its author actually saw. Issuing a fresh `x` per claim would
+mean publishing a new rendezvous *after* a claim arrives and having the claimant
+re-derive against it — a third round trip, driven by unauthenticated
+claim-intents, in a protocol whose one-round shape is what lets a receiver claim
+straight from a relay fetch.
+
+What reuse would cost in RFC 9382's own flow does not arise here. There, `A`
+emits `cA = MAC(KcA, TT)` for an attacker-chosen `pB`, so a reused `x` yields
+many chosen-`pB` outputs under one scalar. In this protocol the sender emits
+nothing on a failed claim: the claim *is* the receiver's key confirmation, and
+the sender's confirm is published only once one verifies. An attacker replaying
+against the reused `pA` therefore learns exactly one bit per claim — confirm or
+silence — which is the same bit `CLAIM_VERIFY_LIMIT` already meters. Reuse also
+cannot be combined with small-subgroup or invalid-curve probing to attack `x`
+directly: P-256 has cofactor 1, and every incoming element is checked on-curve
+and non-identity before it is touched.
+
+Two honest limits on that argument. It is a deployment-specific argument, not a
+security reduction: SPAKE2's proof assumes fresh scalars per execution, and
+reuse places this outside the proof's hypotheses, so the protocol relies on the
+absence of a known attack rather than on the RFC's guarantee. And it holds only
+while the sender stays silent on failure — adding *any* sender-side response to
+an unverified claim (an error, a nack, a distinguishable timing path) would turn
+the reused `x` into a chosen-`pB` oracle and make this a real weakness.
+
 **Rotation.** The sender mints and publishes a fresh PIN every 2 minutes
 (`PIN_ROTATION_MS`), honors only PINs minted in its current or immediately
 previous bucket, and attaches a NIP-40 expiration at the end of the PIN's

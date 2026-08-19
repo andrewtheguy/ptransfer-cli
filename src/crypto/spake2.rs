@@ -148,13 +148,23 @@ pub struct PakeIdentities<'a> {
     pub receiver_pubkey: &'a str,
 }
 
-/// One side of one SPAKE2 run: a fresh ephemeral scalar, its blinded element,
-/// and the password scalar the run is authenticated by.
+/// One side of one SPAKE2 run: an ephemeral scalar, its blinded element, and
+/// the password scalar the run is authenticated by.
 ///
-/// The sender starts one per PIN generation; the receiver starts one per
-/// rendezvous candidate it claims. Fresh scalars per run are what make every
-/// published element single-use — nothing replays across rotations, transfers,
-/// or candidates.
+/// The receiver starts one per rendezvous candidate it claims, so its `y` and
+/// `pB` really are single-use. The sender starts one per PIN generation and
+/// [`PakeRun::finish`]es it against *every* claim that generation sees, so its
+/// `x` and `pA` are reused up to
+/// [`crate::crypto::pin::CLAIM_VERIFY_LIMIT`] times inside one rotation
+/// bucket. `finish` takes `&self` for exactly that reason.
+///
+/// That reuse is a deliberate deviation from RFC 9382 §6 ("Randomly generated
+/// values, e.g., x and y, MUST NOT be reused"). It is forced by the rendezvous
+/// shape: `pA` is published before any claimant exists, and each claim is
+/// sealed under a transcript committing to the `pA` its author saw, so a fresh
+/// scalar per claim would need a third round trip. See "SPAKE2 scalar reuse"
+/// in `docs/ARCHITECTURE.md` for why it does not hand an attacker more than
+/// the metered one guess per claim — and for the limits of that argument.
 pub struct PakeRun {
     role: PakeRole,
     secret: [u8; PAKE_SECRET_LEN],
