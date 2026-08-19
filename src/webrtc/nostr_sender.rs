@@ -1,8 +1,10 @@
 //! Nostr Auto Exchange sender compatible with secure-send-web.
 //!
-//! Handshake: publish a rendezvous event per PIN rotation, wait for a
-//! receiver's claim sealed with a still-honored PIN generation, require the
-//! receiver's ECDH-derived confirmation code, then confirm and transfer.
+//! Handshake: publish a plaintext rendezvous event carrying a blinded SPAKE2
+//! element per PIN rotation, finish the PAKE against the first claim that opens
+//! under a still-honored generation, publish the sealed confirm (file metadata
+//! included) immediately, then park until the operator types the confirmation
+//! code the receiver is showing before any WebRTC signal leaves this device.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -18,19 +20,20 @@ use crate::archive::SendSource;
 use crate::crypto::aes;
 use crate::crypto::base32::{constant_time_equal, normalize_crockford_base32};
 use crate::crypto::chunk::MAX_MESSAGE_SIZE;
-use crate::crypto::ecdh::{
-    ConfirmationCodeBinding, EcdhKeyPair, NostrSessionKeys, generate_salt,
+use crate::crypto::kdf::{
+    ConfirmationCodeBinding, HandshakeSealKeys, NostrSessionKeys, PakeRoot, generate_salt,
 };
 use crate::crypto::pin::{
-    PIN_ROTATION_MS, PIN_WAIT_TIMEOUT_MS, PinRoot, generate_pin, generate_transfer_id,
+    CLAIM_VERIFY_LIMIT, PIN_ROTATION_MS, PIN_WAIT_TIMEOUT_MS, generate_pin, generate_transfer_id,
     is_pin_bucket_active, now_ms, pin_bucket, pin_hint_for_bucket, pin_locator,
 };
+use crate::crypto::spake2::{PakeIdentities, PakeRole, PakeRun, derive_pake_secret};
 use crate::signaling::nostr::{
     self, CandidatePayload, ClaimPayload, ConfirmPayload, HandshakeType, NostrClient,
-    RendezvousPayload, Signal, addressed_filter, addressed_filter_from_author,
-    compute_rendezvous_transcript_hash, create_handshake_event, create_rendezvous_event,
-    create_signal_event, generate_handshake_nonce, open_handshake_payload, parse_handshake_event,
-    parse_signal_event, seal_handshake_payload,
+    RendezvousPayload, Signal, TransferMetadata, addressed_filter, addressed_filter_from_author,
+    compute_rendezvous_transcript_hash, compute_transfer_metadata_hash, create_handshake_event,
+    create_rendezvous_event, create_signal_event, generate_handshake_nonce, open_handshake_payload,
+    parse_handshake_event, parse_signal_event, seal_handshake_payload,
 };
 use crate::transfer::run_sender;
 use crate::ui;
@@ -41,32 +44,33 @@ use crate::webrtc::{add_ice_candidate_safely, advertise_max_message_size, candid
 /// Total time the sender keeps rotating/waiting before giving up
 /// ([`PIN_WAIT_TIMEOUT_MS`]).
 const WAIT_FOR_RECEIVER_TIMEOUT: Duration = Duration::from_millis(PIN_WAIT_TIMEOUT_MS);
-/// Human confirmation entry window; shorter than the receiver's confirm wait.
+/// Human confirmation entry window; shorter than the receiver's offer wait, so
+/// a slow typist makes the side with a person in front of it report the timeout.
 const CONFIRM_CODE_ENTRY_TIMEOUT: Duration = Duration::from_secs(150);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 const OFFER_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// One rotation generation of the displayed PIN. Its absolute bucket prevents
-/// retained keys from authenticating outside the current or previous bucket.
+/// One rotation generation of the displayed PIN: its SPAKE2 run, the rendezvous
+/// it published, and the online-guessing budget claims against it may spend.
 struct PinGeneration {
-    auth_key: [u8; aes::AES_KEY_LEN],
+    pake: PakeRun,
     nonce: String,
     bucket: u64,
     transcript_hash: String,
+    /// Remaining SPAKE2 claim verifications. With a PAKE every verification is
+    /// exactly one online PIN guess for whoever authored the claim, so this
+    /// budget — not any key stretching — is the online guessing bound.
+    verify_budget: u32,
 }
 
 /// A verified receiver claim: the transfer is locked to this peer.
 struct VerifiedClaim {
     receiver_pubkey: PublicKey,
-    receiver_ecdh_public_key: Vec<u8>,
     payload: ClaimPayload,
-    auth_key: [u8; aes::AES_KEY_LEN],
-}
-
-fn decode_ecdh_public_key(b64: &str) -> Option<Vec<u8>> {
-    let bytes = STANDARD.decode(b64).ok()?;
-    (bytes.len() == 65 && bytes[0] == 0x04).then_some(bytes)
+    /// Root of the matching SPAKE2 session; every session key hangs off it.
+    root: PakeRoot,
+    seal_keys: HandshakeSealKeys,
 }
 
 pub async fn send_file_nostr(source: &SendSource) -> Result<()> {
@@ -83,16 +87,27 @@ pub async fn send_file_nostr(source: &SendSource) -> Result<()> {
         );
     }
 
-    // Per-transfer credentials: public salt (HKDF input for the ECDH session
-    // keys), ephemeral Nostr identity, and the ephemeral ECDH key pair whose
-    // shared secret will protect signaling and content.
+    // Per-transfer credentials: the public salt (HKDF input for the session
+    // keys) and an ephemeral Nostr identity. The shared secret protecting
+    // signaling and content comes from the SPAKE2 run itself — each PIN
+    // generation carries fresh ephemeral scalars, so there is no key pair to
+    // keep across rotations.
     let step = Instant::now();
     ui::status("Preparing secure keys...");
     let salt = generate_salt()?;
     let transfer_id = generate_transfer_id()?;
-    let ecdh = EcdhKeyPair::generate()?;
-    let ecdh_public_key_b64 = STANDARD.encode(ecdh.public_key_bytes);
     ui::status_timed("Prepared secure keys", step.elapsed());
+
+    // File metadata never touches the rendezvous; it travels inside the sealed
+    // confirm and is bound into the confirmation code through its own digest.
+    let metadata = TransferMetadata {
+        content_type: "file".to_string(),
+        file_name: file_name.clone(),
+        file_size,
+        file_size_exact,
+        mime_type,
+    };
+    let metadata_hash = compute_transfer_metadata_hash(&metadata)?;
 
     let step = Instant::now();
     ui::status("Connecting to Nostr relays...");
@@ -111,11 +126,8 @@ pub async fn send_file_nostr(source: &SendSource) -> Result<()> {
         salt: &salt,
         transfer_id: &transfer_id,
         sender_pubkey_hex: client.public_key_hex(),
-        ecdh_public_key_b64: &ecdh_public_key_b64,
         file_name: &file_name,
         file_size,
-        file_size_exact,
-        mime_type: &mime_type,
     };
 
     let claim = wait_for_verified_claim(&client, &rendezvous, &sender_pubkey).await?;
@@ -125,46 +137,49 @@ pub async fn send_file_nostr(source: &SendSource) -> Result<()> {
     ui::hide_pin();
     ui::status("Receiver claim verified.");
 
-    // Derive the session and human confirmation code from the same ephemeral
-    // ECDH secret. Nothing is confirmed or signaled until the operator enters
-    // the code shown by the receiver.
-    let session_keys: NostrSessionKeys =
-        ecdh.derive_nostr_session_keys(&claim.receiver_ecdh_public_key, &salt)?;
-    let expected_confirmation_code = ecdh.derive_confirmation_code(
-        &claim.receiver_ecdh_public_key,
+    // Session keys and the human confirmation code are HKDF derivations off the
+    // SPAKE2 root the claim just proved agreement on.
+    let session_keys: NostrSessionKeys = claim.root.session_keys(&salt)?;
+    let expected_confirmation_code = claim.root.confirmation_code(
         &salt,
         &ConfirmationCodeBinding {
             transfer_id: &transfer_id,
             sender_nonce: &claim.payload.sender_nonce,
             receiver_nonce: &claim.payload.receiver_nonce,
             transcript_hash: &claim.payload.transcript_hash,
+            metadata_hash: &metadata_hash,
         },
     )?;
-    wait_for_confirmation_code(&expected_confirmation_code).await?;
 
-    // Mutual proof: confirm under the same PIN-derived auth key that sealed
-    // the claim, echoing the transcript, identities, nonces, and receiver key.
+    // Mutual proof plus metadata delivery, sealed under the session's confirm
+    // key. It goes out *before* the code gate: the receiver needs it to learn
+    // what is being offered and to display the confirmation code at all. The
+    // gate guards the WebRTC offer and the file bytes, which is where the harm
+    // lives.
     let confirm = ConfirmPayload {
         payload_type: "confirm".to_string(),
         transfer_id: transfer_id.clone(),
         sender_nonce: claim.payload.sender_nonce.clone(),
         receiver_nonce: claim.payload.receiver_nonce.clone(),
-        receiver_ecdh_public_key: claim.payload.receiver_ecdh_public_key.clone(),
         sender_pubkey: client.public_key_hex(),
         receiver_pubkey: claim.receiver_pubkey.to_hex(),
         transcript_hash: claim.payload.transcript_hash.clone(),
+        metadata,
     };
     let confirm_event = create_handshake_event(
         &client,
         &claim.receiver_pubkey,
         &transfer_id,
         HandshakeType::Confirm,
-        &seal_handshake_payload(&claim.auth_key, &confirm)?,
+        &seal_handshake_payload(&claim.seal_keys.confirm, &confirm)?,
+        None,
     )?;
     let step = Instant::now();
     ui::status("Publishing confirmation to Nostr...");
     client.publish(&confirm_event).await?;
     ui::status_timed("Published confirmation to Nostr", step.elapsed());
+
+    wait_for_confirmation_code(&expected_confirmation_code).await?;
 
     ui::status("Creating P2P connection...");
     let mut peer = WebRtcPeer::new(ICE_GATHER_TIMEOUT).await?;
@@ -322,49 +337,40 @@ struct RendezvousContext<'a> {
     salt: &'a [u8],
     transfer_id: &'a str,
     sender_pubkey_hex: String,
-    ecdh_public_key_b64: &'a str,
     file_name: &'a str,
     file_size: u64,
-    file_size_exact: bool,
-    mime_type: &'a str,
 }
 
 impl RendezvousContext<'_> {
-    /// Mint a fresh PIN, publish its rendezvous event, and display it.
-    /// Returns the generation the sender must retain to verify claims.
+    /// Mint a fresh PIN, start a fresh SPAKE2 run, publish its rendezvous
+    /// event, and display the PIN. Returns the generation the sender must
+    /// retain to verify claims.
     async fn publish_fresh_pin(&self) -> Result<PinGeneration> {
         let pin = generate_pin()?;
-        // The PBKDF2 stretch is CPU-bound (~600k iterations); keep it off the
-        // async runtime worker.
-        let root = tokio::task::spawn_blocking({
-            let pin = pin.clone();
-            move || PinRoot::derive(&pin)
-        })
-        .await
-        .context("PIN derivation task failed")?;
+        // No key stretching: with a balanced PAKE nothing published can be
+        // ground against offline, so stretching would only add latency.
+        let pake_secret = derive_pake_secret(&pin);
+        let pake = PakeRun::start(PakeRole::Sender, &pake_secret)?;
 
         let nonce = generate_handshake_nonce()?;
         let bucket = pin_bucket(now_ms());
         let payload = RendezvousPayload {
             payload_type: "rendezvous".to_string(),
-            content_type: "file".to_string(),
             transfer_id: self.transfer_id.to_string(),
             sender_pubkey: self.sender_pubkey_hex.clone(),
-            ecdh_public_key: self.ecdh_public_key_b64.to_string(),
+            pake_message: STANDARD.encode(pake.message()),
             nonce: nonce.clone(),
             relays: Some(nostr::default_relays_vec()),
-            file_name: self.file_name.to_string(),
-            file_size: self.file_size,
-            file_size_exact: self.file_size_exact,
-            mime_type: self.mime_type.to_string(),
         };
+        // Hash what we are about to publish, so a claim can be checked against
+        // the rendezvous we actually sent rather than the one the claimant says
+        // it saw. Per generation, since the nonce and element are fresh on
+        // every rotation.
         let transcript_hash = compute_rendezvous_transcript_hash(&payload, self.salt)?;
-        let encrypted = aes::encrypt(&root.rendezvous_key(), &serde_json::to_vec(&payload)?)?;
         let event = create_rendezvous_event(
             self.client,
-            &encrypted,
+            &payload,
             self.salt,
-            self.transfer_id,
             &pin_hint_for_bucket(pin_locator(&pin), bucket),
             bucket,
         )?;
@@ -373,10 +379,11 @@ impl RendezvousContext<'_> {
         ui::show_pin(self.file_name, self.file_size, &pin);
 
         Ok(PinGeneration {
-            auth_key: root.auth_key(),
+            pake,
             nonce,
             bucket,
             transcript_hash,
+            verify_budget: CLAIM_VERIFY_LIMIT,
         })
     }
 }
@@ -450,9 +457,9 @@ async fn wait_for_verified_claim(
                 if let Some(claim) =
                     verify_claim(
                         &event,
-                        &generations,
+                        &mut generations,
                         rendezvous.transfer_id,
-                        rendezvous.ecdh_public_key_b64,
+                        rendezvous.salt,
                         sender_pubkey,
                     )
                 {
@@ -466,41 +473,58 @@ async fn wait_for_verified_claim(
     Ok(claim)
 }
 
-/// Try every retained, active PIN generation against a claim event. Invalid
-/// claims are ignored, never fatal: transfer tags are public, so aborting here
-/// would let anyone deny the transfer.
+/// Try every retained, active PIN generation with budget left against a claim
+/// event. Invalid claims are ignored, never fatal: transfer tags are public, so
+/// aborting here would let anyone deny the transfer — but every attempt burns a
+/// unit of the generation's verification budget, which is the online-guessing
+/// meter.
 fn verify_claim(
     event: &Event,
-    generations: &[PinGeneration],
+    generations: &mut [PinGeneration],
     transfer_id: &str,
-    sender_ecdh_public_key_b64: &str,
+    salt: &[u8],
     sender_pubkey: &PublicKey,
 ) -> Option<VerifiedClaim> {
     let handshake = parse_handshake_event(event)?;
     if handshake.handshake_type != HandshakeType::Claim || handshake.transfer_id != transfer_id {
         return None;
     }
+    let claim_pake_message = handshake.pake_message?;
 
-    for generation in generations {
-        if !is_pin_bucket_active(generation.bucket, now_ms()) {
+    let identities = PakeIdentities {
+        transfer_id,
+        sender_pubkey: &sender_pubkey.to_hex(),
+        receiver_pubkey: &event.pubkey.to_hex(),
+    };
+
+    for generation in generations.iter_mut() {
+        if !is_pin_bucket_active(generation.bucket, now_ms()) || generation.verify_budget == 0 {
             continue;
         }
+        generation.verify_budget -= 1;
+
+        // Finish our side of the SPAKE2 run against the claimant's element,
+        // then try the claim seal. A wrong PIN (or a different generation)
+        // lands on a different root key and the seal simply refuses to open.
+        let Ok(root) = generation.pake.finish(&claim_pake_message, &identities) else {
+            continue; // Invalid element
+        };
+        let Ok(seal_keys) = root.handshake_seal_keys(salt) else {
+            continue;
+        };
         let Ok(payload) =
-            open_handshake_payload::<ClaimPayload>(&generation.auth_key, &handshake.sealed_payload)
+            open_handshake_payload::<ClaimPayload>(&seal_keys.claim, &handshake.sealed_payload)
         else {
-            continue; // Sealed with a different PIN/generation
+            continue; // Sealed by a different PAKE session
         };
 
-        let receiver_ecdh_public_key = decode_ecdh_public_key(&payload.receiver_ecdh_public_key);
-
-        // The payload opened under this generation's key; its contents must
-        // bind the proof to this transfer, this rotation's nonce, and both
-        // ECDH public keys (what makes the ECDH session MITM-proof).
+        // The payload opened under this generation's session key; its contents
+        // must bind the proof to this transfer, this rotation's nonce, both
+        // identities, and the rendezvous we actually published.
         if payload.payload_type != "claim"
             || payload.transfer_id != transfer_id
             || payload.sender_nonce != generation.nonce
             || payload.receiver_nonce.is_empty()
-            || payload.sender_ecdh_public_key != sender_ecdh_public_key_b64
             || payload.sender_pubkey != sender_pubkey.to_hex()
             || payload.receiver_pubkey != event.pubkey.to_hex()
             || payload.transcript_hash != generation.transcript_hash
@@ -508,13 +532,12 @@ fn verify_claim(
         {
             return None;
         }
-        let receiver_ecdh_public_key = receiver_ecdh_public_key?;
 
         return Some(VerifiedClaim {
             receiver_pubkey: event.pubkey,
-            receiver_ecdh_public_key,
             payload,
-            auth_key: generation.auth_key,
+            root,
+            seal_keys,
         });
     }
 

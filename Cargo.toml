@@ -6,7 +6,7 @@ edition = "2024"
 publish = false
 
 [package.metadata]
-secure-send-web-version = "0.0.18"
+secure-send-web-version = "0.0.19"
 
 [lib]
 name = "secure_send_cli"
@@ -33,7 +33,6 @@ getrandom = "0.2"
 aes-gcm = "0.10"
 p256 = { version = "0.13", features = ["ecdh"] }
 hkdf = "0.12"
-pbkdf2 = "0.12"
 sha2 = "0.10"
 
 # Manual SS03 signaling payload compression

@@ -3124,7 +3124,6 @@ dependencies = [
  "log",
  "nostr-sdk",
  "p256",
- "pbkdf2",
  "ratatui",
  "rtc",
  "rustls",

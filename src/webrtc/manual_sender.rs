@@ -10,7 +10,8 @@ use rtc::peer_connection::state::RTCPeerConnectionState;
 
 use crate::archive::SendSource;
 use crate::crypto::chunk::MAX_MESSAGE_SIZE;
-use crate::crypto::ecdh::{EcdhKeyPair, generate_salt};
+use crate::crypto::ecdh::EcdhKeyPair;
+use crate::crypto::kdf::generate_salt;
 use crate::signaling::manual::{self, SignalingPayload};
 use crate::transfer::run_sender;
 use crate::ui;
