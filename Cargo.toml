@@ -1,19 +1,19 @@
 [package]
-name = "secure-send-cli"
-# does not have to match secure-send-web's npm version
-version = "0.0.22"
+name = "ptransfer-cli"
+# does not have to match pTransfer's npm version
+version = "0.0.1"
 edition = "2024"
 publish = false
 
 [package.metadata]
-secure-send-web-version = "0.0.20"
+ptransfer-protocol-version = "0.0.22"
 
 [lib]
-name = "secure_send_cli"
+name = "ptransfer_cli"
 path = "src/lib.rs"
 
 [[bin]]
-name = "secure-send-cli"
+name = "ptransfer"
 path = "src/main.rs"
 
 [dependencies]
@@ -29,18 +29,18 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] 
 # Randomness (nonces, salts, ECDH scalars, PINs)
 getrandom = "0.2"
 
-# secure-send-web compatible crypto
+# pTransfer-compatible crypto
 aes-gcm = "0.10"
 p256 = { version = "0.13", features = ["ecdh"] }
 hkdf = "0.12"
 sha2 = "0.10"
 
-# Manual SS03 signaling payload compression
+# Manual PT01 signaling payload compression
 flate2 = "1"
 
 # Multi-file/folder packaging (streamed directly into the transfer)
 zip = { version = "8", default-features = false }
-# Local-time archive-name timestamps (matches secure-send-web's archiveTimestamp)
+# Local-time archive-name timestamps (matches pTransfer's archiveTimestamp)
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Nostr signaling

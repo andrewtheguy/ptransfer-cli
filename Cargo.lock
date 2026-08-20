@@ -2377,6 +2377,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "ptransfer-cli"
+version = "0.0.1"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "crossterm",
+ "env_logger",
+ "flate2",
+ "futures-util",
+ "getrandom 0.2.17",
+ "hkdf",
+ "if-addrs",
+ "log",
+ "nostr-sdk",
+ "p256",
+ "ratatui",
+ "rtc",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "zip",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3102,37 +3133,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4387882333d3aa8cb20530a17c69a3752e97837832f34f6dccc760e715001d9"
 dependencies = [
  "cc",
-]
-
-[[package]]
-name = "secure-send-cli"
-version = "0.0.22"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "crossterm",
- "env_logger",
- "flate2",
- "futures-util",
- "getrandom 0.2.17",
- "hkdf",
- "if-addrs",
- "log",
- "nostr-sdk",
- "p256",
- "ratatui",
- "rtc",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "zip",
 ]
 
 [[package]]

@@ -1,11 +1,11 @@
-//! Manual (copy/paste) signaling - the "SS03" payload format, byte-for-byte
-//! compatible with secure-send-web's `src/lib/manual-signaling.ts`.
+//! Manual (copy/paste) signaling - the "PT01" payload format, byte-for-byte
+//! compatible with pTransfer's `src/lib/manual-signaling.ts`.
 //!
 //! Wire pipeline (offer and answer are identical apart from the JSON body):
 //!
 //! ```text
 //! JSON -> raw DEFLATE -> ["mag!" || compressed] -> XOR-obfuscate
-//!      -> ["SS03" || obfuscated] -> standard base64
+//!      -> ["PT01" || obfuscated] -> standard base64
 //! ```
 //!
 //! The XOR layer is obfuscation, not encryption (secrecy comes from ECDH); it
@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::ecdh::PUBLIC_KEY_LEN;
 
-/// Outer magic: "SS03" (Secure Send version 3).
-const MAGIC_HEADER: [u8; 4] = [0x53, 0x53, 0x30, 0x33];
+/// Outer magic: "PT01" (pTransfer manual-signaling format version 1).
+const MAGIC_HEADER: [u8; 4] = [0x50, 0x54, 0x30, 0x31];
 /// Inner magic: "mag!" - inside the obfuscated area to verify the XOR seed.
 const INNER_MAGIC: [u8; 4] = [0x6d, 0x61, 0x67, 0x21];
 const BUCKET_SEC: u64 = 3600;
@@ -185,7 +185,7 @@ fn inflate(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Encode a payload to the base64 SS03 clipboard string (uses the current time
+/// Encode a payload to the base64 PT01 clipboard string (uses the current time
 /// bucket for obfuscation, matching the web app).
 pub fn encode(payload: &SignalingPayload) -> Result<String> {
     let json = serde_json::to_vec(payload)?;
@@ -204,7 +204,7 @@ pub fn encode(payload: &SignalingPayload) -> Result<String> {
     Ok(STANDARD.encode(&binary))
 }
 
-/// Decode a base64 SS03 clipboard string back into a payload. Tries the current
+/// Decode a base64 PT01 clipboard string back into a payload. Tries the current
 /// and previous time bucket (a ~2-hour window), mirroring the web app.
 pub fn decode(input: &str) -> Result<SignalingPayload> {
     let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
@@ -213,7 +213,7 @@ pub fn decode(input: &str) -> Result<SignalingPayload> {
         .map_err(|e| anyhow::anyhow!("invalid base64: {e}"))?;
 
     if binary.len() < 8 || binary[..4] != MAGIC_HEADER {
-        bail!("not a valid SS03 payload (bad magic header)");
+        bail!("not a valid PT01 payload (bad magic header)");
     }
     let obfuscated_inner = &binary[4..];
     let bucket = current_bucket();
@@ -239,7 +239,7 @@ pub fn decode(input: &str) -> Result<SignalingPayload> {
         return Ok(payload);
     }
 
-    bail!("could not decode SS03 payload (expired or corrupted)");
+    bail!("could not decode PT01 payload (expired or corrupted)");
 }
 
 #[cfg(test)]
@@ -264,6 +264,9 @@ mod tests {
     fn offer_round_trip() {
         let offer = sample_offer();
         let encoded = encode(&offer).unwrap();
+        let binary = STANDARD.decode(&encoded).unwrap();
+        assert_eq!(&binary[..4], b"PT01");
+
         let decoded = decode(&encoded).unwrap();
         assert_eq!(decoded.payload_type, "offer");
         assert_eq!(decoded.sdp, offer.sdp);
@@ -306,7 +309,7 @@ mod tests {
 
     #[test]
     fn rejects_garbage() {
-        assert!(decode("not base64 SS03!").is_err());
+        assert!(decode("not base64 PT01!").is_err());
         assert!(decode(&STANDARD.encode(b"XXXX....")).is_err());
     }
 }

@@ -1,4 +1,4 @@
-//! Nostr Auto Exchange receiver compatible with secure-send-web.
+//! Nostr Auto Exchange receiver compatible with pTransfer.
 //!
 //! Handshake: reduce the PIN to its SPAKE2 password scalar, locate candidate
 //! rendezvous events via rotation-bucket hints, run the receiver side of the

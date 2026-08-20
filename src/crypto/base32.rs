@@ -29,7 +29,7 @@ pub fn encode_crockford_base32(bytes: &[u8]) -> String {
     out
 }
 
-/// Normalize a typed confirmation code exactly like secure-send-web.
+/// Normalize a typed confirmation code exactly like pTransfer.
 ///
 /// ASCII case is folded, spaces/hyphens are dropped, `I`/`L` become `1`, `O`
 /// becomes `0`, and remaining characters outside the Crockford alphabet are

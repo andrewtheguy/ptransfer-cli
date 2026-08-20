@@ -5,7 +5,7 @@
 //! - Nostr plans stay inside the TUI ([`transfer_screen`]), with live status,
 //!   PIN panel, progress gauge, and the file-exists modal.
 //! - Manual plans tear the terminal down and run the existing plain-text flow,
-//!   because the SS03 offer/answer blobs must be copy/pasteable — an alternate
+//!   because the PT01 offer/answer blobs must be copy/pasteable — an alternate
 //!   screen would get in the way. The TUI is never re-entered afterward.
 //!
 //! The process performs exactly one transfer and exits, so the UI event sink

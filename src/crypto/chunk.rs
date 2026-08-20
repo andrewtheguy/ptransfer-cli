@@ -1,4 +1,4 @@
-//! Streaming chunk encryption, byte-for-byte compatible with secure-send-web's
+//! Streaming chunk encryption, byte-for-byte compatible with pTransfer's
 //! `src/lib/crypto/stream-crypto.ts`.
 //!
 //! Each chunk is one discrete WebRTC data-channel message with the wire format:
@@ -15,7 +15,7 @@ use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use anyhow::{Context, Result, bail};
 
-/// Plaintext chunk size (`ENCRYPTION_CHUNK_SIZE` in secure-send-web).
+/// Plaintext chunk size (`ENCRYPTION_CHUNK_SIZE` in pTransfer).
 pub const ENCRYPTION_CHUNK_SIZE: usize = 128 * 1024;
 /// AES-GCM nonce length (`AES_NONCE_LENGTH`).
 pub const NONCE_LEN: usize = 12;

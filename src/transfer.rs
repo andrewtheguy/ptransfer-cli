@@ -1,5 +1,5 @@
 //! Message-oriented file transfer over a WebRTC data channel, matching
-//! secure-send-web's transfer choreography:
+//! pTransfer's transfer choreography:
 //!
 //! - Sender: consume a lazy source in 128 KiB plaintext chunks, send each as
 //!   an encrypted binary message (index 0..N-1), then send the text message

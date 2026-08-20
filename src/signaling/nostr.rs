@@ -1,4 +1,4 @@
-//! Nostr signaling compatible with secure-send-web's Auto Exchange mode.
+//! Nostr signaling compatible with pTransfer's Auto Exchange mode.
 //!
 //! Three event shapes, mirroring `src/lib/nostr/events.ts`:
 //!
@@ -131,7 +131,7 @@ pub struct ConfirmPayload {
     pub metadata: TransferMetadata,
 }
 
-/// Compute secure-send-web's versioned canonical rendezvous transcript digest.
+/// Compute pTransfer's versioned canonical rendezvous transcript digest.
 ///
 /// The SPAKE2 transcript already keys the session by both identities, both
 /// elements, and the transfer id. This digest extends the agreement to the rest
@@ -144,7 +144,7 @@ pub fn compute_rendezvous_transcript_hash(
     payload: &RendezvousPayload,
     salt: &[u8],
 ) -> Result<String> {
-    const TRANSCRIPT_LABEL: &str = "secure-send:nostr-rendezvous-transcript:v4";
+    const TRANSCRIPT_LABEL: &str = "ptransfer:nostr-rendezvous-transcript:v4";
 
     let canonical = serde_json::to_vec(&serde_json::json!([
         TRANSCRIPT_LABEL,
@@ -160,14 +160,14 @@ pub fn compute_rendezvous_transcript_hash(
     Ok(hex_lower(&Sha256::digest(canonical)))
 }
 
-/// Compute secure-send-web's versioned canonical file-metadata digest.
+/// Compute pTransfer's versioned canonical file-metadata digest.
 ///
 /// Metadata travels inside the sealed confirm, so it cannot ride the rendezvous
 /// transcript (the receiver commits to that digest in its claim, before it has
 /// seen any metadata). This digest is bound into the confirmation-code KDF
 /// instead.
 pub fn compute_transfer_metadata_hash(metadata: &TransferMetadata) -> Result<String> {
-    const METADATA_LABEL: &str = "secure-send:nostr-metadata-transcript:v1";
+    const METADATA_LABEL: &str = "ptransfer:nostr-metadata-transcript:v1";
 
     let canonical = serde_json::to_vec(&serde_json::json!([
         METADATA_LABEL,
@@ -638,7 +638,7 @@ pub fn confirm_filter<'a>(
 }
 
 /// Kind-24242 events authored by the sender for this transfer, regardless of
-/// `#p` tag — matches the shape secure-send-web's receiver subscribes with.
+/// `#p` tag — matches the shape pTransfer's receiver subscribes with.
 pub fn signal_filter_from_sender(transfer_id: &str, sender_pubkey: PublicKey) -> Filter {
     Filter::new()
         .kind(data_kind())
@@ -806,7 +806,7 @@ mod tests {
         let opened: ClaimPayload = open_handshake_payload(&key, &sealed).unwrap();
         assert_eq!(opened.sender_nonce, "sn");
 
-        // Wire JSON uses secure-send-web's camelCase field names.
+        // Wire JSON uses pTransfer's camelCase field names.
         let json = serde_json::to_value(&claim).unwrap();
         assert_eq!(json["type"], "claim");
         assert!(json.get("receiverNonce").is_some());
@@ -1041,7 +1041,7 @@ mod tests {
     fn rendezvous_transcript_matches_web_fixed_vector() {
         assert_eq!(
             compute_rendezvous_transcript_hash(&sample_rendezvous(), &[7_u8; 32]).unwrap(),
-            "90188f66525ea1ceb4115e7cef91f777d22c5c2e9e6b35793622d1b681a28cc6"
+            "edf3c4ce9b70adf0cb6e316e247f2f840e18af094d20466dfd55c00e694be675"
         );
     }
 
@@ -1049,7 +1049,7 @@ mod tests {
     fn metadata_transcript_matches_web_fixed_vector() {
         assert_eq!(
             compute_transfer_metadata_hash(&sample_metadata()).unwrap(),
-            "4e81dd4145657c1786a5a7109907cc70b1492cd17a8dcf1cfeeccf81c92aee26"
+            "6ebaf21fd32f1f01883abf53f3b87d3b682a85ec923577f91dddde3567d086b0"
         );
     }
 }

@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use secure_send_cli::archive::{SendSource, prepare_send_source};
-use secure_send_cli::transfer::{run_receiver, run_sender};
-use secure_send_cli::webrtc::common::{DcMessenger, WebRtcPeer, open_and_detach};
+use ptransfer_cli::archive::{SendSource, prepare_send_source};
+use ptransfer_cli::transfer::{run_receiver, run_sender};
+use ptransfer_cli::webrtc::common::{DcMessenger, WebRtcPeer, open_and_detach};
 
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::state::RTCPeerConnectionState;

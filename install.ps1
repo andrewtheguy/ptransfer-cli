@@ -1,26 +1,27 @@
 #!/usr/bin/env pwsh
 
-# Secure Send CLI installer for Windows
-# Downloads latest binary from: https://github.com/andrewtheguy/secure-send-cli/releases
+# pTransfer CLI installer for Windows
+# Downloads latest binary from: https://github.com/andrewtheguy/ptransfer-cli/releases
 #
 # Invocation is now argument-parsed only (compat-breaking): flags are read from
-# $args or $env:SECURE_SEND_CLI_INSTALL_ARGS. Param binding is removed.
+# $args or $env:PTRANSFER_CLI_INSTALL_ARGS. Param binding is removed.
 
 # Defaults (will be overwritten by fallback arg parser)
 $ReleaseTag   = $null
 $Admin        = $false
 $PreRelease   = $false
 $DownloadOnly = $false
+$ScriptArgs   = @($args)
 
 $ErrorActionPreference = "Stop"
 
 $REPO_OWNER = "andrewtheguy"
-$REPO_NAME = "secure-send-cli"
+$REPO_NAME = "ptransfer-cli"
 
 # Allow passing flags when the script is piped into Invoke-Expression (iex) where
 # normal PowerShell parameter binding is unavailable. Users can set
-# $env:SECURE_SEND_CLI_INSTALL_ARGS to a PowerShell-style argument string, e.g.:
-#   $env:SECURE_SEND_CLI_INSTALL_ARGS='-PreRelease'; irm https://andrewtheguy.github.io/secure-send-cli/install.ps1 | iex
+# $env:PTRANSFER_CLI_INSTALL_ARGS to a PowerShell-style argument string, e.g.:
+#   $env:PTRANSFER_CLI_INSTALL_ARGS='-PreRelease'; irm https://andrewtheguy.github.io/ptransfer-cli/install.ps1 | iex
 # This keeps the single-line install experience while still supporting flags.
 
 # Function to print colored messages
@@ -189,11 +190,11 @@ function Get-BinaryName {
         exit 1
     }
 
-    return "secure-send-cli-windows-amd64.exe"
+    return "ptransfer-windows-amd64.exe"
 }
 
 function Get-InstallName {
-    return "secure-send-cli.exe"
+    return "ptransfer.exe"
 }
 
 # Parse argument strings (e.g., from environment variables) using PowerShell's tokenizer
@@ -208,12 +209,12 @@ function Parse-ArgString {
     $tokens = [System.Management.Automation.PSParser]::Tokenize($ArgString, [ref]$errors)
 
     if ($errors -and $errors.Count -gt 0) {
-        Print-Warn "Could not parse SECURE_SEND_CLI_INSTALL_ARGS: $($errors[0].Message)"
+        Print-Warn "Could not parse PTRANSFER_CLI_INSTALL_ARGS: $($errors[0].Message)"
         return @()
     }
 
     return $tokens |
-        Where-Object { $_.Type -in @('CommandArgument', 'CommandParameter', 'String', 'Number') } |
+        Where-Object { $_.Type -in @('Command', 'CommandArgument', 'CommandParameter', 'String', 'Number') } |
         ForEach-Object { $_.Content }
 }
 
@@ -332,9 +333,9 @@ function Install-Binary {
     )
 
     $url = "$BaseUrl/$BinaryName"
-    $tempDir = Join-Path $env:TEMP "secure-send-cli-install-$(Get-Random)"
+    $tempDir = Join-Path $env:TEMP "ptransfer-cli-install-$(Get-Random)"
     $tempBinary = Join-Path $tempDir $BinaryName
-    $installDir = Join-Path $env:LOCALAPPDATA "Programs\secure-send-cli"
+    $installDir = Join-Path $env:LOCALAPPDATA "Programs\ptransfer"
     $installName = Get-InstallName
     $finalPath = Join-Path $installDir $installName
 
@@ -408,7 +409,7 @@ function Show-Usage {
     Write-Host @"
 Usage: .\install.ps1 [OPTIONS] [RELEASE_TAG]
 
-Download and install secure-send-cli binary
+Download and install the pTransfer CLI binary
 
 Options:
   -DownloadOnly  Download binary to current directory without installing
@@ -421,17 +422,17 @@ Arguments:
 
 Environment variables:
   `$env:RELEASE_TAG    Alternative way to specify release tag
-    `$env:SECURE_SEND_CLI_INSTALL_ARGS  Fallback flags for iex one-liners (e.g. "-PreRelease")
+    `$env:PTRANSFER_CLI_INSTALL_ARGS  Fallback flags for iex one-liners (e.g. "-PreRelease")
 
 Examples:
-    .\install.ps1                              # Install latest secure-send-cli (args-only parser)
+    .\install.ps1                              # Install latest pTransfer CLI (args-only parser)
     .\install.ps1 20251210172710               # Install specific release
     .\install.ps1 -PreRelease                  # Install latest prerelease
     .\install.ps1 -DownloadOnly                # Download latest to current directory
     .\install.ps1 -DownloadOnly 20251210172710 # Download specific release
     .\install.ps1 -Admin                       # Allow admin installation (not recommended)
     `$env:RELEASE_TAG='latest'; .\install.ps1  # Use environment variable
-    `$env:SECURE_SEND_CLI_INSTALL_ARGS='-PreRelease'; irm https://andrewtheguy.github.io/secure-send-cli/install.ps1 | iex
+    `$env:PTRANSFER_CLI_INSTALL_ARGS='-PreRelease'; irm https://andrewtheguy.github.io/ptransfer-cli/install.ps1 | iex
 
 Supported platforms: Windows (amd64)
 
@@ -472,10 +473,10 @@ function Start-Installation {
     )
 
     if ($DownloadOnly) {
-        Print-Info "Secure Send CLI downloader"
+        Print-Info "pTransfer CLI downloader"
     }
     else {
-        Print-Info "Secure Send CLI installer"
+        Print-Info "pTransfer CLI installer"
     }
     Print-Info "Release: $Tag"
     Print-Info "Repository: $REPO_OWNER/$REPO_NAME"
@@ -519,18 +520,18 @@ function Start-Installation {
 
 # Main execution
 function Main {
-    # Capture arguments from $args and env for both iex and direct runs
+    # Capture script arguments and env flags for both iex and direct runs.
         $fallbackArgs = @()
-        if ($args -and $args.Count -gt 0) {
-            $fallbackArgs += $args
+        if ($ScriptArgs.Count -gt 0) {
+            $fallbackArgs += $ScriptArgs
         }
-        if ($env:SECURE_SEND_CLI_INSTALL_ARGS) {
-            $fallbackArgs += (Parse-ArgString -ArgString $env:SECURE_SEND_CLI_INSTALL_ARGS)
+        if ($env:PTRANSFER_CLI_INSTALL_ARGS) {
+            $fallbackArgs += (Parse-ArgString -ArgString $env:PTRANSFER_CLI_INSTALL_ARGS)
         }
         Apply-FallbackArgs -ArgList $fallbackArgs
 
         # Extra guard: honor env flags even if tokenization failed
-        $envArgs = $env:SECURE_SEND_CLI_INSTALL_ARGS
+        $envArgs = $env:PTRANSFER_CLI_INSTALL_ARGS
         if ($envArgs) {
             if (-not $PreRelease -and $envArgs -match '(?i)(^|\s)--?prerelease(\s|$)') { $PreRelease = $true }
             if (-not $DownloadOnly -and $envArgs -match '(?i)(^|\s)--?downloadonly(\s|$)') { $DownloadOnly = $true }
@@ -541,17 +542,17 @@ function Main {
         }
 
     # Handle help flags - check both parameter and ReleaseTag value
-    if ($args -contains "--help" -or $args -contains "-h" -or $args -contains "-?" -or $args -contains "/?" -or $args -contains "/h" -or
+    if ($ScriptArgs -contains "--help" -or $ScriptArgs -contains "-h" -or $ScriptArgs -contains "-?" -or $ScriptArgs -contains "/?" -or $ScriptArgs -contains "/h" -or
         $ReleaseTag -eq "--help" -or $ReleaseTag -eq "-h" -or $ReleaseTag -eq "-?" -or $ReleaseTag -eq "/?" -or $ReleaseTag -eq "/h") {
         Show-Usage
         exit 0
     }
 
     if ($DownloadOnly) {
-        Print-Info "Starting Secure Send CLI download..."
+        Print-Info "Starting pTransfer CLI download..."
     }
     else {
-        Print-Info "Starting Secure Send CLI installation..."
+        Print-Info "Starting pTransfer CLI installation..."
     }
 
     # Determine release tag
@@ -583,7 +584,7 @@ try {
 }
 finally {
     # Clean up the fallback args variable to avoid persistence across sessions
-    if (Test-Path env:SECURE_SEND_CLI_INSTALL_ARGS) {
-        Remove-Item env:SECURE_SEND_CLI_INSTALL_ARGS -ErrorAction SilentlyContinue
+    if (Test-Path env:PTRANSFER_CLI_INSTALL_ARGS) {
+        Remove-Item env:PTRANSFER_CLI_INSTALL_ARGS -ErrorAction SilentlyContinue
     }
 }

@@ -1,5 +1,5 @@
 //! SPAKE2 (RFC 9382) over P-256, byte-for-byte compatible with
-//! secure-send-web's `src/lib/crypto/spake2.ts`.
+//! pTransfer's `src/lib/crypto/spake2.ts`.
 //!
 //! A balanced PAKE is what removes the offline attack surface the previous
 //! PBKDF2-sealed handshake had to out-muscle: both published elements are
@@ -30,8 +30,8 @@ pub const PAKE_MESSAGE_LEN: usize = 33;
 pub const PAKE_SECRET_LEN: usize = 32;
 
 /// Versioned domain separators. Bump with any change to the transcript layout.
-const PAKE_CONTEXT: &str = "secure-send:spake2-p256:v4";
-const PAKE_SECRET_SALT: &str = "secure-send:spake2-w:v4";
+const PAKE_CONTEXT: &str = "ptransfer:spake2-p256:v4";
+const PAKE_SECRET_SALT: &str = "ptransfer:spake2-w:v4";
 
 /// RFC 9382 nothing-up-my-sleeve constant `M` for P-256 (compressed SEC1).
 const M_BYTES: [u8; PAKE_MESSAGE_LEN] = [
@@ -167,7 +167,7 @@ pub struct PakeRun {
 
 impl Drop for PakeRun {
     fn drop(&mut self) {
-        // Best-effort hygiene, mirroring secure-send-web's wipe of the PAKE
+        // Best-effort hygiene, mirroring pTransfer's wipe of the PAKE
         // secret when a generation is retired. Every secret here is
         // transfer-scoped and dead within minutes either way.
         self.secret.fill(0);
@@ -345,10 +345,10 @@ mod tests {
 
     #[test]
     fn pake_secret_matches_web_vector() {
-        // secure-send-web's derivePakeSecret("ABCDEFGHJKLA").
+        // pTransfer's derivePakeSecret("ABCDEFGHJKLA").
         assert_eq!(
             hex_lower(&derive_pake_secret("ABCDEFGHJKLA")),
-            "4ff171f7e73e59d95a9a0be87e8ad79384876092b0f7b99cce2f1820ee5fb7ce"
+            "f0cd5f05d917b6e709a3a0b4b5e9c51e8329f1cbd4213d90649ec0687b099e17"
         );
         // Deterministic across the two peers entering the same PIN.
         assert_eq!(
@@ -357,7 +357,7 @@ mod tests {
         );
     }
 
-    /// A fully deterministic run against secure-send-web: fixed `w` (from the
+    /// A fully deterministic run against pTransfer: fixed `w` (from the
     /// PIN above) and fixed ephemeral scalars x = 0x11.., y = 0x22.., so the
     /// published elements, the shared element K, and the transcript digest can
     /// all be pinned as known answers.
@@ -371,17 +371,17 @@ mod tests {
 
         assert_eq!(
             hex_lower(&sender_message),
-            "021bec667675583d7e32b092248fe0f1da12e1e876cfad21d9073ba4b837f27a93"
+            "02f81a66edc179e6db204cd4afabeff70ac2384906889bfa5a5d2caf0054641c91"
         );
         assert_eq!(
             hex_lower(&receiver_message),
-            "023e76f17bd01a193b307ba174e1839a69a21d1f71951225262a6cd11ec90db37f"
+            "03aeaa5ffd18474586f56ddae8f36db4510f2193238f6a9093b82f538e9dc73b38"
         );
 
         let root = sender.finish(&receiver_message, &identities()).unwrap();
         assert_eq!(
             hex_lower(root.ikm()),
-            "71af683d0cda14a5883f729efb953625d2d9d5f1a2498efa0176a8d4aab7672d"
+            "b483b81c6a22bd570f7e5857171051c9e18a44da8834669843eda000b035b983"
         );
         // Both roles land on the same root from opposite sides of the wire.
         let mirrored = receiver.finish(&sender_message, &identities()).unwrap();

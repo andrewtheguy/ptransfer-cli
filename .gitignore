@@ -1,5 +1,5 @@
 /target
-secure_send_cli_*
+ptransfer_cli_*
 .idea/
 build/
 tmp/

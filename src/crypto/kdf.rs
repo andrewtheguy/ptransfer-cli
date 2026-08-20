@@ -1,5 +1,5 @@
 //! Key derivation off the SPAKE2 root established by the PIN handshake,
-//! byte-for-byte compatible with secure-send-web's `src/lib/crypto/kdf.ts`.
+//! byte-for-byte compatible with pTransfer's `src/lib/crypto/kdf.ts`.
 //!
 //! The root already mixes fresh ephemeral scalars from both sides, so it is the
 //! transfer's ephemeral shared secret — there is no ECDH exchange in Nostr
@@ -17,11 +17,11 @@ use super::chunk::fill_random;
 /// Transfer salt length (`SALT_LENGTH`).
 pub const SALT_LEN: usize = 16;
 
-const LABEL_SIGNALS: &str = "secure-send:nostr-session:v4:signals";
-const LABEL_CONTENT: &str = "secure-send:nostr-session:v4:content";
-const LABEL_CLAIM: &str = "secure-send:nostr-session:v4:claim";
-const LABEL_CONFIRM: &str = "secure-send:nostr-session:v4:confirm";
-const LABEL_CONFIRMATION: &str = "secure-send:nostr-session:v4:confirmation";
+const LABEL_SIGNALS: &str = "ptransfer:nostr-session:v4:signals";
+const LABEL_CONTENT: &str = "ptransfer:nostr-session:v4:content";
+const LABEL_CLAIM: &str = "ptransfer:nostr-session:v4:claim";
+const LABEL_CONFIRM: &str = "ptransfer:nostr-session:v4:confirm";
+const LABEL_CONFIRMATION: &str = "ptransfer:nostr-session:v4:confirmation";
 
 /// Session keys for Nostr (Auto Exchange) mode. Distinct HKDF info labels
 /// guarantee signaling and content never reuse the same AES-GCM key.
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn session_and_seal_labels_match_web_vectors() {
         // HKDF-SHA256(ikm = 0x00..0x1f, salt = 16 x 0x07) with the kdf.ts info
-        // labels, verified against secure-send-web's Web Crypto derivations.
+        // labels, verified against pTransfer's Web Crypto derivations.
         let root = fixed_root();
         let salt = [7u8; SALT_LEN];
         let session = root.session_keys(&salt).unwrap();
@@ -192,19 +192,19 @@ mod tests {
 
         assert_eq!(
             hex_lower(&session.signals),
-            "6d418e6543fd2d99f8d7587a84884b90e1b765ff03e752bc7b265d6e21f10ab1"
+            "e2ef8867c18f2b2c18a5c0ba43d0c847dde7b82fd88154306ae7d63240dc79f9"
         );
         assert_eq!(
             hex_lower(&session.content),
-            "f7e6eb8471d0e274ce7f979d5b35d05742ec85e61a831e9ade6f4811a62bbb1d"
+            "e76cf121350e644ecfcfdc3064175fde202fb66033af60f395b9215f1ff09701"
         );
         assert_eq!(
             hex_lower(&seals.claim),
-            "b5be97d4f23fd9105f32692c71d5964276ce01c997154fa31c124cc6ddb83e22"
+            "648d59c93a4bfc65ce45d1da06ed98eda628b6b3b9b280862a855bac078378fc"
         );
         assert_eq!(
             hex_lower(&seals.confirm),
-            "581475ee363698d069426c1b36805072573080556f8869f75f3dfc0417252357"
+            "81c7de7b8b45d14d20492c2a11ba61967a50cbc6c17ddca481db973b5d7c46e7"
         );
     }
 
@@ -220,10 +220,10 @@ mod tests {
             metadata_hash: &metadata_hash,
         };
 
-        // HKDF bits 98c41f6f50 over the fixed root, Crockford Base32 encoded.
+        // HKDF bits 12be48769b over the fixed root, Crockford Base32 encoded.
         assert_eq!(
             fixed_root().confirmation_code(&[7u8; SALT_LEN], &binding).unwrap(),
-            encode_crockford_base32(&[0x98, 0xc4, 0x1f, 0x6f, 0x50])
+            encode_crockford_base32(&[0x12, 0xbe, 0x48, 0x76, 0x9b])
         );
     }
 

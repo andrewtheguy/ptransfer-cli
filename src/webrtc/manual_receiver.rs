@@ -1,4 +1,4 @@
-//! Manual-mode receiver: consume the sender's SS03 offer code, hand back an
+//! Manual-mode receiver: consume the sender's PT01 offer code, hand back an
 //! answer code, connect, and receive the encrypted file to disk.
 
 use std::path::PathBuf;
@@ -23,7 +23,7 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Receive a single file using manual (copy/paste) signaling.
 ///
-/// `offer_code` is the sender's SS03 offer; `output_dir` defaults to the
+/// `offer_code` is the sender's PT01 offer; `output_dir` defaults to the
 /// current directory.
 pub async fn receive_file_manual(
     offer_code: &str,
@@ -104,7 +104,7 @@ pub async fn receive_file_manual(
         bail!("No ICE candidates gathered. Check your network connection.");
     }
 
-    // Build and show the SS03 answer code.
+    // Build and show the PT01 answer code.
     let answer_payload = SignalingPayload::answer(
         advertise_max_message_size(answer.sdp),
         candidate_strings(candidates)?,
@@ -113,7 +113,7 @@ pub async fn receive_file_manual(
     );
     let answer_code = manual::encode(&answer_payload)?;
     ui::status("Send this response code back to the sender:");
-    ui::show_code("SECURE SEND RESPONSE", &answer_code);
+    ui::show_code("PTRANSFER RESPONSE", &answer_code);
 
     let peer = Arc::new(peer);
 
