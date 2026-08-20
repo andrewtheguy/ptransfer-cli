@@ -182,7 +182,7 @@ pub fn show_pin(file_name: &str, file_size: u64, pin: &str) {
         return;
     }
     eprintln!(
-        "Ready to send \"{file_name}\" ({}). Enter this PIN in secure-send-web:",
+        "Ready to send \"{file_name}\" ({}). Enter this PIN in pTransfer:",
         format_bytes(file_size)
     );
     println!("{pin}");
@@ -306,7 +306,7 @@ fn prompt_file_exists_blocking(path: &Path) -> Result<FileExistsChoice> {
 
 /// Read a pasted code, submitted with a single Enter.
 ///
-/// Base64 SS03 codes are single-line, but a paste may carry hard line breaks
+/// Base64 PT01 codes are single-line, but a paste may carry hard line breaks
 /// (e.g. copied from wrapped text). A multi-line paste lands in the input
 /// buffer all at once, so after the first line we briefly drain whatever else
 /// is already there and join it — one Enter still submits.

@@ -1,4 +1,4 @@
-//! Manual-mode sender: create an offer, hand the receiver an SS03 offer code,
+//! Manual-mode sender: create an offer, hand the receiver a PT01 offer code,
 //! consume their answer code, connect, and stream the encrypted file.
 
 use std::sync::Arc;
@@ -57,7 +57,7 @@ pub async fn send_file_manual(source: &SendSource) -> Result<()> {
         bail!("No ICE candidates gathered. Check your network connection.");
     }
 
-    // Build and show the SS03 offer code.
+    // Build and show the PT01 offer code.
     let offer_payload = SignalingPayload::offer(
         advertise_max_message_size(offer.sdp),
         candidate_strings(candidates)?,
@@ -74,7 +74,7 @@ pub async fn send_file_manual(source: &SendSource) -> Result<()> {
         "Ready to send \"{}\" ({} bytes). Give this offer code to the receiver:",
         file_name, file_size
     ));
-    ui::show_code("SECURE SEND OFFER", &offer_code);
+    ui::show_code("PTRANSFER OFFER", &offer_code);
 
     // Read the receiver's answer code.
     let answer_code = ui::prompt_code("Paste the receiver's response code:").await?;

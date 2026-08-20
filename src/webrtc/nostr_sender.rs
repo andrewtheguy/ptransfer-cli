@@ -1,4 +1,4 @@
-//! Nostr Auto Exchange sender compatible with secure-send-web.
+//! Nostr Auto Exchange sender compatible with pTransfer.
 //!
 //! Handshake: publish a plaintext rendezvous event carrying a blinded SPAKE2
 //! element per PIN rotation, finish the PAKE against the first claim targeting
@@ -87,7 +87,7 @@ struct PinGeneration {
 
 impl Drop for PinGeneration {
     fn drop(&mut self) {
-        // Best-effort hygiene, mirroring secure-send-web's wipe when a
+        // Best-effort hygiene, mirroring pTransfer's wipe when a
         // generation is retired; the run's own secret wipes itself.
         self.pake_secret.fill(0);
     }

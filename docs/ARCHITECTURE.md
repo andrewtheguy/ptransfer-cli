@@ -1,7 +1,7 @@
 # Architecture
 
-`secure-send-cli` is a CLI client for `secure-send-web`. The web app is the source
-of truth for protocol shape and compatibility.
+`ptransfer-cli` provides the `ptransfer` command-line client for pTransfer. The web app is the source of truth
+for protocol shape and compatibility.
 
 ## Modes
 
@@ -21,12 +21,12 @@ leading three characters are a public locator segment used only for relay
 lookup, so effective strength is 55⁸ ≈ 46.3 bits.
 
 - `hint:<bucket>` — 8-hex-character event lookup tag, derived by HKDF-SHA256
-  (salt `secure-send:pin:v4`) directly from the public locator and scoped to the
+  (salt `ptransfer:pin:v4`) directly from the public locator and scoped to the
   2-minute rotation bucket (`floor(now_ms / 120000)`). It is a candidate filter,
   not an authenticator, and carries at most ~17.3 bits, so collisions are
   expected.
 - `w` — the SPAKE2 password scalar: `HKDF-SHA256(ikm = pin, salt =
-  "secure-send:spake2-w:v4", info = "w", len = 48)` reduced mod the P-256 order
+  "ptransfer:spake2-w:v4", info = "w", len = 48)` reduced mod the P-256 order
   and serialized as 32 big-endian bytes. There is deliberately **no** key
   stretching: stretching only helps against offline guessing, and a balanced
   PAKE leaves nothing to grind. Online guessing is metered instead — the sender
@@ -130,7 +130,7 @@ backstop, not a security bound — before giving up.
    receiver allows 60 seconds for it and verifies every echoed field.
 6. Both sides derive an 8-character Crockford Base32 confirmation code from 40
    HKDF-SHA256 bits over the SPAKE2 root with info
-   `secure-send:nostr-session:v4:confirmation|<transfer-id>|<sender-nonce>|<receiver-nonce>|<transcript-hash>|<metadata-hash>`,
+   `ptransfer:nostr-session:v4:confirmation|<transfer-id>|<sender-nonce>|<receiver-nonce>|<transcript-hash>|<metadata-hash>`,
    where the metadata hash is a versioned SHA-256 digest of the confirmed
    metadata. The receiver displays it; the sender publishes no WebRTC signal and
    no file byte until its operator enters a normalized match, waiting up to 150
@@ -138,8 +138,8 @@ backstop, not a security bound — before giving up.
    sender's first signal, which is how it learns the code matched.
 7. Both sides derive the session keys with HKDF-SHA256 over the SPAKE2
    transcript root and the public transfer salt:
-   `secure-send:nostr-session:v4:signals` (relay-carried WebRTC signaling) and
-   `secure-send:nostr-session:v4:content` (P2P file chunks). The claim/confirm
+   `ptransfer:nostr-session:v4:signals` (relay-carried WebRTC signaling) and
+   `ptransfer:nostr-session:v4:content` (P2P file chunks). The claim/confirm
    seal keys use the `:claim` and `:confirm` labels off the same root.
 8. Sender and receiver exchange kind `24242` WebRTC signal events (`offer`,
    `answer`, `candidate`), encrypted with the session signals key.
@@ -147,7 +147,7 @@ backstop, not a security bound — before giving up.
    - Sender-side answer subscriptions filter by `t`, `p=<sender pubkey>`, and
      receiver author.
    - Receiver-side offer subscriptions filter by `t` and sender author only,
-     matching `secure-send-web`.
+     matching pTransfer.
    - Offer and answer bundles are republished while the P2P connection is
      pending so relay misses do not strand the session, and each bundle's
      events are published concurrently so one slow relay does not serialize
@@ -156,19 +156,19 @@ backstop, not a security bound — before giving up.
    content key. Completion is the data channel `ACK`; no relay event is
    published after signaling.
 
-Default relays match `secure-send-web`. Transport is direct-only: STUN servers
+Default relays match pTransfer. Transport is direct-only: STUN servers
 assist NAT traversal, but no TURN relay is configured, so a transfer fails
 rather than route file bytes through a relay.
 
-### Manual SS03 Mode
+### Manual PT01 Mode
 
 Manual mode is explicit: `send --manual` and `receive --manual`.
 
-The signaling payload is the web app's SS03 format:
+The signaling payload is the web app's PT01 format:
 
 ```text
 JSON -> raw DEFLATE -> "mag!" || compressed -> time-bucket XOR
-     -> "SS03" || obfuscated -> standard base64
+     -> "PT01" || obfuscated -> standard base64
 ```
 
 Manual offer payloads contain SDP, ICE candidate strings, file metadata,
@@ -183,7 +183,7 @@ Both sides derive the AES content key with:
 HKDF-SHA256(
   ikm = P-256 ECDH shared X coordinate,
   salt = offer salt,
-  info = "secure-send-mutual",
+  info = "ptransfer-mutual",
   len = 32
 )
 ```
@@ -220,8 +220,8 @@ arms the same window once the data channel is open and resets it for every
 incoming data-channel message, including
 `DONE:<total_chunks>:<total_bytes>`.
 
-The maximum transfer size is 2 GiB (`MAX_MESSAGE_SIZE`), matching
-`secure-send-web`; both ends stream chunk by chunk, so the bound is not RAM.
+The maximum transfer size is 2 GiB (`MAX_MESSAGE_SIZE`), matching pTransfer; both
+ends stream chunk by chunk, so the bound is not RAM.
 For multi-file/folder sends the CLI walks and validates the selection first,
 then starts a store-mode ZIP writer only after the data channel opens. A
 bounded channel applies backpressure between blocking file reads/ZIP output

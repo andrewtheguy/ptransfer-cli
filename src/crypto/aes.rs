@@ -1,4 +1,4 @@
-//! AES-256-GCM helpers compatible with secure-send-web's `aes-gcm.ts`.
+//! AES-256-GCM helpers compatible with pTransfer's `aes-gcm.ts`.
 //!
 //! Format for Nostr metadata/signaling ciphertexts:
 //! `12-byte nonce || ciphertext || 16-byte GCM tag`.

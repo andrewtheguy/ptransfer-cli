@@ -76,13 +76,13 @@ jobs:
         run: cargo build --release --all-features --target ${{ matrix.target }}
 
       - name: Rename CLI binary
-        run: mv target/${{ matrix.target }}/release/secure-send-cli target/release/secure-send-cli-${{ matrix.suffix }}
+        run: mv target/${{ matrix.target }}/release/ptransfer target/release/ptransfer-${{ matrix.suffix }}
 
       - name: Upload CLI release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: release-secure-send-cli-${{ matrix.suffix }}
-          path: target/release/secure-send-cli-${{ matrix.suffix }}
+          name: release-ptransfer-${{ matrix.suffix }}
+          path: target/release/ptransfer-${{ matrix.suffix }}
 
   build-macos:
     needs: setup
@@ -105,13 +105,13 @@ jobs:
         run: cargo build --release --all-features --target ${{ matrix.target }}
 
       - name: Rename CLI binary
-        run: mv target/${{ matrix.target }}/release/secure-send-cli target/release/secure-send-cli-${{ matrix.suffix }}
+        run: mv target/${{ matrix.target }}/release/ptransfer target/release/ptransfer-${{ matrix.suffix }}
 
       - name: Upload CLI release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: release-secure-send-cli-${{ matrix.suffix }}
-          path: target/release/secure-send-cli-${{ matrix.suffix }}
+          name: release-ptransfer-${{ matrix.suffix }}
+          path: target/release/ptransfer-${{ matrix.suffix }}
 
   build-windows:
     needs: setup
@@ -133,13 +133,13 @@ jobs:
         run: cargo build --release --all-features --target ${{ env.TARGET }}
 
       - name: Rename CLI binary
-        run: move target\${{ env.TARGET }}\release\secure-send-cli.exe target\release\secure-send-cli-${{ env.SUFFIX }}.exe
+        run: move target\${{ env.TARGET }}\release\ptransfer.exe target\release\ptransfer-${{ env.SUFFIX }}.exe
 
       - name: Upload CLI release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: release-secure-send-cli-${{ env.SUFFIX }}
-          path: target/release/secure-send-cli-${{ env.SUFFIX }}.exe
+          name: release-ptransfer-${{ env.SUFFIX }}
+          path: target/release/ptransfer-${{ env.SUFFIX }}.exe
 
   create-release:
     needs: [setup, build-linux, build-macos, build-windows]

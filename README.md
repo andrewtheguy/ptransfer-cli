@@ -1,14 +1,14 @@
-# secure-send-cli
+# ptransfer-cli
 
-CLI companion for [`secure-send-web`](https://github.com/andrewtheguy/secure-send-web).
+CLI companion for [pTransfer](https://github.com/andrewtheguy/ptransfer).
 
 This project is pre-release software. No backward compatibility or legacy
 protocol support is maintained.
 
 ## What It Does
 
-`secure-send-cli` sends and receives files and folders with the same wire
-formats as `secure-send-web`. Running the binary with no arguments launches a
+The `ptransfer` command sends and receives files and folders with the same wire
+formats as pTransfer. Running the binary with no arguments launches a
 full-screen TUI wizard that walks through the whole transfer: send or receive,
 file/folder selection, signaling mode, output directory, and PIN entry.
 
@@ -19,7 +19,7 @@ file/folder selection, signaling mode, output directory, and PIN entry.
   content keys. Nothing published to a relay can test a PIN guess offline. The
   receiver then reads an 8-character confirmation code to the sender; nothing
   is sent until the sender enters a match.
-- Manual SS03 copy/paste signaling, compatible with the web app's manual
+- Manual PT01 copy/paste signaling, compatible with the web app's manual
   exchange codes. When chosen in the wizard, the TUI exits back to the normal
   terminal so the offer/response codes can be copy/pasted.
 - Multiple files and folders are bundled into a single ZIP on the fly, exactly
@@ -49,7 +49,7 @@ binary in your PATH; no runtime dependencies or package managers are required.
 The shell installer supports Linux x86_64/aarch64 and macOS Apple Silicon.
 
 ```bash
-curl -sSL https://andrewtheguy.github.io/secure-send-cli/install.sh | bash
+curl -sSL https://andrewtheguy.github.io/ptransfer-cli/install.sh | bash
 ```
 
 By default the installer pulls the latest **stable** release. Use `--prerelease`
@@ -58,10 +58,10 @@ Examples:
 
 ```bash
 # Latest prerelease
-curl -sSL https://andrewtheguy.github.io/secure-send-cli/install.sh | bash -s -- --prerelease
+curl -sSL https://andrewtheguy.github.io/ptransfer-cli/install.sh | bash -s -- --prerelease
 
 # Pin to a specific tag
-curl -sSL https://andrewtheguy.github.io/secure-send-cli/install.sh | bash -s <release-tag>
+curl -sSL https://andrewtheguy.github.io/ptransfer-cli/install.sh | bash -s <release-tag>
 ```
 
 ### Quick Install (Windows)
@@ -69,19 +69,19 @@ curl -sSL https://andrewtheguy.github.io/secure-send-cli/install.sh | bash -s <r
 The Windows installer supports x86_64 (AMD64).
 
 ```powershell
-irm https://andrewtheguy.github.io/secure-send-cli/install.ps1 | iex
+irm https://andrewtheguy.github.io/ptransfer-cli/install.ps1 | iex
 ```
 
 By default the PowerShell installer pulls the latest **stable** release. Because
 parameter binding is unavailable when piping into `iex`, pass flags via
-`$env:SECURE_SEND_CLI_INSTALL_ARGS`. Examples:
+`$env:PTRANSFER_CLI_INSTALL_ARGS`. Examples:
 
 ```powershell
 # Latest prerelease
-$env:SECURE_SEND_CLI_INSTALL_ARGS='-PreRelease'; irm https://andrewtheguy.github.io/secure-send-cli/install.ps1 | iex
+$env:PTRANSFER_CLI_INSTALL_ARGS='-PreRelease'; irm https://andrewtheguy.github.io/ptransfer-cli/install.ps1 | iex
 
 # Pin to a specific tag
-$env:SECURE_SEND_CLI_INSTALL_ARGS='<release-tag>'; irm https://andrewtheguy.github.io/secure-send-cli/install.ps1 | iex
+$env:PTRANSFER_CLI_INSTALL_ARGS='<release-tag>'; irm https://andrewtheguy.github.io/ptransfer-cli/install.ps1 | iex
 ```
 
 ### From Source
@@ -96,14 +96,14 @@ Run the binary with no arguments to start the TUI wizard — it takes no CLI
 arguments at all:
 
 ```bash
-secure-send-cli
+ptransfer
 ```
 
 The wizard covers everything interactively: choose send or receive, pick files
 and/or folders in the built-in browser (Space to multi-select), choose the
 signaling mode, and when receiving, browse to the output directory (or create
 a new folder with `n`) and enter the PIN. Nostr PIN transfers run inside the
-TUI with live status and progress; manual SS03 transfers drop back to the
+TUI with live status and progress; manual PT01 transfers drop back to the
 plain terminal for the code swap.
 
 ### Non-Interactive Test Mode
@@ -115,8 +115,8 @@ read from stdin and can be piped.
 Nostr PIN mode:
 
 ```bash
-secure-send-cli test send /path/to/file more-files a-folder
-secure-send-cli test receive <PIN> --output /path/to/dir
+ptransfer test send /path/to/file more-files a-folder
+ptransfer test receive <PIN> --output /path/to/dir
 ```
 
 The sender prints a case-sensitive 12-character PIN on stdout, and prints a
@@ -126,11 +126,11 @@ transfer; enter the PIN currently shown exactly. The receiver then prints an
 continues. Multiple paths or a folder are sent as one ZIP. If the destination
 file already exists the receiver fails; pass `--overwrite` to replace it.
 
-Manual SS03 mode:
+Manual PT01 mode:
 
 ```bash
-secure-send-cli test send --manual /path/to/file
-secure-send-cli test receive --manual <OFFER-CODE>
+ptransfer test send --manual /path/to/file
+ptransfer test receive --manual <OFFER-CODE>
 ```
 
 The sender prints an offer code and waits for the response code on stdin. The
@@ -138,14 +138,14 @@ receiver takes the offer code as an argument and prints a response code.
 
 ## Protocol Compatibility
 
-The CLI follows `secure-send-web` as the source of truth:
+The CLI follows pTransfer as the source of truth:
 
 - Rendezvous event: Nostr kind `24243`, tagged with a rotation-bucket-scoped
   PIN hint and a NIP-40 expiration. The payload is plaintext JSON carrying a
   blinded SPAKE2 element — nothing in it is PIN-testable, and file metadata is
   deliberately absent.
 - Claim/confirm handshake and WebRTC signal events: Nostr kind `24242`.
-- Default relays match `secure-send-web`.
+- Default relays match pTransfer.
 - The PIN reduces to the SPAKE2 password scalar `w` (HKDF-SHA256 to 384 bits,
   reduced mod the P-256 order); there is no key stretching because nothing
   published permits offline guessing. The public lookup hint is derived only
@@ -165,13 +165,13 @@ The CLI follows `secure-send-web` as the source of truth:
 - PIN rotation: fresh PIN every 2 minutes; only PINs minted in the current or
   immediately previous bucket are honored (roughly 2–4 minutes). The sender
   waits up to 30 minutes for a receiver before giving up.
-- Manual signaling uses SS03 payloads.
+- Manual signaling uses PT01 payloads.
 - File chunks use AES-256-GCM with the 2-byte chunk index as AAD, followed by
   `DONE:<chunkCount>:<byteCount>` and receiver `ACK`.
 
 ## Limits
 
-- Maximum transfer size is 2 GiB, matching `secure-send-web`. For a generated
+- Maximum transfer size is 2 GiB, matching pTransfer. For a generated
   ZIP this applies to the final archive, so a selection whose ZIP crosses the
   limit fails while it is being generated and sent.
 - Received ZIPs are not auto-extracted, matching the web app.
@@ -195,11 +195,11 @@ Run the live CLI-to-CLI and bidirectional CLI/web interoperability test:
 node tests/live_interop_e2e.mjs
 ```
 
-It requires internet access, Node/npm, a Chrome-family browser, and a
-`secure-send-web` checkout next to this repository. Set
-`SECURE_SEND_WEB_ROOT`, `SECURE_SEND_WEB_URL`, or `CHROME_PATH` to override
-those defaults. The script builds the CLI with all features, starts the web
-development server when needed, and leaves byte-verified transfer artifacts in
-the temporary directory printed at the end.
+It requires internet access, Node/npm, a Chrome-family browser, and a pTransfer
+checkout in the sibling `ptransfer` folder. Set `PTRANSFER_WEB_ROOT`,
+`PTRANSFER_WEB_URL`, or `CHROME_PATH` to override those defaults. The script builds
+the CLI with all features, starts the web development server when needed, and
+leaves byte-verified transfer artifacts in the temporary directory printed at
+the end.
 
 Do not run `cargo fmt` for this repo.

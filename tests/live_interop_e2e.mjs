@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
-// Live interoperability smoke test for secure-send-cli and secure-send-web.
+// Live interoperability smoke test for the pTransfer CLI and web app.
 //
 // This deliberately uses the public Nostr relays and real WebRTC transports.
 // It is therefore separate from `cargo test` and requires internet access,
-// Node/npm, a Chrome-family browser, and the sibling secure-send-web checkout.
+// Node/npm, a Chrome-family browser, and the sibling pTransfer checkout.
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -27,19 +27,19 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const CLI_ROOT = resolve(SCRIPT_DIR, '..');
 const WEB_ROOT = resolve(
-  process.env.SECURE_SEND_WEB_ROOT ?? join(CLI_ROOT, '..', 'secure-send-web'),
+  process.env.PTRANSFER_WEB_ROOT ?? join(CLI_ROOT, '..', 'ptransfer'),
 );
 const REQUESTED_WEB_URL = new URL(
-  process.env.SECURE_SEND_WEB_URL ?? 'http://127.0.0.1:4173',
+  process.env.PTRANSFER_WEB_URL ?? 'http://127.0.0.1:4173',
 );
 let webUrl = REQUESTED_WEB_URL;
-const CLI = join(CLI_ROOT, 'target', 'debug', 'secure-send-cli');
+const CLI = join(CLI_ROOT, 'target', 'debug', 'ptransfer');
 const CACHE_ROOT = resolve(
-  process.env.SECURE_SEND_E2E_CACHE
-    ?? join(tmpdir(), 'secure-send-cli-live-e2e-cache'),
+  process.env.PTRANSFER_E2E_CACHE
+    ?? join(tmpdir(), 'ptransfer-cli-live-e2e-cache'),
 );
-const PLAYWRIGHT_VERSION = process.env.SECURE_SEND_PLAYWRIGHT_VERSION ?? '1.55.0';
-const ARTIFACTS = await mkdtemp(join(tmpdir(), 'secure-send-live-e2e-'));
+const PLAYWRIGHT_VERSION = process.env.PTRANSFER_PLAYWRIGHT_VERSION ?? '1.55.0';
+const ARTIFACTS = await mkdtemp(join(tmpdir(), 'ptransfer-live-e2e-'));
 const CONFIRMATION_CODE = /^[0-9A-HJKMNPQRSTVWXYZ]{8}$/;
 
 const activeClis = new Set();
@@ -106,18 +106,18 @@ async function assertProtocolVersionMatches() {
     await readFile(join(WEB_ROOT, 'package.json'), 'utf8'),
   );
   const metadataMatch = cargoToml.match(
-    /^secure-send-web-version\s*=\s*"([^"]+)"\s*$/m,
+    /^ptransfer-protocol-version\s*=\s*"([^"]+)"\s*$/m,
   );
   if (!metadataMatch) {
-    throw new Error('Cargo.toml is missing package.metadata.secure-send-web-version');
+    throw new Error('Cargo.toml is missing package.metadata.ptransfer-protocol-version');
   }
   if (metadataMatch[1] !== webPackage.version) {
     throw new Error(
-      `Protocol version mismatch: CLI declares secure-send-web ${metadataMatch[1]}, `
+      `Protocol version mismatch: CLI declares pTransfer ${metadataMatch[1]}, `
       + `but ${WEB_ROOT}/package.json is ${webPackage.version}`,
     );
   }
-  console.log(`[setup] protocol version secure-send-web ${webPackage.version}`);
+  console.log(`[setup] protocol version pTransfer ${webPackage.version}`);
   return webPackage;
 }
 
@@ -181,14 +181,14 @@ async function ensureWebServer(expectedPackage) {
   if (existing.version === expectedPackage.version) {
     webUrl = REQUESTED_WEB_URL;
     console.log(
-      `[setup] using verified secure-send-web ${existing.version} at ${webUrl.origin}`,
+      `[setup] using verified pTransfer ${existing.version} at ${webUrl.origin}`,
     );
     return;
   }
 
   if (existing.reachable) {
     console.log(
-      `[setup] not reusing ${REQUESTED_WEB_URL.origin}: expected secure-send-web `
+      `[setup] not reusing ${REQUESTED_WEB_URL.origin}: expected pTransfer `
       + `${expectedPackage.version}, found ${existing.version ?? 'an unverified response'}`,
     );
   }
@@ -204,7 +204,7 @@ async function ensureWebServer(expectedPackage) {
     : await availableLoopbackUrl();
 
   const port = webUrl.port || '80';
-  console.log(`[setup] starting secure-send-web ${expectedPackage.version} at ${webUrl.origin}`);
+  console.log(`[setup] starting pTransfer ${expectedPackage.version} at ${webUrl.origin}`);
   ownedWebServer = spawn(
     'npm',
     [
@@ -231,7 +231,7 @@ async function ensureWebServer(expectedPackage) {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     if (ownedWebServer.exitCode !== null || ownedWebServer.signalCode !== null) {
-      throw new Error('secure-send-web exited before becoming ready');
+      throw new Error('pTransfer exited before becoming ready');
     }
     const probe = await probeWebServer(webUrl, expectedPackage.name);
     if (probe.version === expectedPackage.version) {
@@ -240,7 +240,7 @@ async function ensureWebServer(expectedPackage) {
     await sleep(250);
   }
   throw new Error(
-    `secure-send-web ${expectedPackage.version} did not become ready at ${webUrl.origin}`,
+    `pTransfer ${expectedPackage.version} did not become ready at ${webUrl.origin}`,
   );
 }
 
@@ -378,6 +378,45 @@ function instrumentPage(page, label) {
       throw new Error(`${label}: browser page raised ${pageErrors.length} error(s)`);
     }
   };
+}
+
+async function warmWebApp() {
+  console.log('[setup] warming browser dependency cache');
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  try {
+    // The about page exercises the QR worker and its WASM dependency. On a
+    // fresh Vite cache this can trigger dependency optimization and a full
+    // browser reload, so wait for QR generation to succeed after that reload.
+    await page.goto(new URL('/about', webUrl).href, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page
+      .getByRole('img', { name: 'Scan to open on mobile' })
+      .waitFor({ state: 'visible', timeout: 60_000 });
+    await page.waitForLoadState('networkidle');
+
+    // Confirm both pages used by the scenarios are fully loaded only after the
+    // optimization reload. The isolated test contexts are created afterward,
+    // so no in-memory transfer state can be lost to first-run cache warming.
+    await page.goto(new URL('/receive', webUrl).href, {
+      waitUntil: 'networkidle',
+    });
+    await page
+      .getByRole('textbox', { name: 'PIN', exact: true })
+      .waitFor({ state: 'visible', timeout: 30_000 });
+
+    await page.goto(new URL('/send', webUrl).href, {
+      waitUntil: 'networkidle',
+    });
+    await page
+      .locator('input[type="file"]')
+      .first()
+      .waitFor({ state: 'attached', timeout: 30_000 });
+    console.log('[setup] browser dependency cache ready');
+  } finally {
+    await context.close();
+  }
 }
 
 async function readWebConfirmationCode(page) {
@@ -597,6 +636,7 @@ try {
     args: ['--no-sandbox', '--disable-dev-shm-usage'],
   });
 
+  await warmWebApp();
   await cliToCli();
   await cliToWeb();
   await webToCli();

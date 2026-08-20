@@ -1,4 +1,4 @@
-//! Rotating short PIN for secure-send-web's Nostr "Auto Exchange" mode.
+//! Rotating short PIN for pTransfer's Nostr "Auto Exchange" mode.
 //!
 //! The PIN is 12 case-sensitive characters (11 data + 1 checksum). The sender
 //! mints a fresh PIN every [`PIN_ROTATION_MS`] and honors PINs minted in the
@@ -33,7 +33,7 @@ pub const PIN_LOCATOR_LENGTH: usize = 3;
 
 /// Case-sensitive alphabet of letters and digits excluding ambiguous `0`, `1`,
 /// `I`, `O`, `i`, `l`, and `o`. 55 characters, no symbols, so the PIN types
-/// cleanly on any mobile keyboard. Matches secure-send-web's `PIN_CHARSET`.
+/// cleanly on any mobile keyboard. Matches pTransfer's `PIN_CHARSET`.
 const PIN_CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
 
 /// How often the sender mints and publishes a fresh PIN.
@@ -41,7 +41,7 @@ pub const PIN_ROTATION_MS: u64 = 120_000;
 /// Total time the sender keeps rotating/waiting before giving up. A resource
 /// backstop, not a security control: rotation already caps any single PIN's
 /// exposure at [`PIN_TTL_MS`], so waiting longer is not less safe. Mirrors
-/// secure-send-web's `PIN_WAIT_TIMEOUT_MS`.
+/// pTransfer's `PIN_WAIT_TIMEOUT_MS`.
 pub const PIN_WAIT_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 /// How many wall-clock buckets may authenticate a claim: the current bucket
 /// and the immediately previous one.
@@ -79,7 +79,7 @@ pub const MAX_CLAIM_ATTEMPTS: usize = 16;
 /// HKDF salt for the locator-keyed rendezvous hint derivation. A public
 /// constant for domain separation only: the hint is keyed by the public locator
 /// segment and never by any PIN secret.
-const PIN_HINT_HKDF_SALT: &str = "secure-send:pin:v4";
+const PIN_HINT_HKDF_SALT: &str = "ptransfer:pin:v4";
 
 /// PIN hint length in hex characters: the Nostr `#h` filter tag. It carries at
 /// most log2(55³) ≈ 17.3 bits regardless of width, because it is a function of
@@ -100,7 +100,7 @@ pub fn now_sec() -> u64 {
 /// Compute the checksum character using a position-weighted sum.
 ///
 /// Each character's alphabet index is weighted by its one-based position.
-/// Mirrors secure-send-web's `computeChecksum`.
+/// Mirrors pTransfer's `computeChecksum`.
 fn compute_checksum(data: &[u8]) -> u8 {
     let mut sum = 0usize;
     for (i, byte) in data.iter().enumerate() {
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn checksum_rejects_typo_and_transposition() {
         // Fixed vector: checksum of "ABCDEFGHJKL" is 'A',
-        // verified against secure-send-web's computeChecksum.
+        // verified against pTransfer's computeChecksum.
         assert!(is_valid_pin("ABCDEFGHJKLA"));
         assert!(!is_valid_pin("ABCDefGHJKLA")); // substitution
         assert!(!is_valid_pin("BACDEFGHJKLA")); // transposition
@@ -264,10 +264,10 @@ mod tests {
 
     #[test]
     fn locator_hint_depends_only_on_locator_and_bucket() {
-        // Fixed vector from secure-send-web's computePinHintFromLocator.
+        // Fixed vector from pTransfer's computePinHintFromLocator.
         let bucket = 36_947_145;
         assert_eq!(pin_locator("ABCDEFGHJKLA"), "ABC");
-        assert_eq!(pin_hint_for_bucket("ABC", bucket), "ae4c9f57");
+        assert_eq!(pin_hint_for_bucket("ABC", bucket), "0997b0f6");
         assert_eq!(
             pin_hint_for_bucket("ABC", bucket),
             pin_hint_for_bucket(pin_locator("ABCzzzzzzzzQ"), bucket)

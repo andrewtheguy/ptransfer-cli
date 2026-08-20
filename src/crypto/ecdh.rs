@@ -1,10 +1,10 @@
-//! ECDH P-256 key agreement + HKDF-SHA256 key derivation for manual (SS03
-//! copy/paste) mode, byte-for-byte compatible with secure-send-web's
+//! ECDH P-256 key agreement + HKDF-SHA256 key derivation for manual (PT01
+//! copy/paste) mode, byte-for-byte compatible with pTransfer's
 //! `src/lib/crypto/ecdh.ts`.
 //!
 //! Manual mode derives one AES content key:
 //! `HKDF-SHA256(ikm = ECDH shared X coordinate, salt = 16-byte transfer salt,
-//!  info = "secure-send-mutual", len = 32)`.
+//!  info = "ptransfer-mutual", len = 32)`.
 //!
 //! Nostr mode has no ECDH exchange at all: its keys come from the SPAKE2 run
 //! the PIN authenticates (see [`crate::crypto::spake2`] and
@@ -20,7 +20,7 @@ use super::chunk::fill_random;
 use super::kdf::SALT_LEN;
 
 /// HKDF `info` string for the mutual (manual-mode) content key.
-const HKDF_INFO_MUTUAL: &[u8] = b"secure-send-mutual";
+const HKDF_INFO_MUTUAL: &[u8] = b"ptransfer-mutual";
 /// Uncompressed P-256 public key length (`0x04 || X || Y`).
 pub const PUBLIC_KEY_LEN: usize = 65;
 
@@ -67,7 +67,7 @@ impl EcdhKeyPair {
         let peer = import_public_key(peer_public_key)?;
 
         let shared = p256::ecdh::diffie_hellman(self.secret.to_nonzero_scalar(), peer.as_affine());
-        // secure-send-web's Web Crypto ECDH yields the X coordinate as the HKDF
+        // pTransfer's Web Crypto ECDH yields the X coordinate as the HKDF
         // input keying material; `raw_secret_bytes()` is exactly that X coordinate.
         let hk = Hkdf::<Sha256>::new(Some(salt), shared.raw_secret_bytes());
 

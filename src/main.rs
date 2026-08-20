@@ -1,7 +1,7 @@
-//! secure-send-cli: CLI companion to secure-send-web for peer-to-peer file transfer.
+//! ptransfer-cli: the pTransfer command-line client for peer-to-peer file transfer.
 //!
 //! Running with no arguments launches the full-screen TUI wizard, which covers
-//! sending/receiving files and folders in both Nostr PIN mode and manual SS03
+//! sending/receiving files and folders in both Nostr PIN mode and manual PT01
 //! copy/paste mode. The `test` subcommand exposes the same flows as a
 //! non-interactive plain-text mode for testing. QR support is intentionally
 //! not part of this CLI.
@@ -11,12 +11,12 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use secure_send_cli::util::{OnConflict, is_interrupted};
-use secure_send_cli::{archive, tui, webrtc};
+use ptransfer_cli::util::{OnConflict, is_interrupted};
+use ptransfer_cli::{archive, tui, webrtc};
 
 #[derive(Parser)]
-#[command(name = "secure-send-cli")]
-#[command(about = "Secure peer-to-peer file transfer, compatible with secure-send-web")]
+#[command(name = "ptransfer")]
+#[command(about = "Secure peer-to-peer file transfer, compatible with pTransfer")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -39,18 +39,18 @@ enum Commands {
 #[derive(Subcommand)]
 enum TestCommands {
     /// Send files and/or folders; multiple inputs are bundled into one ZIP.
-    /// Defaults to secure-send-web Nostr PIN mode.
+    /// Defaults to pTransfer Nostr PIN mode.
     Send {
         /// Files and/or directories to send
         #[arg(required = true, num_args = 1..)]
         paths: Vec<PathBuf>,
 
-        /// Use manual SS03 copy/paste signaling instead of Nostr PIN mode
+        /// Use manual PT01 copy/paste signaling instead of Nostr PIN mode
         #[arg(long)]
         manual: bool,
     },
 
-    /// Receive a file. Defaults to secure-send-web Nostr PIN mode.
+    /// Receive a file. Defaults to pTransfer Nostr PIN mode.
     Receive {
         /// PIN for Nostr mode, or sender offer code with --manual
         code: String,
@@ -59,7 +59,7 @@ enum TestCommands {
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Use manual SS03 copy/paste signaling instead of Nostr PIN mode
+        /// Use manual PT01 copy/paste signaling instead of Nostr PIN mode
         #[arg(long)]
         manual: bool,
 
@@ -153,20 +153,20 @@ mod tests {
 
     #[test]
     fn no_arguments_selects_the_tui() {
-        let cli = Cli::try_parse_from(["secure-send-cli"]).unwrap();
+        let cli = Cli::try_parse_from(["ptransfer"]).unwrap();
         assert!(cli.command.is_none());
     }
 
     #[test]
     fn bare_invocation_accepts_no_flags() {
-        assert!(Cli::try_parse_from(["secure-send-cli", "--verbose"]).is_err());
-        assert!(Cli::try_parse_from(["secure-send-cli", "send", "x"]).is_err());
+        assert!(Cli::try_parse_from(["ptransfer", "--verbose"]).is_err());
+        assert!(Cli::try_parse_from(["ptransfer", "send", "x"]).is_err());
     }
 
     #[test]
     fn test_send_takes_multiple_paths() {
         let cli =
-            Cli::try_parse_from(["secure-send-cli", "test", "send", "a.txt", "b", "dir"]).unwrap();
+            Cli::try_parse_from(["ptransfer", "test", "send", "a.txt", "b", "dir"]).unwrap();
         let Some(Commands::Test {
             command: TestCommands::Send { paths, manual },
             ..
@@ -180,18 +180,18 @@ mod tests {
 
     #[test]
     fn test_send_requires_a_path() {
-        assert!(Cli::try_parse_from(["secure-send-cli", "test", "send"]).is_err());
+        assert!(Cli::try_parse_from(["ptransfer", "test", "send"]).is_err());
     }
 
     #[test]
     fn test_receive_requires_a_code() {
-        assert!(Cli::try_parse_from(["secure-send-cli", "test", "receive"]).is_err());
+        assert!(Cli::try_parse_from(["ptransfer", "test", "receive"]).is_err());
     }
 
     #[test]
     fn test_receive_parses_overwrite() {
         let cli = Cli::try_parse_from([
-            "secure-send-cli",
+            "ptransfer",
             "test",
             "receive",
             "PIN123",

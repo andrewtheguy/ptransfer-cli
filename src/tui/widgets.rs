@@ -11,7 +11,7 @@ pub fn screen_frame(f: &mut Frame, title: &str) -> Rect {
     let area = f.area();
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" secure-send — {title} "));
+        .title(format!(" pTransfer — {title} "));
     let inner = block.inner(area);
     f.render_widget(block, area);
     inner

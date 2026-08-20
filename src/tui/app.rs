@@ -23,19 +23,19 @@ use super::widgets;
 pub enum WizardPlan {
     /// Stays in the TUI.
     SendNostr(Vec<PathBuf>),
-    /// Leaves the TUI so the SS03 blobs can be copy/pasted.
+    /// Leaves the TUI so the PT01 blobs can be copy/pasted.
     SendManual(Vec<PathBuf>),
     /// Stays in the TUI.
     ReceiveNostr {
         pin: String,
         output: PathBuf,
     },
-    /// Leaves the TUI so the SS03 blobs can be copy/pasted.
+    /// Leaves the TUI so the PT01 blobs can be copy/pasted.
     ReceiveManual { output: PathBuf },
 }
 
 const MODE_ITEMS: &[&str] = &[
-    "PIN code via Nostr relays (works with secure-send-web Auto Exchange)",
+    "PIN code via Nostr relays (works with pTransfer Auto Exchange)",
     "Manual copy/paste exchange (leaves this screen for the code swap)",
 ];
 

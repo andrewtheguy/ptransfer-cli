@@ -1,4 +1,4 @@
-//! Cryptography compatible with secure-send-web (Web Crypto API).
+//! Cryptography compatible with pTransfer (Web Crypto API).
 //!
 //! - [`base32`]: Crockford Base32 encoding and normalization for confirmation
 //!   codes.

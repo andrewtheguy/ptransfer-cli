@@ -1,4 +1,4 @@
-//! Prepare send inputs the way secure-send-web does.
+//! Prepare send inputs the way pTransfer does.
 //!
 //! A single regular file is sent as-is. Anything else (a folder, or multiple
 //! inputs) becomes a lazy ZIP source that writes directly into the transfer,
@@ -230,7 +230,7 @@ pub fn send_display_name(inputs: &[PathBuf]) -> String {
 }
 
 /// Local-time `yyyymmddhhmmss` stamp appended to archive names. Mirrors
-/// secure-send-web's `archiveTimestamp`.
+/// pTransfer's `archiveTimestamp`.
 fn archive_timestamp() -> String {
     chrono::Local::now().format("%Y%m%d%H%M%S").to_string()
 }
@@ -326,7 +326,7 @@ fn input_name(path: &Path) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("File name is not valid UTF-8: {}", path.display()))
 }
 
-/// Write a standard ZIP without seeking. Store mode matches secure-send-web's
+/// Write a standard ZIP without seeking. Store mode matches pTransfer's
 /// streamed archives and keeps production bounded without a deflate buffer.
 fn write_zip<W: Write>(entries: &[(String, PathBuf)], output: W) -> Result<W> {
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);

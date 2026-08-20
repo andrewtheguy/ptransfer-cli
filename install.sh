@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Secure Send CLI installer for Linux and Mac
-# Downloads latest binary from: https://github.com/andrewtheguy/secure-send-cli/releases
+# pTransfer CLI installer for Linux and Mac
+# Downloads latest binary from: https://github.com/andrewtheguy/ptransfer-cli/releases
 #
 # Usage: ./install.sh [RELEASE_TAG] [--prerelease]
 # Or set RELEASE_TAG environment variable
@@ -9,7 +9,7 @@
 set -e
 
 REPO_OWNER="andrewtheguy"
-REPO_NAME="secure-send-cli"
+REPO_NAME="ptransfer-cli"
 DOWNLOAD_ONLY=false
 PREFER_PRERELEASE=false
 
@@ -231,8 +231,8 @@ detect_arch() {
 
 # Map OS and architecture to binary name
 get_binary_name() {
-    BINARY_PREFIX="secure-send-cli"
-    INSTALL_NAME="secure-send-cli"
+    BINARY_PREFIX="ptransfer"
+    INSTALL_NAME="ptransfer"
 
     case "${OS}-${ARCH}" in
         "linux-amd64")
@@ -414,7 +414,7 @@ download_and_install() {
         if [ -n "$profile" ]; then
             # Profile already has .local/bin configured, just needs reload
             print_warn "${target_dir} is not in your current PATH, but is configured in your profile."
-            print_warn "To use secure-send-cli now, reload your profile:"
+            print_warn "To use ptransfer now, reload your profile:"
             echo ""
             echo "    source $profile"
             echo ""
@@ -435,7 +435,7 @@ download_and_install() {
 show_usage() {
     echo "Usage: $0 [OPTIONS] [RELEASE_TAG]"
     echo ""
-    echo "Download and install secure-send-cli binary"
+    echo "Download and install the pTransfer CLI binary"
     echo ""
     echo "Options:"
     echo "  --download-only  Download binary to current directory without installing"
@@ -446,7 +446,7 @@ show_usage() {
     echo "  RELEASE_TAG      GitHub release tag to download (default: latest)"
     echo ""
     echo "Examples:"
-    echo "  $0                              # Install latest secure-send-cli"
+    echo "  $0                              # Install latest pTransfer CLI"
     echo "  $0 20251210172710               # Install specific release"
     echo "  $0 --prerelease                 # Install latest prerelease"
     echo "  $0 --download-only              # Download latest to current directory"
@@ -458,9 +458,9 @@ show_usage() {
 # Main installation function
 install() {
     if [ "$DOWNLOAD_ONLY" = true ]; then
-        print_info "Secure Send CLI downloader"
+        print_info "pTransfer CLI downloader"
     else
-        print_info "Secure Send CLI installer"
+        print_info "pTransfer CLI installer"
     fi
     print_info "Release: ${RELEASE_TAG}"
     print_info "Repository: ${REPO_OWNER}/${REPO_NAME}"
@@ -510,9 +510,9 @@ main() {
     parse_args "$@"
 
     if [ "$DOWNLOAD_ONLY" = true ]; then
-        print_info "Starting Secure Send CLI download..."
+        print_info "Starting pTransfer CLI download..."
     else
-        print_info "Starting Secure Send CLI installation..."
+        print_info "Starting pTransfer CLI installation..."
         check_privileges
     fi
 

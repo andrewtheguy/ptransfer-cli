@@ -17,12 +17,12 @@ use rtc::peer_connection::transport::RTCIceCandidateInit;
 use crate::webrtc::common::WebRtcPeer;
 
 /// Serialize gathered ICE candidates to their SDP `candidate:` strings - the
-/// only field secure-send-web transmits and reads.
+/// only field pTransfer transmits and reads.
 pub(crate) fn candidate_strings(candidates: Vec<RTCIceCandidateInit>) -> Result<Vec<String>> {
     Ok(candidates.into_iter().map(|candidate| candidate.candidate).collect())
 }
 
-/// Rebuild an ICE candidate init from a candidate string. secure-send-web
+/// Rebuild an ICE candidate init from a candidate string. pTransfer
 /// applies received candidates with `sdpMid:"0"`, `sdpMLineIndex:0` (the single
 /// data-channel m-section), so we do the same.
 pub(crate) fn candidate_init(candidate: &str) -> RTCIceCandidateInit {
@@ -35,7 +35,7 @@ pub(crate) fn candidate_init(candidate: &str) -> RTCIceCandidateInit {
     }
 }
 
-/// Match secure-send-web's candidate handling: malformed, duplicate, or stale
+/// Match pTransfer's candidate handling: malformed, duplicate, or stale
 /// candidates should not abort an otherwise viable WebRTC connection attempt.
 pub(crate) async fn add_ice_candidate_safely(peer: &WebRtcPeer, candidate: &str) {
     if let Err(err) = peer.add_ice_candidate(candidate_init(candidate)).await {
