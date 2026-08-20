@@ -380,6 +380,45 @@ function instrumentPage(page, label) {
   };
 }
 
+async function warmWebApp() {
+  console.log('[setup] warming browser dependency cache');
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  try {
+    // The about page exercises the QR worker and its WASM dependency. On a
+    // fresh Vite cache this can trigger dependency optimization and a full
+    // browser reload, so wait for QR generation to succeed after that reload.
+    await page.goto(new URL('/about', webUrl).href, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page
+      .getByRole('img', { name: 'Scan to open on mobile' })
+      .waitFor({ state: 'visible', timeout: 60_000 });
+    await page.waitForLoadState('networkidle');
+
+    // Confirm both pages used by the scenarios are fully loaded only after the
+    // optimization reload. The isolated test contexts are created afterward,
+    // so no in-memory transfer state can be lost to first-run cache warming.
+    await page.goto(new URL('/receive', webUrl).href, {
+      waitUntil: 'networkidle',
+    });
+    await page
+      .getByRole('textbox', { name: 'PIN', exact: true })
+      .waitFor({ state: 'visible', timeout: 30_000 });
+
+    await page.goto(new URL('/send', webUrl).href, {
+      waitUntil: 'networkidle',
+    });
+    await page
+      .locator('input[type="file"]')
+      .first()
+      .waitFor({ state: 'attached', timeout: 30_000 });
+    console.log('[setup] browser dependency cache ready');
+  } finally {
+    await context.close();
+  }
+}
+
 async function readWebConfirmationCode(page) {
   await page.waitForFunction(
     () => /Confirmation code\s+[0-9A-Z]{4}-[0-9A-Z]{4}/.test(document.body.innerText),
@@ -597,6 +636,7 @@ try {
     args: ['--no-sandbox', '--disable-dev-shm-usage'],
   });
 
+  await warmWebApp();
   await cliToCli();
   await cliToWeb();
   await webToCli();
