@@ -190,10 +190,10 @@ cargo clippy --all-features
 Run the live CLI-to-CLI and bidirectional CLI/web interoperability test:
 
 ```bash
-node tests/live_interop_e2e.mjs
+bun tests/live_interop_e2e.ts
 ```
 
-It requires internet access, Node/npm, a Chrome-family browser, and a pTransfer
+It requires internet access, Bun, a Chrome-family browser, and a pTransfer
 checkout in the sibling `ptransfer` folder. Set `PTRANSFER_WEB_ROOT`,
 `PTRANSFER_WEB_URL`, or `CHROME_PATH` to override those defaults. The script builds
 the CLI with all features, starts the web development server when needed, and

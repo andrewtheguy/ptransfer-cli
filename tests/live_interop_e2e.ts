@@ -1,12 +1,16 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 // Live interoperability smoke test for the pTransfer CLI and web app.
 //
 // This deliberately uses the public Nostr relays and real WebRTC transports.
 // It is therefore separate from `cargo test` and requires internet access,
-// Node/npm, a Chrome-family browser, and the sibling pTransfer checkout.
+// Bun, a Chrome-family browser, and the sibling pTransfer checkout.
 
-import { spawn } from 'node:child_process';
+import {
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+  spawn,
+} from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import {
@@ -24,6 +28,79 @@ import {
   resolve,
 } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+
+// Minimal structural views of the playwright-core API this script uses.
+// playwright-core is installed at runtime into CACHE_ROOT rather than being a
+// project dependency, so its own type declarations are not imported here.
+interface PwLocator {
+  click(): Promise<void>;
+  fill(value: string): Promise<void>;
+  first(): PwLocator;
+  innerText(): Promise<string>;
+  inputValue(): Promise<string>;
+  setInputFiles(files: string): Promise<void>;
+  waitFor(options?: { state?: string; timeout?: number }): Promise<void>;
+}
+
+interface PwDownload {
+  saveAs(path: string): Promise<void>;
+}
+
+interface PwPage {
+  getByRole(
+    role: string,
+    options?: { name?: string; exact?: boolean },
+  ): PwLocator;
+  getByText(text: string, options?: { exact?: boolean }): PwLocator;
+  goto(url: string, options?: { waitUntil?: string }): Promise<unknown>;
+  locator(selector: string): PwLocator;
+  on(event: 'pageerror', handler: (error: Error) => void): void;
+  waitForEvent(
+    event: 'download',
+    options?: { timeout?: number },
+  ): Promise<PwDownload>;
+  waitForFunction(
+    fn: () => boolean,
+    arg?: unknown,
+    options?: { timeout?: number },
+  ): Promise<unknown>;
+  waitForLoadState(state?: string): Promise<void>;
+}
+
+interface PwBrowserContext {
+  close(): Promise<void>;
+  newPage(): Promise<PwPage>;
+}
+
+interface PwBrowser {
+  close(): Promise<void>;
+  newContext(options?: { acceptDownloads?: boolean }): Promise<PwBrowserContext>;
+}
+
+interface PwBrowserType {
+  launch(options?: {
+    args?: string[];
+    executablePath?: string;
+    headless?: boolean;
+  }): Promise<PwBrowser>;
+}
+
+interface PackageIdentity {
+  name: string;
+  version: string;
+}
+
+interface CommandExit {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}
+
+interface CliProcess {
+  child: ChildProcessWithoutNullStreams;
+  captured: { stdout: string; stderr: string };
+  exit: Promise<CommandExit>;
+  label: string;
+}
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const CLI_ROOT = resolve(SCRIPT_DIR, '..');
@@ -43,21 +120,25 @@ const PLAYWRIGHT_VERSION = process.env.PTRANSFER_PLAYWRIGHT_VERSION ?? '1.55.0';
 const ARTIFACTS = await mkdtemp(join(tmpdir(), 'ptransfer-live-e2e-'));
 const CONFIRMATION_CODE = /^[0-9A-HJKMNPQRSTVWXYZ]{8}$/;
 
-const activeClis = new Set();
-let browser;
-let ownedWebServer;
+const activeClis = new Set<ChildProcess>();
+let browser: PwBrowser | undefined;
+let ownedWebServer: ChildProcess | undefined;
 let cleanupStarted = false;
 
-function sleep(milliseconds) {
+function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 }
 
-async function withTimeout(promise, timeoutMs, description) {
-  let timer;
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  description: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       promise,
-      new Promise((_, reject) => {
+      new Promise<never>((_, reject) => {
         timer = setTimeout(
           () => reject(new Error(`Timed out waiting for ${description}`)),
           timeoutMs,
@@ -69,7 +150,11 @@ async function withTimeout(promise, timeoutMs, description) {
   }
 }
 
-async function runCommand(command, args, options = {}) {
+async function runCommand(
+  command: string,
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
+): Promise<void> {
   console.log(`[setup] ${command} ${args.join(' ')}`);
   const child = spawn(command, args, {
     cwd: options.cwd,
@@ -77,11 +162,11 @@ async function runCommand(command, args, options = {}) {
     stdio: 'inherit',
   });
   activeClis.add(child);
-  const exit = new Promise((resolvePromise, reject) => {
+  const exit = new Promise<CommandExit>((resolvePromise, reject) => {
     child.once('error', reject);
     child.once('exit', (code, signal) => resolvePromise({ code, signal }));
   });
-  let result;
+  let result: CommandExit;
   try {
     result = await withTimeout(
       exit,
@@ -108,11 +193,13 @@ async function runCommand(command, args, options = {}) {
 /// is serving the checkout it was pointed at.
 const PROTOCOL_TS = join(WEB_ROOT, 'src', 'lib', 'protocol.ts');
 
-async function readWebPackage() {
-  return JSON.parse(await readFile(join(WEB_ROOT, 'package.json'), 'utf8'));
+async function readWebPackage(): Promise<PackageIdentity> {
+  return JSON.parse(
+    await readFile(join(WEB_ROOT, 'package.json'), 'utf8'),
+  ) as PackageIdentity;
 }
 
-async function assertProtocolVersionMatches() {
+async function assertProtocolVersionMatches(): Promise<void> {
   const cargoToml = await readFile(join(CLI_ROOT, 'Cargo.toml'), 'utf8');
   const protocolTs = await readFile(PROTOCOL_TS, 'utf8');
 
@@ -137,7 +224,10 @@ async function assertProtocolVersionMatches() {
   console.log(`[setup] interop protocol version ${webMatch[1]}`);
 }
 
-async function probeWebServer(url, expectedPackageName) {
+async function probeWebServer(
+  url: URL,
+  expectedPackageName: string,
+): Promise<{ reachable: boolean; version: string | null }> {
   let reachable = false;
   try {
     const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
@@ -154,7 +244,10 @@ async function probeWebServer(url, expectedPackageName) {
       await packageResponse.body?.cancel();
       return { reachable, version: null };
     }
-    const servedPackage = await packageResponse.json();
+    const servedPackage = (await packageResponse.json()) as {
+      name?: unknown;
+      version?: unknown;
+    };
     const version = servedPackage.name === expectedPackageName
       && typeof servedPackage.version === 'string'
       ? servedPackage.version
@@ -165,8 +258,8 @@ async function probeWebServer(url, expectedPackageName) {
   }
 }
 
-async function availableLoopbackUrl() {
-  const port = await new Promise((resolvePromise, reject) => {
+async function availableLoopbackUrl(): Promise<URL> {
+  const port = await new Promise<number>((resolvePromise, reject) => {
     const server = createServer();
     server.unref();
     server.once('error', reject);
@@ -189,7 +282,7 @@ async function availableLoopbackUrl() {
   return new URL(`http://127.0.0.1:${port}`);
 }
 
-async function ensureWebServer(expectedPackage) {
+async function ensureWebServer(expectedPackage: PackageIdentity): Promise<void> {
   const existing = await probeWebServer(
     REQUESTED_WEB_URL,
     expectedPackage.name,
@@ -209,7 +302,7 @@ async function ensureWebServer(expectedPackage) {
     );
   }
   await access(join(WEB_ROOT, 'node_modules', '.bin', 'vite'), fsConstants.X_OK).catch(() => {
-    throw new Error(`Missing web dependencies; run npm install in ${WEB_ROOT}`);
+    throw new Error(`Missing web dependencies; run bun install in ${WEB_ROOT}`);
   });
 
   const requestedIsAvailableLoopback = !existing.reachable
@@ -222,7 +315,7 @@ async function ensureWebServer(expectedPackage) {
   const port = webUrl.port || '80';
   console.log(`[setup] starting pTransfer ${expectedPackage.version} at ${webUrl.origin}`);
   ownedWebServer = spawn(
-    'npm',
+    'bun',
     [
       'run',
       'dev',
@@ -260,7 +353,7 @@ async function ensureWebServer(expectedPackage) {
   );
 }
 
-async function loadChromium() {
+async function loadChromium(): Promise<PwBrowserType> {
   const playwrightEntry = join(
     CACHE_ROOT,
     'node_modules',
@@ -272,29 +365,30 @@ async function loadChromium() {
   } catch {
     await mkdir(CACHE_ROOT, { recursive: true });
     await runCommand(
-      'npm',
+      'bun',
       [
         'install',
-        '--prefix',
-        CACHE_ROOT,
         '--no-save',
-        '--no-package-lock',
+        '--cwd',
+        CACHE_ROOT,
         `playwright-core@${PLAYWRIGHT_VERSION}`,
       ],
     );
   }
-  const playwright = await import(pathToFileURL(playwrightEntry).href);
+  const playwright = (await import(pathToFileURL(playwrightEntry).href)) as {
+    chromium: PwBrowserType;
+  };
   return playwright.chromium;
 }
 
-async function findBrowser() {
+async function findBrowser(): Promise<string> {
   const candidates = [
     process.env.CHROME_PATH,
     '/usr/bin/google-chrome',
     '/usr/bin/google-chrome-stable',
     '/usr/bin/chromium',
     '/usr/bin/chromium-browser',
-  ].filter(Boolean);
+  ].filter((candidate): candidate is string => Boolean(candidate));
   for (const candidate of candidates) {
     try {
       await access(candidate, fsConstants.X_OK);
@@ -306,7 +400,7 @@ async function findBrowser() {
   throw new Error('No Chrome-family browser found; set CHROME_PATH');
 }
 
-function runCli(args, label) {
+function runCli(args: string[], label: string): CliProcess {
   const child = spawn(CLI, args, {
     cwd: CLI_ROOT,
     env: { ...process.env, RUST_LOG: 'error,webrtc_ice=error' },
@@ -321,7 +415,7 @@ function runCli(args, label) {
   child.stderr.on('data', (chunk) => {
     captured.stderr += chunk.toString();
   });
-  const exit = new Promise((resolvePromise, reject) => {
+  const exit = new Promise<CommandExit>((resolvePromise, reject) => {
     child.once('error', reject);
     child.once('exit', (code, signal) => {
       activeClis.delete(child);
@@ -331,11 +425,11 @@ function runCli(args, label) {
   return { child, captured, exit, label };
 }
 
-function outputTail(text, maximum = 4_000) {
+function outputTail(text: string, maximum = 4_000): string {
   return text.length > maximum ? `…${text.slice(-maximum)}` : text;
 }
 
-function cliFailure(processHandle, detail) {
+function cliFailure(processHandle: CliProcess, detail: string): Error {
   return new Error(
     `${processHandle.label}: ${detail}\n`
     + `stdout:\n${outputTail(processHandle.captured.stdout)}\n`
@@ -344,11 +438,11 @@ function cliFailure(processHandle, detail) {
 }
 
 async function waitForStdoutLine(
-  processHandle,
-  predicate,
-  description,
+  processHandle: CliProcess,
+  predicate: (line: string) => boolean,
+  description: string,
   timeoutMs = 120_000,
-) {
+): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const lines = processHandle.captured.stdout
@@ -370,10 +464,10 @@ async function waitForStdoutLine(
 }
 
 async function waitForCliSuccess(
-  processHandle,
-  description,
+  processHandle: CliProcess,
+  description: string,
   timeoutMs = 150_000,
-) {
+): Promise<void> {
   const result = await withTimeout(processHandle.exit, timeoutMs, description);
   if (result.code !== 0) {
     throw cliFailure(
@@ -383,8 +477,8 @@ async function waitForCliSuccess(
   }
 }
 
-function instrumentPage(page, label) {
-  const pageErrors = [];
+function instrumentPage(page: PwPage, label: string): () => void {
+  const pageErrors: Error[] = [];
   page.on('pageerror', (error) => {
     pageErrors.push(error);
     console.error(`[${label}:pageerror] ${error.stack ?? error}`);
@@ -396,7 +490,10 @@ function instrumentPage(page, label) {
   };
 }
 
-async function warmWebApp() {
+async function warmWebApp(): Promise<void> {
+  if (!browser) {
+    throw new Error('Browser is not initialized');
+  }
   console.log('[setup] warming browser dependency cache');
   const context = await browser.newContext();
   const page = await context.newPage();
@@ -435,7 +532,7 @@ async function warmWebApp() {
   }
 }
 
-async function readWebConfirmationCode(page) {
+async function readWebConfirmationCode(page: PwPage): Promise<string> {
   await page.waitForFunction(
     () => /Confirmation code\s+[0-9A-Z]{4}-[0-9A-Z]{4}/.test(document.body.innerText),
     null,
@@ -453,7 +550,7 @@ async function readWebConfirmationCode(page) {
 /// barely shrinks it, so the wire payload stays large) followed by a highly
 /// compressible half (so the deflate/inflate path does real work in both
 /// directions). Deterministic, so a failure is reproducible.
-function multiChunkBytes(byteLength) {
+function multiChunkBytes(byteLength: number): Buffer {
   const out = Buffer.alloc(byteLength);
   const half = byteLength >> 1;
   let state = 0x9e3779b9n;
@@ -474,14 +571,18 @@ function multiChunkBytes(byteLength) {
 /// data channel that negotiated *unordered* delivery looks perfectly healthy.
 /// That is exactly how a reliable-unordered channel reached a browser
 /// undetected, so the browser legs carry a multi-chunk payload.
-async function multiChunkFixture() {
+async function multiChunkFixture(): Promise<string> {
   const path = join(ARTIFACTS, 'bulk-payload.bin');
   const bytes = multiChunkBytes(12 * 1024 * 1024);
   await writeFile(path, bytes);
   return path;
 }
 
-async function assertSameBytes(expectedPath, actualPath, label) {
+async function assertSameBytes(
+  expectedPath: string,
+  actualPath: string,
+  label: string,
+): Promise<void> {
   const [expected, actual] = await Promise.all([
     readFile(expectedPath),
     readFile(actualPath),
@@ -495,7 +596,7 @@ async function assertSameBytes(expectedPath, actualPath, label) {
   console.log(`[PASS] ${label}: ${actual.length} bytes, sha256 ${digest}`);
 }
 
-async function cliToCli() {
+async function cliToCli(): Promise<void> {
   console.log('\n=== CLI sender -> CLI receiver ===');
   const source = join(CLI_ROOT, 'README.md');
   const outputDir = await mkdtemp(join(ARTIFACTS, 'cli-to-cli-'));
@@ -530,7 +631,10 @@ async function cliToCli() {
   );
 }
 
-async function cliToWeb() {
+async function cliToWeb(): Promise<void> {
+  if (!browser) {
+    throw new Error('Browser is not initialized');
+  }
   console.log('\n=== CLI sender -> web receiver ===');
   const context = await browser.newContext({ acceptDownloads: true });
   const page = await context.newPage();
@@ -582,7 +686,10 @@ async function cliToWeb() {
   }
 }
 
-async function webToCli() {
+async function webToCli(): Promise<void> {
+  if (!browser) {
+    throw new Error('Browser is not initialized');
+  }
   console.log('\n=== Web sender -> CLI receiver ===');
   const context = await browser.newContext();
   const page = await context.newPage();
@@ -639,11 +746,14 @@ async function webToCli() {
   }
 }
 
-async function terminate(child, processGroup = false) {
+async function terminate(
+  child: ChildProcess | undefined,
+  processGroup = false,
+): Promise<void> {
   if (!child || child.exitCode !== null || child.signalCode !== null) {
     return;
   }
-  const signal = (name) => {
+  const signal = (name: NodeJS.Signals): void => {
     try {
       if (processGroup && child.pid !== undefined) {
         process.kill(-child.pid, name);
@@ -651,7 +761,7 @@ async function terminate(child, processGroup = false) {
         child.kill(name);
       }
     } catch (error) {
-      if (error.code !== 'ESRCH') {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
         throw error;
       }
     }
@@ -665,7 +775,7 @@ async function terminate(child, processGroup = false) {
   }
 }
 
-async function cleanup() {
+async function cleanup(): Promise<void> {
   if (cleanupStarted) {
     return;
   }
@@ -677,7 +787,7 @@ async function cleanup() {
   await terminate(ownedWebServer, true).catch(() => {});
 }
 
-for (const signal of ['SIGINT', 'SIGTERM']) {
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, () => {
     cleanup().finally(() => process.exit(signal === 'SIGINT' ? 130 : 143));
   });
@@ -702,7 +812,8 @@ try {
   await webToCli();
   console.log(`\nALL LIVE INTEROPERABILITY TESTS PASSED\nArtifacts: ${ARTIFACTS}`);
 } catch (error) {
-  console.error(`\nLIVE INTEROPERABILITY TEST FAILED\n${error.stack ?? error}`);
+  const detail = error instanceof Error ? error.stack ?? error.message : String(error);
+  console.error(`\nLIVE INTEROPERABILITY TEST FAILED\n${detail}`);
   console.error(`Artifacts: ${ARTIFACTS}`);
   process.exitCode = 1;
 } finally {
