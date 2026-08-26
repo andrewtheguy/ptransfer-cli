@@ -59,7 +59,7 @@ pub fn sanitize_filename(name: &str) -> String {
 /// Policy for an already-existing destination file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnConflict {
-    /// Ask the user (TUI modal, or plain o/r/c prompt in non-interactive mode).
+    /// Ask the user with the TUI modal.
     Prompt,
     /// Error out (non-interactive test mode without --overwrite).
     Fail,
