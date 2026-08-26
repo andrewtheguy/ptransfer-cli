@@ -1,7 +1,7 @@
 [package]
 name = "ptransfer-cli"
 # does not have to match pTransfer's npm version
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 publish = false
 
