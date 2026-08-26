@@ -135,14 +135,6 @@ fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
-/// A base64 signaling code the user must copy (stdout, framed for readability).
-pub fn show_code(title: &str, code: &str) {
-    println!("\n----- {title} -----");
-    println!("{code}");
-    println!("----- end -----\n");
-    let _ = std::io::stdout().flush();
-}
-
 /// Update the single-line live progress indicator (stderr).
 pub fn progress(dir: Direction, bytes: u64, total: u64) {
     if let Some(tx) = sink() {
@@ -304,39 +296,6 @@ fn prompt_file_exists_blocking(path: &Path) -> Result<FileExistsChoice> {
     }
 }
 
-/// Read a pasted code, submitted with a single Enter.
-///
-/// Base64 PT01 codes are single-line, but a paste may carry hard line breaks
-/// (e.g. copied from wrapped text). A multi-line paste lands in the input
-/// buffer all at once, so after the first line we briefly drain whatever else
-/// is already there and join it — one Enter still submits.
-pub async fn prompt_code(prompt: &str) -> Result<String> {
-    use tokio::io::AsyncBufReadExt;
-
-    eprintln!("{prompt}");
-    eprintln!("(paste the code and press Enter)");
-    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-
-    let mut collected = loop {
-        let line = lines
-            .next_line()
-            .await?
-            .ok_or_else(|| anyhow!("no code entered"))?;
-        let line = line.trim();
-        if !line.is_empty() {
-            break line.to_string();
-        }
-        // ignore leading blank lines
-    };
-
-    const PASTE_DRAIN_WINDOW: Duration = Duration::from_millis(80);
-    while let Ok(Ok(Some(line))) = tokio::time::timeout(PASTE_DRAIN_WINDOW, lines.next_line()).await
-    {
-        collected.push_str(line.trim());
-    }
-
-    Ok(collected)
-}
 
 #[cfg(test)]
 mod tests {

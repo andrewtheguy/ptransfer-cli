@@ -1,12 +1,16 @@
 [package]
 name = "ptransfer-cli"
 # does not have to match pTransfer's npm version
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 publish = false
 
 [package.metadata]
-ptransfer-protocol-version = "0.0.22"
+# The interoperable protocol version this build implements: INTEROP_PROTOCOL_VERSION
+# in the pTransfer web app's src/lib/protocol.ts, specified by its
+# docs/INTEROP_PROTOCOL.md. Deliberately not pTransfer's npm version — that moves
+# for web-only changes (Code Exchange, the relay fallback) this CLI does not implement.
+ptransfer-protocol-version = "2"
 
 [lib]
 name = "ptransfer_cli"
@@ -35,11 +39,13 @@ p256 = { version = "0.13", features = ["ecdh"] }
 hkdf = "0.12"
 sha2 = "0.10"
 
-# Manual PT01 signaling payload compression
+# Raw-DEFLATE wire encoding for single-file transfers. Also supplies the zlib
+# backend the zip crate's deflate-flate2 feature needs (it depends on flate2
+# with default features off), so this must keep its default features.
 flate2 = "1"
 
 # Multi-file/folder packaging (streamed directly into the transfer)
-zip = { version = "8", default-features = false }
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 # Local-time archive-name timestamps (matches pTransfer's archiveTimestamp)
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 

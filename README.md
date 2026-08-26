@@ -10,23 +10,23 @@ protocol support is maintained.
 The `ptransfer` command sends and receives files and folders with the same wire
 formats as pTransfer. Running the binary with no arguments launches a
 full-screen TUI wizard that walks through the whole transfer: send or receive,
-file/folder selection, signaling mode, output directory, and PIN entry.
+file/folder selection, output directory, and PIN entry.
 
-- Nostr PIN signaling by default, compatible with the web app's Auto Exchange
-  mode: a case-sensitive 12-character PIN (fresh every 2 minutes; the sender
-  can also mint a new one on demand with `r`) drives a SPAKE2
+- PIN exchange over Nostr is the only signaling mode, compatible with the web
+  app's PIN Exchange: a case-sensitive 12-character PIN (fresh every 2 minutes;
+  the sender can also mint a new one on demand with `r`) drives a SPAKE2
   password-authenticated key exchange that derives the actual signaling and
   content keys. Nothing published to a relay can test a PIN guess offline. The
   receiver then reads an 8-character confirmation code to the sender; nothing
-  is sent until the sender enters a match.
-- Manual PT01 copy/paste signaling, compatible with the web app's manual
-  exchange codes. When chosen in the wizard, the TUI exits back to the normal
-  terminal so the offer/response codes can be copy/pasted.
-- Multiple files and folders are bundled into a single ZIP on the fly, exactly
-  like the web app (`<folder>_<timestamp>.zip` for one folder,
-  `files_<timestamp>.zip` otherwise). ZIP bytes flow directly into encryption
-  and WebRTC without a complete archive or temporary scratch file. Received
-  ZIPs are saved as-is; extraction is up to you.
+  is sent until the sender enters a match. The web app's Code Exchange
+  (hand-carried QR/clipboard codes) is web-only and is not implemented here.
+- A single file is deflated on the wire and restored by the receiver. Multiple
+  files and folders are bundled into a single ZIP on the fly, exactly like the
+  web app (`<folder>_<timestamp>.zip` for one folder, `files_<timestamp>.zip`
+  otherwise), with each entry deflated; the archive itself is never compressed
+  a second time. Compressed bytes flow directly into encryption and WebRTC
+  without a complete archive or temporary scratch file. Received ZIPs are
+  saved as-is; extraction is up to you.
 - WebRTC data-channel transfer using the web app's encrypted chunk protocol.
   Transport is direct-only (STUN, no TURN relay): the transfer fails rather
   than route file bytes through a relay server.
@@ -100,19 +100,14 @@ ptransfer
 ```
 
 The wizard covers everything interactively: choose send or receive, pick files
-and/or folders in the built-in browser (Space to multi-select), choose the
-signaling mode, and when receiving, browse to the output directory (or create
-a new folder with `n`) and enter the PIN. Nostr PIN transfers run inside the
-TUI with live status and progress; manual PT01 transfers drop back to the
-plain terminal for the code swap.
+and/or folders in the built-in browser (Space to multi-select), and when
+receiving, browse to the output directory (or create a new folder with `n`)
+and enter the PIN. Transfers run inside the TUI with live status and progress.
 
 ### Non-Interactive Test Mode
 
 The `test` subcommand exists for testing only. Initial inputs come from
-arguments; sender-side manual response codes and Nostr confirmation codes are
-read from stdin and can be piped.
-
-Nostr PIN mode:
+arguments; confirmation codes are read from stdin and can be piped.
 
 ```bash
 ptransfer test send /path/to/file more-files a-folder
@@ -126,25 +121,22 @@ transfer; enter the PIN currently shown exactly. The receiver then prints an
 continues. Multiple paths or a folder are sent as one ZIP. If the destination
 file already exists the receiver fails; pass `--overwrite` to replace it.
 
-Manual PT01 mode:
-
-```bash
-ptransfer test send --manual /path/to/file
-ptransfer test receive --manual <OFFER-CODE>
-```
-
-The sender prints an offer code and waits for the response code on stdin. The
-receiver takes the offer code as an argument and prints a response code.
-
 ## Protocol Compatibility
 
-The CLI follows pTransfer as the source of truth:
+The normative wire contract is the sibling pTransfer checkout's
+[`docs/INTEROP_PROTOCOL.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/INTEROP_PROTOCOL.md).
+It covers PIN Exchange and the shared data-channel transfer layer — exactly what
+this CLI implements — and carries an interop protocol version independent of
+pTransfer's app version. This build implements version `1`, declared in
+`package.metadata.ptransfer-protocol-version`.
 
-- Rendezvous event: Nostr kind `24243`, tagged with a rotation-bucket-scoped
+- Rendezvous event: Nostr kind `4243` (a regular kind, so relays retain it for a
+  receiver that connects after the sender published), tagged with a rotation-bucket-scoped
   PIN hint and a NIP-40 expiration. The payload is plaintext JSON carrying a
   blinded SPAKE2 element — nothing in it is PIN-testable, and file metadata is
   deliberately absent.
-- Claim/confirm handshake and WebRTC signal events: Nostr kind `24242`.
+- Claim/confirm handshake and WebRTC signal events: Nostr kind `24243`
+  (ephemeral).
 - Default relays match pTransfer.
 - The PIN reduces to the SPAKE2 password scalar `w` (HKDF-SHA256 to 384 bits,
   reduced mod the P-256 order); there is no key stretching because nothing
@@ -165,18 +157,24 @@ The CLI follows pTransfer as the source of truth:
 - PIN rotation: fresh PIN every 2 minutes; only PINs minted in the current or
   immediately previous bucket are honored (roughly 2–4 minutes). The sender
   waits up to 30 minutes for a receiver before giving up.
-- Manual signaling uses PT01 payloads.
+- Wire encoding is flow-based, never content-sniffed: a single file travels
+  `deflate-raw`, a generated ZIP travels `identity` because its entries are
+  already deflated. The advertised file size is the input size — a progress
+  hint — while `DONE` carries the authoritative wire byte count.
 - File chunks use AES-256-GCM with the 2-byte chunk index as AAD, followed by
-  `DONE:<chunkCount>:<byteCount>` and receiver `ACK`.
+  `DONE:<chunkCount>:<byteCount>` and receiver `ACK`. Every payload is appended
+  in reliable data-channel order; there is no positional write path, because no
+  payload's wire length is known during signaling.
 
 ## Limits
 
-- Maximum transfer size is 2 GiB, matching pTransfer. For a generated
-  ZIP this applies to the final archive, so a selection whose ZIP crosses the
+- Maximum transfer size is 2 GiB, matching pTransfer. It is enforced against
+  the wire bytes as they are produced, so a selection whose payload crosses the
   limit fails while it is being generated and sent.
 - Received ZIPs are not auto-extracted, matching the web app.
 - No resume support.
 - No QR support.
+- No Code Exchange: hand-carried offer/answer codes are web-only.
 - No custom relay/discovery mode.
 - Direct P2P only: no TURN relay fallback for the file bytes.
 

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bytes::{Bytes, BytesMut};
-use rtc::data_channel::RTCDataChannelId;
+use rtc::data_channel::{RTCDataChannelId, RTCDataChannelInit};
 use rtc::peer_connection::RTCPeerConnectionBuilder;
 use rtc::peer_connection::configuration::setting_engine::{SctpMaxMessageSize, SettingEngine};
 use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent};
@@ -58,6 +58,15 @@ enum PeerCommand {
         data: Bytes,
         is_string: bool,
         response: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    /// Whether a channel negotiated ordered delivery. On the answering side
+    /// this reflects the DCEP the offerer sent, which is what makes it worth
+    /// asking: both receivers append in wire order and reject an out-of-order
+    /// index, so an unordered channel corrupts every multi-chunk transfer on a
+    /// path that ever retransmits.
+    IsOrdered {
+        channel_id: RTCDataChannelId,
+        response: oneshot::Sender<std::result::Result<bool, String>>,
     },
     Close(oneshot::Sender<std::result::Result<(), String>>),
 }
@@ -493,7 +502,23 @@ async fn run_peer(
                 let Some(command) = command else { break };
                 match command {
                     PeerCommand::CreateDataChannel { label, response } => {
-                        let result = peer.create_data_channel(&label, None)
+                        // `ordered` MUST be set explicitly. `rtc` builds its
+                        // parameters from a derived `Default`, so passing
+                        // `None` here yields `ordered: false` — a *reliable
+                        // unordered* channel, despite the crate's own doc
+                        // claiming the default is ordered. Every message still
+                        // arrives, but SCTP hands each one up the moment it
+                        // reassembles, so a single retransmit lets a later
+                        // chunk overtake an earlier one. Both receivers append
+                        // in wire order and reject an out-of-order index, so
+                        // that surfaces as "Unexpected streamed chunk index"
+                        // mid-transfer on any lossy path. Loopback never
+                        // reorders, which is why CLI-to-CLI never caught it.
+                        let init = RTCDataChannelInit {
+                            ordered: true,
+                            ..Default::default()
+                        };
+                        let result = peer.create_data_channel(&label, Some(init))
                             .map(|mut dc| {
                                 dc.set_buffered_amount_low_threshold(BUFFERED_AMOUNT_LOW);
                                 dc.set_buffered_amount_high_threshold(BUFFERED_AMOUNT_HIGH);
@@ -534,6 +559,12 @@ async fn run_peer(
                                     dc.send(BytesMut::from(data.as_ref())).map_err(|e| e.to_string())
                                 }
                             });
+                        let _ = response.send(result);
+                    }
+                    PeerCommand::IsOrdered { channel_id, response } => {
+                        let result = peer.data_channel(channel_id)
+                            .map(|dc| dc.ordered())
+                            .ok_or_else(|| "data channel is closed".to_owned());
                         let _ = response.send(result);
                     }
                     PeerCommand::Close(response) => {
@@ -922,12 +953,18 @@ impl DcMessenger {
             .await
     }
 
-    pub fn buffered_amount(&self) -> usize {
-        0
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.channel.closed.load(Ordering::SeqCst)
+    /// Whether the channel negotiated ordered delivery.
+    pub async fn is_ordered(&self) -> Result<bool> {
+        let (response, rx) = oneshot::channel();
+        self.channel
+            .command_tx
+            .send(PeerCommand::IsOrdered {
+                channel_id: self.channel.id,
+                response,
+            })
+            .await
+            .context("Peer connection closed")?;
+        receive_response(rx, "query data-channel ordering").await
     }
 }
 

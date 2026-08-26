@@ -1,13 +1,21 @@
 # Architecture
 
-`ptransfer-cli` provides the `ptransfer` command-line client for pTransfer. The web app is the source of truth
-for protocol shape and compatibility.
+`ptransfer-cli` provides the `ptransfer` command-line client for pTransfer.
 
-## Modes
+The normative wire contract is the web app's `docs/INTEROP_PROTOCOL.md`, which
+specifies PIN Exchange and the shared data-channel transfer layer and carries an
+interop protocol version independent of pTransfer's app version. This build
+implements version `1` (`package.metadata.ptransfer-protocol-version`). This
+document describes how the CLI realizes that contract; where the two disagree,
+the spec wins.
 
-### Nostr PIN Mode
+The web app's Code Exchange — hand-carried QR/clipboard offer and answer codes —
+is deliberately outside that contract while it is still taking shape, and is not
+implemented here. PIN exchange is the CLI's only signaling mode.
 
-This is the default mode. The PIN locates the sender's rendezvous event and
+## PIN Exchange
+
+The PIN locates the sender's rendezvous event and
 authenticates a SPAKE2 (RFC 9382, P-256) password-authenticated key exchange;
 it derives no keys on its own. Signaling, content, handshake-seal, and
 confirmation-code keys are all HKDF expansions off the SPAKE2 transcript root,
@@ -76,7 +84,9 @@ generation's budget and stall it until rotation — a nuisance, not a compromise
 (`PIN_ROTATION_MS`), honors only PINs minted in its current or immediately
 previous bucket, and attaches a NIP-40 expiration at the end of the PIN's
 second bucket. The receiver derives hints for its current and previous buckets
-and refuses rendezvous events older than the 4-minute maximum (`PIN_TTL_MS`).
+and refuses any rendezvous event whose `created_at` did not land in one of
+those same two buckets — a bucket test rather than a maximum age, so an event
+stamped in the future cannot claim to be newer than the real sender forever.
 The TUI `r` key (and the web app's
 refresh button) mints a fresh PIN immediately, dropping all retained
 generations. The sender keeps rotating for up to 30 minutes — a resource
@@ -86,14 +96,16 @@ backstop, not a security bound — before giving up.
 
 1. Sender generates a 16-byte salt, transfer id, and ephemeral Nostr key. Per
    rotation it mints a fresh PIN, starts a fresh SPAKE2 run
-   (`pA = x·G + w·M`), and publishes a kind `24243` rendezvous event:
+   (`pA = x·G + w·M`), and publishes a kind `4243` rendezvous event. A regular
+   kind, not an ephemeral one, so relays retain it and a receiver that connects
+   after publication still finds it:
    - `content`: **plaintext** JSON with `type=rendezvous`, transfer id, the
      sender's Nostr pubkey, `pakeMessage` (base64, 33-byte compressed P-256
      point), a fresh handshake nonce, and relays. Encrypting it under a
      PIN-derived key would reintroduce the offline guessing target the PAKE
      removes, so it is not encrypted — and file metadata is deliberately absent.
    - tags: `h`, `s` (salt), `t`, `type=rendezvous`, `expiration`.
-2. Receiver derives the hints, fetches matching kind `24243` events, and keeps
+2. Receiver derives the hints, fetches matching kind `4243` events, and keeps
    up to 8 structurally valid candidates (newest first, one per transfer id):
    the payload must name the event's own author and transfer id, and its
    element must be a valid non-identity curve point. Nothing distinguishes the
@@ -102,7 +114,7 @@ backstop, not a security bound — before giving up.
    (`pB = y·G + w·N`), finishes it against the candidate's element, and
    computes a versioned SHA-256 transcript over the rendezvous type, transfer
    id, sender identity, element, nonce, relays, and salt. It publishes one kind
-   `24242` claim per candidate (`type=claim`, tags `p=<sender>`, `t`) whose
+   `24243` claim per candidate (`type=claim`, tags `p=<sender>`, `t`) whose
    content is `{"sealed":<base64>,"pake":<base64 pB>,"target":<transcript
    hash>}`: the body is sealed with the session's `claim` key, `pB` rides in
    plaintext because the sender must finish its own side before any key
@@ -123,11 +135,14 @@ backstop, not a security bound — before giving up.
    replacement rendezvous publish for that generation (fresh `x`, element, and
    nonce), which the waiting receiver re-claims. Invalid claims are silently
    ignored, never fatal.
-5. Sender publishes the kind `24242` confirm (`type=confirm`) **immediately** on
+5. Sender publishes the kind `24243` confirm (`type=confirm`) **immediately** on
    verification, sealed with the session's `confirm` key. It echoes both nonces,
    both identities, and the transcript hash, and it delivers the file metadata
-   (`contentType`, `fileName`, `fileSize`, `fileSizeExact`, `mimeType`). The
+   (`contentType`, `fileName`, `fileSize`, `contentEncoding`, `mimeType`). The
    receiver allows 60 seconds for it and verifies every echoed field.
+   `fileSize` is the sender's *input* size — a progress hint, never the wire
+   length — and `contentEncoding` is one of `deflate-raw` or `identity`; any
+   other value fails to parse and the confirm is ignored.
 6. Both sides derive an 8-character Crockford Base32 confirmation code from 40
    HKDF-SHA256 bits over the SPAKE2 root with info
    `ptransfer:nostr-session:v4:confirmation|<transfer-id>|<sender-nonce>|<receiver-nonce>|<transcript-hash>|<metadata-hash>`,
@@ -141,7 +156,7 @@ backstop, not a security bound — before giving up.
    `ptransfer:nostr-session:v4:signals` (relay-carried WebRTC signaling) and
    `ptransfer:nostr-session:v4:content` (P2P file chunks). The claim/confirm
    seal keys use the `:claim` and `:confirm` labels off the same root.
-8. Sender and receiver exchange kind `24242` WebRTC signal events (`offer`,
+8. Sender and receiver exchange kind `24243` WebRTC signal events (`offer`,
    `answer`, `candidate`), encrypted with the session signals key.
    - Signal events use tags `t`, `p=<sender pubkey>`, and `type=signal`.
    - Sender-side answer subscriptions filter by `t`, `p=<sender pubkey>`, and
@@ -160,37 +175,31 @@ Default relays match pTransfer. Transport is direct-only: STUN servers
 assist NAT traversal, but no TURN relay is configured, so a transfer fails
 rather than route file bytes through a relay.
 
-### Manual PT01 Mode
+## Wire Encoding
 
-Manual mode is explicit: `send --manual` and `receive --manual`.
+The compression rule is the web app's, and it is **flow-based, never
+content-sniffed**:
 
-The signaling payload is the web app's PT01 format:
+| Payload | `contentEncoding` |
+|---|---|
+| A single file | `deflate-raw` |
+| A generated ZIP (multiple files or a folder) | `identity` |
 
-```text
-JSON -> raw DEFLATE -> "mag!" || compressed -> time-bucket XOR
-     -> "PT01" || obfuscated -> standard base64
-```
+A single file is deflated on the fly with raw DEFLATE (RFC 1951, no zlib or
+gzip wrapper — the browser's `deflate-raw`) as it is read, and inflated by the
+receiver on the way to disk. A generated ZIP has already deflated each entry, so
+the archive itself is never compressed a second time.
 
-Manual offer payloads contain SDP, ICE candidate strings, file metadata,
-`fileSizeExact` (false for a streamed ZIP whose advertised size is an input
-estimate), created-at timestamp, sender P-256 public key, and salt. Manual
-answer payloads contain SDP, ICE candidate strings, created-at timestamp, and
-receiver P-256 public key.
-
-Both sides derive the AES content key with:
-
-```text
-HKDF-SHA256(
-  ikm = P-256 ECDH shared X coordinate,
-  salt = offer salt,
-  info = "ptransfer-mutual",
-  len = 32
-)
-```
+Either way the final wire length is unknown while signaling runs, which is why
+the advertised size is only a hint and `DONE` carries the real count. The
+receiver caps *inflated* output at `MAX_MESSAGE_SIZE` as a decompression-bomb
+guard, and a stream that has not ended by `DONE` is rejected as truncated —
+something the byte count alone cannot detect, since every promised wire byte did
+arrive.
 
 ## Data Channel Protocol
 
-Each plaintext chunk is at most 128 KiB. Each encrypted binary data-channel
+Each wire chunk is at most 128 KiB. Each encrypted binary data-channel
 message is:
 
 ```text
@@ -205,9 +214,22 @@ After all chunks, the sender sends:
 DONE:<total_chunks>:<total_bytes>
 ```
 
-The final byte count authenticates the length of streamed ZIPs, whose output
-size was not known during signaling. The receiver authenticates and persists
-the full file, then replies:
+The final byte count authenticates the wire length, which no payload knows
+during signaling. The receiver appends every authenticated chunk in reliable
+data-channel order — there is no positional write path, because a chunk index
+cannot be turned into a file offset when the total is unknown — then persists
+the full file and replies:
+
+That ordering is a requirement on the channel, not an assumption: the CLI
+creates its data channel with `ordered: true` explicitly, because `rtc` derives
+its data-channel parameters from a plain `Default` and an omitted
+`RTCDataChannelInit` negotiates *reliable unordered* instead. Every message
+still arrives, but SCTP delivers each one as soon as it reassembles, so one
+retransmit is enough for a later chunk to overtake an earlier one and for the
+peer to reject the out-of-order index mid-transfer. Loopback never reorders, so
+`tests/cli_to_cli_transfer.rs` asserts the negotiated ordering directly (the
+answering end decodes it from the offerer's DCEP) rather than hoping a transfer
+notices.
 
 ```text
 ACK
@@ -222,15 +244,18 @@ incoming data-channel message, including
 
 The maximum transfer size is 2 GiB (`MAX_MESSAGE_SIZE`), matching pTransfer; both
 ends stream chunk by chunk, so the bound is not RAM.
-For multi-file/folder sends the CLI walks and validates the selection first,
-then starts a store-mode ZIP writer only after the data channel opens. A
-bounded channel applies backpressure between blocking file reads/ZIP output
-and async encryption/WebRTC sends, so no complete archive or temporary ZIP is
-created. The advertised ZIP size is the input byte count as a progress hint;
-the sender enforces the limit against actual output and seals the final length
-in `DONE`.
+
+Both send paths run the same shape: a blocking worker produces wire bytes — a
+deflater over one file, or a ZIP writer over a walked selection — into a chunk
+writer that hands complete 128 KiB chunks across a bounded channel. That channel
+is the backpressure boundary between blocking filesystem work and async
+encryption/WebRTC sends, so neither a complete archive nor a whole compressed
+file is ever materialized, and no temporary file is created. The selection is
+walked and validated first; production starts only after the data channel opens.
+The advertised size is the input byte count as a progress hint; the sender
+enforces the limit against actual output and seals the final length in `DONE`.
 
 ## Scope
 
 The CLI intentionally has no legacy signaling protocol, no resume path, no QR
-support, no relay discovery, and no custom fallback mode.
+support, no Code Exchange, no relay discovery, and no custom fallback mode.

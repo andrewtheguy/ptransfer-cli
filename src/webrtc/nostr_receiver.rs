@@ -1,4 +1,4 @@
-//! Nostr Auto Exchange receiver compatible with pTransfer.
+//! PIN Exchange receiver compatible with pTransfer.
 //!
 //! Handshake: reduce the PIN to its SPAKE2 password scalar, locate candidate
 //! rendezvous events via rotation-bucket hints, run the receiver side of the
@@ -25,8 +25,8 @@ use crate::crypto::aes;
 use crate::crypto::chunk::MAX_MESSAGE_SIZE;
 use crate::crypto::kdf::{ConfirmationCodeBinding, HandshakeSealKeys, NostrSessionKeys, PakeRoot};
 use crate::crypto::pin::{
-    MAX_CLAIM_ATTEMPTS, MAX_CLAIM_CANDIDATES, PIN_HINT_LOOKBACK_BUCKETS, PIN_TTL_MS, is_valid_pin,
-    now_ms, pin_bucket, pin_hint_for_bucket, pin_locator,
+    MAX_CLAIM_ATTEMPTS, MAX_CLAIM_CANDIDATES, PIN_HINT_LOOKBACK_BUCKETS, is_rendezvous_fresh,
+    is_valid_pin, now_ms, pin_bucket, pin_hint_for_bucket, pin_locator,
 };
 use crate::crypto::spake2::{
     PakeIdentities, PakeRole, PakeRun, derive_pake_secret, is_valid_pake_message,
@@ -139,9 +139,9 @@ pub async fn receive_file_nostr(
     if metadata.content_type != "file" {
         bail!("Transfer describes unsupported content");
     }
-    if metadata.file_size_exact && metadata.file_size == 0 {
-        bail!("Transfer describes an empty file");
-    }
+    // No emptiness check here: `file_size` is the sender's input size, a
+    // progress hint that bounds nothing, and pTransfer's receiver does not
+    // check it either. The sender is where an empty selection is refused.
     if metadata.file_size > MAX_MESSAGE_SIZE {
         bail!(
             "Transfer is {}, which exceeds the {} limit",
@@ -171,7 +171,7 @@ pub async fn receive_file_nostr(
 
     let file_name = metadata.file_name.clone();
     let file_size = metadata.file_size;
-    let file_size_exact = metadata.file_size_exact;
+    let content_encoding = metadata.content_encoding;
     ui::incoming(&file_name, file_size, Some(&metadata.mime_type));
     let dest = match resolve_destination(output_dir, &file_name, on_conflict).await? {
         Some(dest) => dest,
@@ -359,7 +359,7 @@ pub async fn receive_file_nostr(
         &mut messenger,
         &session_keys.content,
         &dest,
-        file_size_exact.then_some(file_size),
+        content_encoding,
         file_size,
     )
     .await;
@@ -410,6 +410,7 @@ async fn find_rendezvous_candidates(
 
     let mut saw_expired = false;
     let mut candidates: Vec<RendezvousCandidate> = Vec::new();
+    let now = now_ms();
 
     for event in events {
         if candidates.len() >= MAX_CLAIM_CANDIDATES {
@@ -417,11 +418,15 @@ async fn find_rendezvous_candidates(
         }
 
         // A rendezvous event is only claimable while the sender still honors
-        // its PIN generation. Tracked here (not in the shared helper) so the
-        // "PIN expired" message can distinguish stale transfers.
-        let created_at_ms = event.created_at.as_secs() * 1000;
-        if now_ms().saturating_sub(created_at_ms) > PIN_TTL_MS {
-            saw_expired = true;
+        // the bucket it was published in. Tracked here (not in the shared
+        // helper) so the "PIN expired" message can distinguish a rotated
+        // transfer. Only a bucket in the past means the PIN moved on: a
+        // future-dated event is forged or badly clocked, and telling the user
+        // to retype would send them after the wrong problem.
+        if !is_rendezvous_fresh(event.created_at.as_secs(), now) {
+            if pin_bucket(event.created_at.as_secs().saturating_mul(1000)) < pin_bucket(now) {
+                saw_expired = true;
+            }
             continue;
         }
 
@@ -458,11 +463,11 @@ async fn find_rendezvous_candidates(
 
 /// Structural validation of a rendezvous event, shared by the initial fetch
 /// and the replacement events that arrive while waiting for the confirm: the
-/// event must be fresh, its payload must name the event's own author and
-/// transfer id, and its element must be a valid non-identity curve point.
+/// event must have been published in a bucket the sender still honors, its
+/// payload must name the event's own author and transfer id, and its element
+/// must be a valid non-identity curve point.
 fn parse_claimable_rendezvous(event: &Event) -> Option<RendezvousCandidate> {
-    let created_at_ms = event.created_at.as_secs() * 1000;
-    if now_ms().saturating_sub(created_at_ms) > PIN_TTL_MS {
+    if !is_rendezvous_fresh(event.created_at.as_secs(), now_ms()) {
         return None;
     }
     let parsed = parse_rendezvous_event(event)?;
@@ -882,10 +887,29 @@ async fn handle_receiver_candidate(
     Ok(())
 }
 
+async fn next_event(
+    notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+) -> Result<Event> {
+    loop {
+        match notifications.recv().await {
+            Ok(RelayPoolNotification::Event { event, .. }) => return Ok((*event).clone()),
+            Ok(RelayPoolNotification::Message { message, .. }) => {
+                if let RelayMessage::Event { event, .. } = message {
+                    return Ok((*event).clone());
+                }
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(e) => bail!("Nostr notification stream closed: {e}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::signaling::nostr::data_kind;
+    use crate::wire::WireEncoding;
 
     const TRANSFER_ID: &str = "a1b2c3d4e5f60718";
     const SALT: &[u8] = b"0123456789abcdef";
@@ -949,7 +973,7 @@ mod tests {
                 content_type: "file".to_string(),
                 file_name: "quarterly-report.pdf".to_string(),
                 file_size: 1_048_576,
-                file_size_exact: true,
+                content_encoding: WireEncoding::DeflateRaw,
                 mime_type: "application/pdf".to_string(),
             },
         };
@@ -991,23 +1015,5 @@ mod tests {
         let (index, _) = match_confirm(&event, &claims, &receiver_pubkey)
             .expect("confirm sealed for the original claim must match");
         assert_eq!(index, 0);
-    }
-}
-
-async fn next_event(
-    notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
-) -> Result<Event> {
-    loop {
-        match notifications.recv().await {
-            Ok(RelayPoolNotification::Event { event, .. }) => return Ok((*event).clone()),
-            Ok(RelayPoolNotification::Message { message, .. }) => {
-                if let RelayMessage::Event { event, .. } = message {
-                    return Ok((*event).clone());
-                }
-            }
-            Ok(_) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-            Err(e) => bail!("Nostr notification stream closed: {e}"),
-        }
     }
 }

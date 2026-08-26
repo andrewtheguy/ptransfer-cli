@@ -102,18 +102,13 @@ pub async fn run(terminal: &mut DefaultTerminal, plan: WizardPlan) -> Result<()>
 
 async fn run_plan(plan: WizardPlan) -> Result<()> {
     match plan {
-        WizardPlan::SendNostr(paths) => {
+        WizardPlan::SendPin(paths) => {
             let source =
                 tokio::task::spawn_blocking(move || archive::prepare_send_source(&paths)).await??;
             webrtc::send_file_nostr(&source).await
         }
-        WizardPlan::ReceiveNostr { pin, output, .. } => {
+        WizardPlan::ReceivePin { pin, output } => {
             webrtc::receive_file_nostr(&pin, Some(output), OnConflict::Prompt).await
-        }
-        // Manual plans never reach the transfer screen: tui::run tears the
-        // terminal down first and runs the plain-text flow.
-        WizardPlan::SendManual(_) | WizardPlan::ReceiveManual { .. } => {
-            unreachable!("manual plans run outside the TUI")
         }
     }
 }
@@ -147,11 +142,8 @@ struct ConfirmationPrompt {
 impl State {
     fn new(plan: &WizardPlan) -> Self {
         let title = match plan {
-            WizardPlan::SendNostr(_) => "sending",
-            WizardPlan::ReceiveNostr { .. } => "receiving",
-            WizardPlan::SendManual(_) | WizardPlan::ReceiveManual { .. } => {
-                unreachable!("manual plans run outside the TUI")
-            }
+            WizardPlan::SendPin(_) => "sending",
+            WizardPlan::ReceivePin { .. } => "receiving",
         };
         Self {
             title,
@@ -463,7 +455,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirmation_prompt_normalizes_paste_before_submitting() {
-        let mut state = State::new(&WizardPlan::SendNostr(Vec::new()));
+        let mut state = State::new(&WizardPlan::SendPin(Vec::new()));
         let (reply, received) = oneshot::channel();
         state.apply(UiEvent::ConfirmationCodeInput { reply });
 

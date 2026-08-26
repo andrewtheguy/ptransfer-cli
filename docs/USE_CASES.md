@@ -6,10 +6,10 @@ non-interactive `test` mode, which exists for testing only.
 
 ## Send Between CLI and pTransfer
 
-Run `ptransfer`, choose **Send**, pick files and/or folders in the
-browser (Space to multi-select), and choose PIN mode. Enter the displayed PIN
-in pTransfer's receive mode. Multiple files or a folder arrive as one
-ZIP, exactly as if they had been sent from the web app.
+Run `ptransfer`, choose **Send** and pick files and/or folders in the browser
+(Space to multi-select). Enter the displayed PIN in pTransfer's receive page.
+Multiple files or a folder arrive as one ZIP, exactly as if they had been sent
+from the web app.
 
 Test mode:
 
@@ -19,8 +19,8 @@ ptransfer test send ./file.bin ./photos
 
 ## Receive From pTransfer
 
-Start a send in pTransfer, then run `ptransfer`, choose
-**Receive** and PIN mode, pick the output directory, and enter the PIN.
+Start a send in pTransfer with **PIN Exchange**, then run `ptransfer`, choose
+**Receive**, pick the output directory, and enter the PIN.
 
 Test mode (fails if the destination exists; add `--overwrite` to replace):
 
@@ -41,19 +41,3 @@ Test mode:
 ptransfer test send ./file.bin
 ptransfer test receive <PIN>
 ```
-
-## Manual Copy/Paste Signaling
-
-Use this when Nostr relays are unavailable but both peers can still establish a
-WebRTC connection. Choose **Manual copy/paste exchange** in the wizard; the TUI
-exits back to the normal terminal so the PT01 offer and response codes can be
-copied and pasted between the peers.
-
-Test mode (the sender reads the response code from stdin):
-
-```bash
-ptransfer test send --manual ./file.bin
-ptransfer test receive --manual <OFFER-CODE>
-```
-
-Manual mode exchanges PT01 offer and answer text. It does not add QR support.

@@ -1,4 +1,4 @@
-//! Nostr Auto Exchange sender compatible with pTransfer.
+//! PIN Exchange sender compatible with pTransfer.
 //!
 //! Handshake: publish a plaintext rendezvous event carrying a blinded SPAKE2
 //! element per PIN rotation, finish the PAKE against the first claim targeting
@@ -103,12 +103,11 @@ struct VerifiedClaim {
 }
 
 pub async fn send_file_nostr(source: &SendSource) -> Result<()> {
-    let file_size = source.advertised_size();
-    let file_size_exact = source.size_is_exact();
+    let file_size = source.estimated_size;
     let file_name = source.file_name.clone();
     let mime_type = source.mime_type.to_string();
 
-    if file_size > MAX_MESSAGE_SIZE || source.estimated_size > MAX_MESSAGE_SIZE {
+    if file_size > MAX_MESSAGE_SIZE {
         bail!(
             "File is {}, which exceeds the {} limit",
             format_bytes(file_size),
@@ -133,7 +132,7 @@ pub async fn send_file_nostr(source: &SendSource) -> Result<()> {
         content_type: "file".to_string(),
         file_name: file_name.clone(),
         file_size,
-        file_size_exact,
+        content_encoding: source.wire_encoding,
         mime_type,
     };
     let metadata_hash = compute_transfer_metadata_hash(&metadata)?;

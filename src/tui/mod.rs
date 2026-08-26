@@ -1,15 +1,12 @@
 //! Full-screen TUI wizard: the default interface when the binary runs with no
 //! arguments.
 //!
-//! The wizard collects a [`app::WizardPlan`] first, then:
-//! - Nostr plans stay inside the TUI ([`transfer_screen`]), with live status,
-//!   PIN panel, progress gauge, and the file-exists modal.
-//! - Manual plans tear the terminal down and run the existing plain-text flow,
-//!   because the PT01 offer/answer blobs must be copy/pasteable — an alternate
-//!   screen would get in the way. The TUI is never re-entered afterward.
+//! The wizard collects a [`app::WizardPlan`] first, then runs it inside the
+//! TUI ([`transfer_screen`]), with live status, PIN panel, progress gauge, and
+//! the file-exists modal.
 //!
 //! The process performs exactly one transfer and exits, so the UI event sink
-//! installed for Nostr transfers is never uninstalled.
+//! is never uninstalled.
 
 mod app;
 mod dir_picker;
@@ -23,11 +20,6 @@ use crossterm::event::{
 };
 use ratatui::DefaultTerminal;
 
-use crate::util::OnConflict;
-use crate::{archive, ui, webrtc};
-
-use app::WizardPlan;
-
 /// Run the interactive wizard end to end.
 pub async fn run() -> Result<()> {
     let mut guard = TerminalGuard::init()?;
@@ -36,24 +28,7 @@ pub async fn run() -> Result<()> {
         None => return Ok(()), // clean quit from the main menu
     };
 
-    match plan {
-        WizardPlan::SendNostr(_) | WizardPlan::ReceiveNostr { .. } => {
-            transfer_screen::run(guard.terminal(), plan).await
-        }
-
-        WizardPlan::SendManual(paths) => {
-            drop(guard); // back to the normal terminal for the code swap
-            let source =
-                tokio::task::spawn_blocking(move || archive::prepare_send_source(&paths)).await??;
-            webrtc::send_file_manual(&source).await
-        }
-
-        WizardPlan::ReceiveManual { output } => {
-            drop(guard);
-            let code = ui::prompt_code("Paste the sender's offer code:").await?;
-            webrtc::receive_file_manual(code.trim(), Some(output), OnConflict::Prompt).await
-        }
-    }
+    transfer_screen::run(guard.terminal(), plan).await
 }
 
 /// Raw mode disables signal handling, so Ctrl-C arrives as a key event.
