@@ -4,3 +4,4 @@ ptransfer_cli_*
 build/
 tmp/
 .claude/
+CLAUDE.local.md
