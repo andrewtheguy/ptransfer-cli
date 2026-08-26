@@ -1,13 +1,9 @@
 //! WebRTC transport for peer-to-peer file transfer.
 
 pub mod common;
-pub mod manual_receiver;
-pub mod manual_sender;
 pub mod nostr_receiver;
 pub mod nostr_sender;
 
-pub use manual_receiver::receive_file_manual;
-pub use manual_sender::send_file_manual;
 pub use nostr_receiver::receive_file_nostr;
 pub use nostr_sender::send_file_nostr;
 

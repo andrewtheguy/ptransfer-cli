@@ -23,7 +23,7 @@ const LABEL_CLAIM: &str = "ptransfer:nostr-session:v4:claim";
 const LABEL_CONFIRM: &str = "ptransfer:nostr-session:v4:confirm";
 const LABEL_CONFIRMATION: &str = "ptransfer:nostr-session:v4:confirmation";
 
-/// Session keys for Nostr (Auto Exchange) mode. Distinct HKDF info labels
+/// Session keys for PIN Exchange. Distinct HKDF info labels
 /// guarantee signaling and content never reuse the same AES-GCM key.
 pub struct NostrSessionKeys {
     /// Encrypts relay-carried WebRTC signaling (offer/answer/candidates).

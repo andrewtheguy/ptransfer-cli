@@ -17,6 +17,7 @@ use std::time::Duration;
 use ptransfer_cli::archive::{SendSource, prepare_send_source};
 use ptransfer_cli::transfer::{run_receiver, run_sender};
 use ptransfer_cli::webrtc::common::{DcMessenger, WebRtcPeer, open_and_detach};
+use ptransfer_cli::wire::WireEncoding;
 
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::state::RTCPeerConnectionState;
@@ -34,8 +35,9 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 /// stall (the bug this guards against) trips this instead of completing.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Deterministic, poorly-compressible bytes so `Stored` ZIP output tracks input
-/// size and every received byte can be checked against the source.
+/// Deterministic, poorly-compressible bytes. Deflate barely shrinks them, so
+/// the generated archive stays large enough to span many chunks and exercise
+/// flow control, and every received byte can be checked against the source.
 fn pseudo_random(seed: u64, len: usize) -> Vec<u8> {
     let mut state = seed | 1;
     let mut out = Vec::with_capacity(len);
@@ -175,8 +177,9 @@ async fn multi_folder_zip_streams_cli_to_cli_without_stalling() {
 
     let inputs: Vec<PathBuf> = vec![src.path().join("dir_a"), src.path().join("dir_b")];
     let source: SendSource = prepare_send_source(&inputs).unwrap();
-    // Multiple folders take the lazy-ZIP path with an unknown final size.
-    assert!(!source.size_is_exact(), "expected a streamed ZIP source");
+    // Multiple folders take the lazy-ZIP path: already compressed entry by
+    // entry, so the archive travels as-is.
+    assert_eq!(source.wire_encoding, WireEncoding::Identity);
     let estimated = source.estimated_size;
     let dest = dst.path().join("received.zip");
 
@@ -184,7 +187,14 @@ async fn multi_folder_zip_streams_cli_to_cli_without_stalling() {
 
     let send = async { run_sender(&mut sender_msg, &TEST_KEY, &source).await };
     let recv = async {
-        run_receiver(&mut receiver_msg, &TEST_KEY, &dest, None, estimated).await
+        run_receiver(
+            &mut receiver_msg,
+            &TEST_KEY,
+            &dest,
+            WireEncoding::Identity,
+            estimated,
+        )
+        .await
     };
 
     let outcome = tokio::time::timeout(TRANSFER_TIMEOUT, async { tokio::try_join!(send, recv) })
@@ -223,4 +233,57 @@ async fn multi_folder_zip_streams_cli_to_cli_without_stalling() {
         );
         assert!(got_bytes == want_bytes, "entry {got_name} content mismatch");
     }
+}
+
+/// The single-file path: deflated on the wire by the sender, inflated by the
+/// receiver, over a real data channel. This is the leg that has to interoperate
+/// with the browser's CompressionStream/DecompressionStream, so it is checked
+/// end to end rather than only at the codec. That the wire payload really is
+/// compressed is covered by `archive::tests::single_file_stream_is_a_raw_deflate_stream`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_file_deflates_on_the_wire_and_inflates_on_receipt() {
+    let _ = env_logger::try_init();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+
+    // Compressible enough that the wire payload is unmistakably smaller than
+    // the file, but long enough to span many chunks either way.
+    let mut plain = Vec::with_capacity(8 * 1024 * 1024);
+    while plain.len() < 8 * 1024 * 1024 {
+        plain.extend_from_slice(b"the quick brown fox jumps over the lazy dog\n");
+    }
+    let input = src.path().join("report.log");
+    write_file(&input, &plain);
+
+    let source: SendSource = prepare_send_source(&[input]).unwrap();
+    // A single file is always deflated, whatever it contains.
+    assert_eq!(source.wire_encoding, WireEncoding::DeflateRaw);
+    assert_eq!(source.estimated_size, plain.len() as u64);
+    let dest = dst.path().join("report.log");
+
+    let (sender_peer, mut sender_msg, receiver_peer, mut receiver_msg) = connect_pair().await;
+
+    let send = async { run_sender(&mut sender_msg, &TEST_KEY, &source).await };
+    let recv = async {
+        run_receiver(
+            &mut receiver_msg,
+            &TEST_KEY,
+            &dest,
+            WireEncoding::DeflateRaw,
+            source.estimated_size,
+        )
+        .await
+    };
+
+    let outcome = tokio::time::timeout(TRANSFER_TIMEOUT, async { tokio::try_join!(send, recv) })
+        .await
+        .expect("CLI\u{2194}CLI transfer stalled: did not finish within the time budget");
+    outcome.expect("transfer returned an error");
+
+    let _ = sender_peer.close().await;
+    let _ = receiver_peer.close().await;
+
+    assert_eq!(std::fs::read(&dest).unwrap(), plain, "payload did not survive");
 }

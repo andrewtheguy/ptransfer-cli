@@ -100,25 +100,40 @@ async function runCommand(command, args, options = {}) {
   }
 }
 
+/// The two sides agree on the *interop* protocol version, not the web app's
+/// npm version: the app bumps its patch version for web-only changes (Code
+/// Exchange, the relay fallback) this CLI does not implement. The npm version
+/// is still read, but only so the harness can tell whether the server it finds
+/// is serving the checkout it was pointed at.
+const PROTOCOL_TS = join(WEB_ROOT, 'src', 'lib', 'protocol.ts');
+
+async function readWebPackage() {
+  return JSON.parse(await readFile(join(WEB_ROOT, 'package.json'), 'utf8'));
+}
+
 async function assertProtocolVersionMatches() {
   const cargoToml = await readFile(join(CLI_ROOT, 'Cargo.toml'), 'utf8');
-  const webPackage = JSON.parse(
-    await readFile(join(WEB_ROOT, 'package.json'), 'utf8'),
-  );
+  const protocolTs = await readFile(PROTOCOL_TS, 'utf8');
+
   const metadataMatch = cargoToml.match(
     /^ptransfer-protocol-version\s*=\s*"([^"]+)"\s*$/m,
   );
   if (!metadataMatch) {
     throw new Error('Cargo.toml is missing package.metadata.ptransfer-protocol-version');
   }
-  if (metadataMatch[1] !== webPackage.version) {
+  const webMatch = protocolTs.match(
+    /INTEROP_PROTOCOL_VERSION\s*=\s*'([^']+)'/,
+  );
+  if (!webMatch) {
+    throw new Error(`${PROTOCOL_TS} is missing INTEROP_PROTOCOL_VERSION`);
+  }
+  if (metadataMatch[1] !== webMatch[1]) {
     throw new Error(
-      `Protocol version mismatch: CLI declares pTransfer ${metadataMatch[1]}, `
-      + `but ${WEB_ROOT}/package.json is ${webPackage.version}`,
+      `Interop protocol version mismatch: ${CLI_ROOT}/Cargo.toml declares `
+      + `${metadataMatch[1]}, but ${PROTOCOL_TS} is ${webMatch[1]}`,
     );
   }
-  console.log(`[setup] protocol version pTransfer ${webPackage.version}`);
-  return webPackage;
+  console.log(`[setup] interop protocol version ${webMatch[1]}`);
 }
 
 async function probeWebServer(url, expectedPackageName) {
@@ -403,7 +418,7 @@ async function warmWebApp() {
       waitUntil: 'networkidle',
     });
     await page
-      .getByRole('textbox', { name: 'PIN', exact: true })
+      .getByRole('tab', { name: 'Paste' })
       .waitFor({ state: 'visible', timeout: 30_000 });
 
     await page.goto(new URL('/send', webUrl).href, {
@@ -497,10 +512,21 @@ async function cliToWeb() {
     );
     console.log(`[e2e] CLI sender PIN: ${pin}`);
 
-    await page.goto(new URL('/receive', webUrl).href, {
+    // The PIN deep link is what a scanned PIN QR opens: it lands on the
+    // consolidated receive screen with the Paste tab selected and the input
+    // prefilled, so the harness does not have to drive the tab itself.
+    await page.goto(new URL(`/receive#p=${pin}`, webUrl).href, {
       waitUntil: 'domcontentloaded',
     });
-    await page.getByRole('textbox', { name: 'PIN', exact: true }).fill(pin);
+    const receiveInput = page.getByRole('textbox', {
+      name: 'PIN or sender code',
+    });
+    await receiveInput.waitFor({ state: 'visible', timeout: 30_000 });
+    // Fail loudly if the deep link stopped prefilling, rather than waiting out
+    // a timeout on the disabled Receive button.
+    if ((await receiveInput.inputValue()) !== pin) {
+      throw new Error('The PIN deep link did not prefill the receive input');
+    }
     await page.getByRole('button', { name: 'Receive', exact: true }).click();
 
     const confirmationCode = await readWebConfirmationCode(page);
@@ -536,7 +562,7 @@ async function webToCli() {
       waitUntil: 'domcontentloaded',
     });
     await page.locator('input[type="file"]').first().setInputFiles(source);
-    await page.getByRole('button', { name: 'Start Auto Exchange' }).click();
+    await page.getByRole('button', { name: 'Start PIN Exchange' }).click();
 
     const pinInput = page.getByRole('textbox', { name: 'PIN', exact: true });
     await pinInput.waitFor({ state: 'visible', timeout: 120_000 });
@@ -625,7 +651,8 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 }
 
 try {
-  const expectedWebPackage = await assertProtocolVersionMatches();
+  await assertProtocolVersionMatches();
+  const expectedWebPackage = await readWebPackage();
   await runCommand('cargo', ['build', '--all-features'], { cwd: CLI_ROOT });
   const chromium = await loadChromium();
   const executablePath = await findBrowser();

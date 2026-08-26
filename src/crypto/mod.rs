@@ -4,19 +4,16 @@
 //!   codes.
 //! - [`chunk`]: AES-256-GCM streaming chunk format with the 2-byte chunk index
 //!   as additional authenticated data.
-//! - [`ecdh`]: P-256 ECDH key agreement + HKDF-SHA256 content-key derivation
-//!   used by manual (copy/paste) mode.
 //! - [`kdf`]: session, handshake-seal, and confirmation-code derivations off
-//!   the SPAKE2 root used by Nostr mode.
+//!   the SPAKE2 root.
 //! - [`pin`]: rotating PIN generation, validation, and the public rendezvous
-//!   hint used by Nostr mode.
+//!   hint.
 //! - [`spake2`]: the SPAKE2 (RFC 9382) password-authenticated key exchange the
-//!   PIN drives in Nostr mode.
+//!   PIN drives.
 
 pub mod aes;
 pub mod base32;
 pub mod chunk;
-pub mod ecdh;
 pub mod kdf;
 pub mod pin;
 pub mod spake2;

@@ -1,10 +1,9 @@
 //! ptransfer-cli: the pTransfer command-line client for peer-to-peer file transfer.
 //!
 //! Running with no arguments launches the full-screen TUI wizard, which covers
-//! sending/receiving files and folders in both Nostr PIN mode and manual PT01
-//! copy/paste mode. The `test` subcommand exposes the same flows as a
-//! non-interactive plain-text mode for testing. QR support is intentionally
-//! not part of this CLI.
+//! sending and receiving files and folders over PIN exchange. The `test`
+//! subcommand exposes the same flows as a non-interactive plain-text mode for
+//! testing. QR support is intentionally not part of this CLI.
 //! Build with: cargo build --release
 
 use anyhow::Result;
@@ -39,29 +38,20 @@ enum Commands {
 #[derive(Subcommand)]
 enum TestCommands {
     /// Send files and/or folders; multiple inputs are bundled into one ZIP.
-    /// Defaults to pTransfer Nostr PIN mode.
     Send {
         /// Files and/or directories to send
         #[arg(required = true, num_args = 1..)]
         paths: Vec<PathBuf>,
-
-        /// Use manual PT01 copy/paste signaling instead of Nostr PIN mode
-        #[arg(long)]
-        manual: bool,
     },
 
-    /// Receive a file. Defaults to pTransfer Nostr PIN mode.
+    /// Receive a file.
     Receive {
-        /// PIN for Nostr mode, or sender offer code with --manual
+        /// PIN shown by the sender
         code: String,
 
         /// Output directory (defaults to the current directory)
         #[arg(short, long)]
         output: Option<PathBuf>,
-
-        /// Use manual PT01 copy/paste signaling instead of Nostr PIN mode
-        #[arg(long)]
-        manual: bool,
 
         /// Replace the destination file if it already exists (default: fail)
         #[arg(long)]
@@ -114,21 +104,16 @@ async fn async_main() -> Result<()> {
             init_logging(&format!("{log_level},webrtc_ice=error"));
 
             match command {
-                TestCommands::Send { paths, manual } => {
+                TestCommands::Send { paths } => {
                     let source =
                         tokio::task::spawn_blocking(move || archive::prepare_send_source(&paths))
                             .await??;
-                    if manual {
-                        webrtc::send_file_manual(&source).await
-                    } else {
-                        webrtc::send_file_nostr(&source).await
-                    }
+                    webrtc::send_file_nostr(&source).await
                 }
 
                 TestCommands::Receive {
                     code,
                     output,
-                    manual,
                     overwrite,
                 } => {
                     let on_conflict = if overwrite {
@@ -136,11 +121,7 @@ async fn async_main() -> Result<()> {
                     } else {
                         OnConflict::Fail
                     };
-                    if manual {
-                        webrtc::receive_file_manual(code.trim(), output, on_conflict).await
-                    } else {
-                        webrtc::receive_file_nostr(code.trim(), output, on_conflict).await
-                    }
+                    webrtc::receive_file_nostr(code.trim(), output, on_conflict).await
                 }
             }
         }
@@ -168,14 +149,13 @@ mod tests {
         let cli =
             Cli::try_parse_from(["ptransfer", "test", "send", "a.txt", "b", "dir"]).unwrap();
         let Some(Commands::Test {
-            command: TestCommands::Send { paths, manual },
+            command: TestCommands::Send { paths },
             ..
         }) = cli.command
         else {
             panic!("expected test send");
         };
         assert_eq!(paths.len(), 3);
-        assert!(!manual);
     }
 
     #[test]

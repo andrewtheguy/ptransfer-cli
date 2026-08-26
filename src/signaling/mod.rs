@@ -1,4 +1,4 @@
-//! Signaling: exchanging WebRTC offers/answers between peers.
+//! Signaling: exchanging WebRTC offers/answers between peers over Nostr
+//! relays, authenticated by the PIN's SPAKE2 exchange.
 
-pub mod manual;
 pub mod nostr;

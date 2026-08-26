@@ -1,8 +1,9 @@
-//! Nostr signaling compatible with pTransfer's Auto Exchange mode.
+//! Nostr signaling for PIN exchange, compatible with pTransfer's PIN
+//! Exchange mode.
 //!
 //! Three event shapes, mirroring `src/lib/nostr/events.ts`:
 //!
-//! - **Rendezvous** (kind 24243, `type=rendezvous`): published by the sender
+//! - **Rendezvous** (kind 4243, `type=rendezvous`): published by the sender
 //!   once per PIN rotation, tagged with the rotation-bucket-scoped PIN hint
 //!   (`#h`), and republished with a fresh element whenever a failed claim
 //!   consumes the current one (every element is single-use). The payload is
@@ -10,14 +11,14 @@
 //!   nothing in it can confirm a PIN guess offline, and encrypting it under a
 //!   PIN-derived key would reintroduce exactly the offline target the PAKE
 //!   removes. File metadata is deliberately absent.
-//! - **Handshake** (kind 24242, `type=claim|confirm`): the receiver claims the
+//! - **Handshake** (kind 24243, `type=claim|confirm`): the receiver claims the
 //!   transfer, the sender confirms and delivers the file metadata. The content
 //!   is a JSON envelope carrying the sealed body plus — for claims — the
 //!   receiver's SPAKE2 element in plaintext (the sender must finish its side
 //!   of the PAKE before it can derive the key that opens the seal) and the
 //!   transcript hash of the rendezvous the claim targets (the sender must know
 //!   which single-use element the claim spends before doing any curve work).
-//! - **Signal** (kind 24242, `type=signal`): WebRTC offer/answer/candidates,
+//! - **Signal** (kind 24243, `type=signal`): WebRTC offer/answer/candidates,
 //!   encrypted with the PAKE-derived session signaling key.
 
 use std::time::Duration;
@@ -32,6 +33,7 @@ use sha2::{Digest, Sha256};
 use crate::crypto::aes;
 use crate::crypto::chunk::fill_random;
 use crate::crypto::pin::{PIN_ACTIVE_BUCKETS, PIN_ROTATION_MS};
+use crate::wire::WireEncoding;
 
 pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
@@ -42,13 +44,18 @@ pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.snort.social",
 ];
 
-const EVENT_KIND_DATA_TRANSFER: u16 = 24242;
-const EVENT_KIND_RENDEZVOUS: u16 = 24243;
+/// Claim, confirm, and WebRTC signal events: an *ephemeral* kind, so relays
+/// pass them straight through to live subscribers and retain nothing.
+const EVENT_KIND_DATA_TRANSFER: u16 = 24243;
+/// Rendezvous events: a *regular* kind, so relays retain them and a receiver
+/// that connects after the sender published can still fetch the current PIN
+/// generation. A NIP-40 `expiration` tag bounds how long that lasts.
+const EVENT_KIND_RENDEZVOUS: u16 = 4243;
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const PUBLISH_RETRIES: usize = 3;
 
-/// Rendezvous payload, published as plaintext JSON inside the kind-24243 event.
+/// Rendezvous payload, published as plaintext JSON inside the kind-4243 event.
 /// Republished with a fresh PIN, hint, nonce, and SPAKE2 element on every
 /// rotation; `transfer_id` and `sender_pubkey` stay stable for the transfer's
 /// lifetime.
@@ -79,9 +86,11 @@ pub struct TransferMetadata {
     /// Always `"file"`.
     pub content_type: String,
     pub file_name: String,
+    /// Input size of the payload: a progress hint, never the wire length.
     pub file_size: u64,
-    /// False when `file_size` is an input-size estimate for a streamed ZIP.
-    pub file_size_exact: bool,
+    /// How the payload travels; `deflate-raw` payloads are inflated by the
+    /// receiver after decryption.
+    pub content_encoding: WireEncoding,
     pub mime_type: String,
 }
 
@@ -167,14 +176,14 @@ pub fn compute_rendezvous_transcript_hash(
 /// seen any metadata). This digest is bound into the confirmation-code KDF
 /// instead.
 pub fn compute_transfer_metadata_hash(metadata: &TransferMetadata) -> Result<String> {
-    const METADATA_LABEL: &str = "ptransfer:nostr-metadata-transcript:v1";
+    const METADATA_LABEL: &str = "ptransfer:nostr-metadata-transcript:v2";
 
     let canonical = serde_json::to_vec(&serde_json::json!([
         METADATA_LABEL,
         metadata.content_type,
         metadata.file_name,
         metadata.file_size,
-        metadata.file_size_exact,
+        metadata.content_encoding,
         metadata.mime_type,
     ]))?;
 
@@ -411,7 +420,7 @@ pub fn generate_handshake_nonce() -> Result<String> {
     Ok(STANDARD.encode(bytes))
 }
 
-/// Create a rendezvous event (kind 24243) carrying the plaintext payload.
+/// Create a rendezvous event (kind 4243) carrying the plaintext payload.
 ///
 /// The NIP-40 `expiration` tag is the end of the PIN's immediately following
 /// bucket, matching the sender's current-or-previous acceptance rule.
@@ -479,7 +488,7 @@ pub fn open_handshake_payload<T: for<'de> Deserialize<'de>>(
     serde_json::from_slice(&decrypted).context("invalid handshake payload JSON")
 }
 
-/// Create a handshake event (kind 24242, `type=claim|confirm`).
+/// Create a handshake event (kind 24243, `type=claim|confirm`).
 ///
 /// Tags stay plaintext so relays can route by transfer and recipient, but
 /// neither they nor the element carry authority: the sealed body must decrypt
@@ -587,7 +596,7 @@ pub fn parse_signal_event(
     })
 }
 
-/// Rendezvous lookup: kind 24243 events carrying any of the receiver's
+/// Rendezvous lookup: kind 4243 events carrying any of the receiver's
 /// derived PIN hints. The limit leaves headroom for hint collisions, which are
 /// expected rather than exotic (the hint carries ~17.3 bits).
 pub fn rendezvous_filter(hints: &[String]) -> Filter {
@@ -600,7 +609,7 @@ pub fn rendezvous_filter(hints: &[String]) -> Filter {
         .limit(50)
 }
 
-/// Kind-24242 events addressed to `recipient` for this transfer. The sender
+/// Kind-24243 events addressed to `recipient` for this transfer. The sender
 /// uses it for incoming claims (and later, receiver signals); the receiver
 /// narrows it by author for the sender's confirm.
 pub fn addressed_filter(transfer_id: &str, recipient: &PublicKey) -> Filter {
@@ -618,7 +627,7 @@ pub fn addressed_filter_from_author(
     addressed_filter(transfer_id, recipient).author(author)
 }
 
-/// Kind-24242 events addressed to `recipient` by any of the claimed
+/// Kind-24243 events addressed to `recipient` by any of the claimed
 /// candidates' senders. The receiver cannot tell which rendezvous candidate is
 /// its sender until a confirm opens under one of the claimed sessions' keys, so
 /// it watches all of them at once.
@@ -637,7 +646,7 @@ pub fn confirm_filter<'a>(
         .authors(authors)
 }
 
-/// Kind-24242 events authored by the sender for this transfer, regardless of
+/// Kind-24243 events authored by the sender for this transfer, regardless of
 /// `#p` tag — matches the shape pTransfer's receiver subscribes with.
 pub fn signal_filter_from_sender(transfer_id: &str, sender_pubkey: PublicKey) -> Filter {
     Filter::new()
@@ -672,6 +681,17 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// Both kinds are wire constants pTransfer picked deliberately, and their
+    /// *classes* matter as much as their values: 4243 is a regular kind so
+    /// relays retain a rendezvous for a receiver that arrives late, while
+    /// 24243 is in the ephemeral range so handshake and signal traffic is
+    /// never stored. Swapping either silently strands every transfer.
+    #[test]
+    fn event_kinds_match_ptransfer() {
+        assert_eq!(EVENT_KIND_RENDEZVOUS, 4243);
+        assert_eq!(EVENT_KIND_DATA_TRANSFER, 24243);
+    }
+
     fn test_client() -> (NostrClient, Keys) {
         let keys = Keys::generate();
         (
@@ -702,7 +722,7 @@ mod tests {
             content_type: "file".to_string(),
             file_name: "quarterly-report.pdf".to_string(),
             file_size: 1_048_576,
-            file_size_exact: true,
+            content_encoding: WireEncoding::DeflateRaw,
             mime_type: "application/pdf".to_string(),
         }
     }
@@ -835,7 +855,7 @@ mod tests {
         assert_eq!(json["metadata"]["contentType"], "file");
         assert_eq!(json["metadata"]["fileName"], "quarterly-report.pdf");
         assert_eq!(json["metadata"]["fileSize"], 1_048_576);
-        assert_eq!(json["metadata"]["fileSizeExact"], true);
+        assert_eq!(json["metadata"]["contentEncoding"], "deflate-raw");
         assert_eq!(json["metadata"]["mimeType"], "application/pdf");
     }
 
@@ -1049,7 +1069,7 @@ mod tests {
     fn metadata_transcript_matches_web_fixed_vector() {
         assert_eq!(
             compute_transfer_metadata_hash(&sample_metadata()).unwrap(),
-            "6ebaf21fd32f1f01883abf53f3b87d3b682a85ec923577f91dddde3567d086b0"
+            "d71c5d4c12479dfb7e1e4f7c9fd169cddd73206e8c369d49a98f7b726a025f84"
         );
     }
 }

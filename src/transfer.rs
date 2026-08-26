@@ -1,12 +1,16 @@
 //! Message-oriented file transfer over a WebRTC data channel, matching
 //! pTransfer's transfer choreography:
 //!
-//! - Sender: consume a lazy source in 128 KiB plaintext chunks, send each as
-//!   an encrypted binary message (index 0..N-1), then send the text message
-//!   `DONE:N:B` with the final chunk and byte counts and await `ACK`.
-//! - Receiver: exact-size files are written by chunk offset; streamed ZIPs
-//!   whose final size was unknown during signaling are validated in reliable
-//!   wire order and appended. `DONE:N:B` seals both forms before `ACK`.
+//! - Sender: consume a lazy source in 128 KiB wire chunks, send each as an
+//!   encrypted binary message (index 0..N-1), then send the text message
+//!   `DONE:N:B` with the final chunk and wire byte counts and await `ACK`.
+//! - Receiver: append every authenticated chunk in reliable data-channel
+//!   order, inflating `deflate-raw` payloads on the way to disk. `DONE:N:B`
+//!   seals the transfer before `ACK`.
+//!
+//! There is no positional write path. No payload's wire length is known during
+//! signaling — a single file is deflated on the fly and a ZIP is generated
+//! while it is sent — so a chunk index can never be turned into a file offset.
 
 use std::path::Path;
 use std::time::Duration;
@@ -14,7 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use tokio::fs::File;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use crate::archive::SendSource;
 use crate::crypto::chunk::{
@@ -23,6 +27,7 @@ use crate::crypto::chunk::{
 };
 use crate::ui::{self, Direction};
 use crate::webrtc::common::DcMessenger;
+use crate::wire::{Inflater, WireEncoding};
 
 /// How long the sender waits for the receiver's `ACK` after `DONE`.
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -33,26 +38,17 @@ const MAX_BUFFERED: usize = 1024 * 1024;
 /// The chunk index is a 2-byte big-endian field, so valid totals are 0..=65536.
 const MAX_CHUNKS: u64 = 0x10000;
 
-/// Number of 128 KiB chunks needed for `total_bytes`.
-fn chunk_count(total_bytes: u64) -> u64 {
-    total_bytes.div_ceil(ENCRYPTION_CHUNK_SIZE as u64)
-}
-
-/// Plaintext length of chunk `index` given the total size.
-fn plaintext_len(index: u64, total_bytes: u64) -> usize {
-    let start = index * ENCRYPTION_CHUNK_SIZE as u64;
-    (total_bytes - start).min(ENCRYPTION_CHUNK_SIZE as u64) as usize
-}
-
 /// Consume `source`, encrypt it chunk by chunk, and send it over `messenger`.
-/// ZIP generation begins only when the source is opened here.
+/// Compression and ZIP generation begin only when the source is opened here.
 pub async fn run_sender(
     messenger: &mut DcMessenger,
     key: &[u8; 32],
     source: &SendSource,
 ) -> Result<()> {
-    let exact_size = source.file_size;
-    let progress_total = source.advertised_size();
+    // `sent` counts *wire* bytes against an *input*-byte total, so a deflated
+    // payload's bar undershoots and then snaps to 100% at DONE, exactly as it
+    // does in the web app.
+    let progress_total = source.estimated_size;
     let mut stream = source.open().await?;
     let mut chunks_sent = 0u64;
     let mut sent = 0u64;
@@ -70,13 +66,6 @@ pub async fn run_sender(
             .context("generated payload size exceeds the supported range")?;
         if next_sent > MAX_MESSAGE_SIZE {
             bail!("Generated payload exceeds the transfer size limit");
-        }
-        if let Some(expected) = exact_size
-            && next_sent > expected
-        {
-            bail!(
-                "Transfer source size changed: expected {expected} bytes, got more than {expected}"
-            );
         }
 
         let index = chunks_sent as u16;
@@ -97,12 +86,6 @@ pub async fn run_sender(
         sent = next_sent;
         chunks_sent += 1;
         ui::progress(Direction::Send, sent, progress_total);
-    }
-
-    if let Some(expected) = exact_size
-        && sent != expected
-    {
-        bail!("Transfer source size changed: expected {expected} bytes, got {sent}");
     }
 
     // Replace an estimate with the authenticated final byte count at EOF.
@@ -148,26 +131,18 @@ async fn wait_for_ack(messenger: &mut DcMessenger) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("timed out waiting for receiver acknowledgment"))?
 }
 
-/// Receive into `dest`, decrypting with `key`.
+/// Receive into `dest`, decrypting with `key` and decoding `encoding`.
 ///
-/// `total_bytes` is `Some` for an exact-size direct file and `None` for a ZIP
-/// generated during transfer. `estimated_bytes` is only a progress hint in
-/// the latter case. Writes go to `<dest>.part` and are atomically renamed on
-/// success.
+/// `estimated_bytes` is the sender's advertised input size — a progress hint
+/// only, never a bound: the wire length is unknown until `DONE` seals it.
+/// Writes go to `<dest>.part` and are atomically renamed on success.
 pub async fn run_receiver(
     messenger: &mut DcMessenger,
     key: &[u8; 32],
     dest: &Path,
-    total_bytes: Option<u64>,
+    encoding: WireEncoding,
     estimated_bytes: u64,
 ) -> Result<()> {
-    let expected_chunks = total_bytes.map(chunk_count);
-    if let Some(expected) = expected_chunks
-        && expected > MAX_CHUNKS
-    {
-        bail!("transfer size exceeds the supported chunk-index range");
-    }
-
     let part_path = dest.with_extension(match dest.extension().and_then(|e| e.to_str()) {
         Some(ext) => format!("{ext}.part"),
         None => "part".to_string(),
@@ -175,16 +150,18 @@ pub async fn run_receiver(
     let mut out = File::create(&part_path)
         .await
         .with_context(|| format!("Failed to create {}", part_path.display()))?;
-    if let Some(total_bytes) = total_bytes {
-        out.set_len(total_bytes).await?;
-    }
 
-    let mut received = expected_chunks.map(|count| vec![false; count as usize]);
+    // Bound the *inflated* output, not the wire bytes: a deflate bomb is small
+    // on the wire by construction.
+    let mut inflater = match encoding {
+        WireEncoding::DeflateRaw => Some(Inflater::new(MAX_MESSAGE_SIZE)),
+        WireEncoding::Identity => None,
+    };
     let mut received_count = 0u64;
     let mut received_bytes = 0u64;
-    let mut previous_streamed_chunk_len = None;
+    let mut previous_chunk_len = None;
     let mut done = None;
-    let progress_total = total_bytes.unwrap_or(estimated_bytes);
+    let progress_total = estimated_bytes;
 
     let result = async {
         loop {
@@ -206,20 +183,15 @@ pub async fn run_receiver(
                         "sender reported {final_chunks} chunks after {received_count} were received"
                     );
                 }
-                if let Some(expected) = expected_chunks
-                    && final_chunks != expected
-                {
-                    bail!("sender reported {final_chunks} chunks, expected {expected}");
-                }
-                if let Some(expected) = total_bytes
-                    && final_bytes != expected
-                {
-                    bail!("sender reported {final_bytes} bytes, expected {expected}");
-                }
                 if final_bytes != received_bytes {
                     bail!(
                         "sender reported {final_bytes} bytes after {received_bytes} were received"
                     );
+                }
+                // A truncated compressed stream delivers every wire byte the
+                // sender promised, so only the decoder can catch it.
+                if let Some(inflater) = &mut inflater {
+                    out.write_all(inflater.finish()?).await?;
                 }
                 done = Some((final_chunks, final_bytes));
                 ui::progress(Direction::Receive, final_bytes, final_bytes);
@@ -228,40 +200,26 @@ pub async fn run_receiver(
 
             // Binary message: one encrypted chunk.
             let (index, encrypted) = parse_chunk_message(&msg.data)?;
-            let index_u64 = index as u64;
-            let expect_plain = if let Some(expected_chunks) = expected_chunks {
-                if index_u64 >= expected_chunks {
-                    bail!("chunk index {index} out of range (expected < {expected_chunks})");
-                }
-                let received = received.as_mut().context("missing exact-size index set")?;
-                if received[index as usize] {
-                    bail!("duplicate chunk index {index}");
-                }
-                plaintext_len(
-                    index_u64,
-                    total_bytes.context("missing exact transfer size")?,
-                )
-            } else {
-                // Unknown-size transfers append, so require the reliable data
-                // channel's default ordering and full chunks before the last.
-                if index_u64 != received_count {
-                    bail!("unexpected streamed chunk index {index}");
-                }
-                if let Some(previous) = previous_streamed_chunk_len
-                    && previous != ENCRYPTION_CHUNK_SIZE
-                {
-                    bail!("only the final streamed chunk may be short");
-                }
-                let length = encrypted
-                    .len()
-                    .checked_sub(NONCE_LEN + TAG_LEN)
-                    .context("streamed chunk is shorter than its encryption overhead")?;
-                if length == 0 || length > ENCRYPTION_CHUNK_SIZE {
-                    bail!("invalid streamed chunk {index} length");
-                }
-                previous_streamed_chunk_len = Some(length);
-                length
-            };
+            // Every payload appends, so the reliable data channel's default
+            // ordering is required and only the last chunk may be short. This
+            // also bounds the transfer at MAX_CHUNKS for free: the index is a
+            // 2-byte field, so no chunk past 65535 can name its own position.
+            if index as u64 != received_count {
+                bail!("unexpected chunk index {index}");
+            }
+            if let Some(previous) = previous_chunk_len
+                && previous != ENCRYPTION_CHUNK_SIZE
+            {
+                bail!("only the final chunk may be short");
+            }
+            let expect_plain = encrypted
+                .len()
+                .checked_sub(NONCE_LEN + TAG_LEN)
+                .context("chunk is shorter than its encryption overhead")?;
+            if expect_plain == 0 || expect_plain > ENCRYPTION_CHUNK_SIZE {
+                bail!("invalid chunk {index} length");
+            }
+            previous_chunk_len = Some(expect_plain);
 
             let expect_encrypted = expect_plain + NONCE_LEN + TAG_LEN;
             if encrypted.len() != expect_encrypted {
@@ -285,12 +243,10 @@ pub async fn run_receiver(
                 );
             }
 
-            if total_bytes.is_some() {
-                let offset = index_u64 * ENCRYPTION_CHUNK_SIZE as u64;
-                out.seek(std::io::SeekFrom::Start(offset)).await?;
-                received.as_mut().context("missing exact-size index set")?[index as usize] = true;
+            match &mut inflater {
+                Some(inflater) => out.write_all(inflater.push(&plaintext)?).await?,
+                None => out.write_all(&plaintext).await?,
             }
-            out.write_all(&plaintext).await?;
 
             received_count += 1;
             received_bytes = next_received_bytes;

@@ -1,4 +1,4 @@
-//! Rotating short PIN for pTransfer's Nostr "Auto Exchange" mode.
+//! Rotating short PIN for pTransfer's PIN Exchange mode.
 //!
 //! The PIN is 12 case-sensitive characters (11 data + 1 checksum). The sender
 //! mints a fresh PIN every [`PIN_ROTATION_MS`] and honors PINs minted in the

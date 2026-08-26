@@ -21,38 +21,16 @@ use super::widgets;
 
 /// The resolved outcome of the wizard: what to transfer and how.
 pub enum WizardPlan {
-    /// Stays in the TUI.
-    SendNostr(Vec<PathBuf>),
-    /// Leaves the TUI so the PT01 blobs can be copy/pasted.
-    SendManual(Vec<PathBuf>),
-    /// Stays in the TUI.
-    ReceiveNostr {
-        pin: String,
-        output: PathBuf,
-    },
-    /// Leaves the TUI so the PT01 blobs can be copy/pasted.
-    ReceiveManual { output: PathBuf },
+    SendPin(Vec<PathBuf>),
+    ReceivePin { pin: String, output: PathBuf },
 }
-
-const MODE_ITEMS: &[&str] = &[
-    "PIN code via Nostr relays (works with pTransfer Auto Exchange)",
-    "Manual copy/paste exchange (leaves this screen for the code swap)",
-];
 
 enum Screen {
     MainMenu {
         selected: usize,
     },
     FileBrowser(Browser),
-    SendMode {
-        browser: Browser,
-        selected: usize,
-    },
-    ReceiveMode {
-        selected: usize,
-    },
     OutputDir {
-        manual: bool,
         picker: DirPicker,
     },
     PinEntry {
@@ -107,30 +85,17 @@ fn handle_key(screen: Screen, key: KeyEvent) -> Step {
         Screen::FileBrowser(mut browser) => match browser.handle_key(key) {
             BrowserStep::Stay => Step::Continue(Screen::FileBrowser(browser)),
             BrowserStep::Back => Step::Continue(Screen::MainMenu { selected: 0 }),
-            BrowserStep::Confirm => Step::Continue(Screen::SendMode {
-                browser,
-                selected: 0,
-            }),
+            BrowserStep::Confirm => Step::Finish(WizardPlan::SendPin(browser.selection())),
         },
-        Screen::SendMode { browser, selected } => send_mode_key(browser, selected, key),
-        Screen::ReceiveMode { selected } => receive_mode_key(selected, key),
-        Screen::OutputDir { manual, mut picker } => match picker.handle_key(key) {
-            DirPickerStep::Stay => Step::Continue(Screen::OutputDir { manual, picker }),
-            DirPickerStep::Back => Step::Continue(Screen::ReceiveMode {
-                selected: usize::from(manual),
+        Screen::OutputDir { mut picker } => match picker.handle_key(key) {
+            DirPickerStep::Stay => Step::Continue(Screen::OutputDir { picker }),
+            DirPickerStep::Back => Step::Continue(Screen::MainMenu { selected: 1 }),
+            DirPickerStep::Choose(output) => Step::Continue(Screen::PinEntry {
+                output,
+                input: String::new(),
+                cursor: 0,
+                error: None,
             }),
-            DirPickerStep::Choose(output) => {
-                if manual {
-                    Step::Finish(WizardPlan::ReceiveManual { output })
-                } else {
-                    Step::Continue(Screen::PinEntry {
-                        output,
-                        input: String::new(),
-                        cursor: 0,
-                        error: None,
-                    })
-                }
-            }
         },
         Screen::PinEntry {
             output,
@@ -156,46 +121,15 @@ fn main_menu_key(selected: usize, key: KeyEvent) -> Step {
                 Ok(browser) => Step::Continue(Screen::FileBrowser(browser)),
                 Err(_) => Step::Continue(Screen::MainMenu { selected }),
             },
-            1 => Step::Continue(Screen::ReceiveMode { selected: 0 }),
+            1 => match DirPicker::new() {
+                Ok(picker) => Step::Continue(Screen::OutputDir { picker }),
+                Err(_) => Step::Continue(Screen::MainMenu { selected }),
+            },
             _ => Step::Quit,
         },
         KeyCode::Esc | KeyCode::Char('q') => Step::Quit,
         _ => Step::Continue(Screen::MainMenu {
             selected: menu_move(selected, 3, &key),
-        }),
-    }
-}
-
-fn send_mode_key(browser: Browser, selected: usize, key: KeyEvent) -> Step {
-    match key.code {
-        KeyCode::Enter => {
-            let paths = browser.selection();
-            if selected == 0 {
-                Step::Finish(WizardPlan::SendNostr(paths))
-            } else {
-                Step::Finish(WizardPlan::SendManual(paths))
-            }
-        }
-        KeyCode::Esc => Step::Continue(Screen::FileBrowser(browser)),
-        _ => Step::Continue(Screen::SendMode {
-            browser,
-            selected: menu_move(selected, MODE_ITEMS.len(), &key),
-        }),
-    }
-}
-
-fn receive_mode_key(selected: usize, key: KeyEvent) -> Step {
-    match key.code {
-        KeyCode::Enter => match DirPicker::new() {
-            Ok(picker) => Step::Continue(Screen::OutputDir {
-                manual: selected == 1,
-                picker,
-            }),
-            Err(_) => Step::Continue(Screen::ReceiveMode { selected }),
-        },
-        KeyCode::Esc => Step::Continue(Screen::MainMenu { selected: 1 }),
-        _ => Step::Continue(Screen::ReceiveMode {
-            selected: menu_move(selected, MODE_ITEMS.len(), &key),
         }),
     }
 }
@@ -211,16 +145,12 @@ fn pin_entry_key(
     match key.code {
         KeyCode::Enter => {
             if is_valid_pin(&input) {
-                return Step::Finish(WizardPlan::ReceiveNostr {
-                    pin: input,
-                    output,
-                });
+                return Step::Finish(WizardPlan::ReceivePin { pin: input, output });
             }
             error = Some("Invalid PIN: check for typos and try again".to_string());
         }
         KeyCode::Esc => {
             return Step::Continue(Screen::OutputDir {
-                manual: false,
                 picker: DirPicker::at(output),
             });
         }
@@ -317,45 +247,7 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
             browser.render(f, inner);
         }
 
-        Screen::SendMode { browser, selected } => {
-            let inner = widgets::screen_frame(f, "send");
-            let area = widgets::centered(inner, 74, 7);
-            let [title, _, list] = Layout::vertical([
-                Constraint::Length(2),
-                Constraint::Length(1),
-                Constraint::Fill(1),
-            ])
-            .areas(area);
-            let paths = browser.selection();
-            f.render_widget(
-                Paragraph::new(format!(
-                    "Sending \"{}\" — how should the two sides connect?",
-                    crate::archive::send_display_name(&paths)
-                )),
-                title,
-            );
-            widgets::menu(f, list, MODE_ITEMS, *selected);
-            widgets::key_hints(f, inner, "↑/↓ move · Enter select · Esc back");
-        }
-
-        Screen::ReceiveMode { selected } => {
-            let inner = widgets::screen_frame(f, "receive");
-            let area = widgets::centered(inner, 74, 6);
-            let [title, _, list] = Layout::vertical([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Fill(1),
-            ])
-            .areas(area);
-            f.render_widget(
-                Paragraph::new("How is the sender sharing the transfer?"),
-                title,
-            );
-            widgets::menu(f, list, MODE_ITEMS, *selected);
-            widgets::key_hints(f, inner, "↑/↓ move · Enter select · Esc back");
-        }
-
-        Screen::OutputDir { picker, .. } => {
+        Screen::OutputDir { picker } => {
             let inner = widgets::screen_frame(f, "receive");
             picker.render(f, inner);
         }

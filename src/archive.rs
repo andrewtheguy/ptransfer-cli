@@ -1,7 +1,9 @@
 //! Prepare send inputs the way pTransfer does.
 //!
-//! A single regular file is sent as-is. Anything else (a folder, or multiple
-//! inputs) becomes a lazy ZIP source that writes directly into the transfer,
+//! A single regular file is deflated on the fly and travels as a `deflate-raw`
+//! payload. Anything else (a folder, or multiple inputs) becomes a lazy ZIP
+//! source whose entries are already deflated, so it travels as `identity` —
+//! the no-recompress rule. Either way it writes directly into the transfer,
 //! mirroring the web app's `createZipTransferSource`:
 //! folder entries are keyed `<folderName>/sub/file.ext` (forward slashes),
 //! loose files are keyed by bare basename, and the archive is named
@@ -22,117 +24,105 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::fs::File;
-use tokio::io::AsyncReadExt;
+use flate2::Compression;
+use flate2::write::DeflateEncoder;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
 
 use crate::crypto::chunk::{ENCRYPTION_CHUNK_SIZE, MAX_MESSAGE_SIZE};
+use crate::wire::WireEncoding;
 
 /// What the transfer layer sends: either the original file untouched, or a
 /// ZIP generated lazily as the transfer consumes it.
 #[derive(Debug)]
 pub struct SendSource {
     pub file_name: String,
-    /// Exact payload size for a direct file; unknown for a generated ZIP.
-    pub file_size: Option<u64>,
-    /// Progress/signaling hint. For ZIPs this is the total input byte count.
+    /// Input byte count. This is the size carried in signaling and used for
+    /// the progress bar — never the wire length, which no source knows before
+    /// it has been produced.
     pub estimated_size: u64,
     pub mime_type: &'static str,
+    /// How the bytes travel; chosen by flow, never by sniffing content.
+    pub wire_encoding: WireEncoding,
     kind: SendSourceKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum SendSourceKind {
     File(PathBuf),
     Zip(Vec<(String, PathBuf)>),
 }
 
-/// An opened source yielding transfer-sized plaintext chunks.
-pub(crate) enum SendStream {
-    File(File),
-    Zip {
-        receiver: mpsc::Receiver<Result<Vec<u8>, String>>,
-        task: Option<JoinHandle<Result<()>>>,
-    },
+/// An opened source yielding transfer-sized wire chunks.
+///
+/// Both kinds run the same shape: a blocking worker produces the wire bytes
+/// (deflating a file, or packaging a ZIP) into a [`ChunkWriter`], which hands
+/// complete 128 KiB chunks across a bounded channel. The channel is the
+/// backpressure boundary, so neither a whole archive nor a whole compressed
+/// file is ever materialized.
+pub(crate) struct SendStream {
+    receiver: mpsc::Receiver<Result<Vec<u8>, String>>,
+    task: Option<JoinHandle<Result<()>>>,
 }
 
 impl SendSource {
-    /// Size carried in signaling. It is exact for files and an estimate for
-    /// ZIPs; [`SendSource::size_is_exact`] distinguishes the two cases.
-    pub fn advertised_size(&self) -> u64 {
-        self.file_size.unwrap_or(self.estimated_size)
-    }
-
-    pub fn size_is_exact(&self) -> bool {
-        self.file_size.is_some()
-    }
-
-    /// Open this source. ZIP work starts here, after the data channel opens.
+    /// Open this source. Compression and ZIP generation start here, after the
+    /// data channel opens — never while the transfer is still being set up.
     pub(crate) async fn open(&self) -> Result<SendStream> {
-        match &self.kind {
-            SendSourceKind::File(path) => {
-                let file = File::open(path)
-                    .await
-                    .with_context(|| format!("Cannot open {}", path.display()))?;
-                Ok(SendStream::File(file))
+        let kind = self.kind.clone();
+        // Two queued chunks plus the writer's current chunk keep peak memory
+        // bounded while allowing filesystem and crypto work to overlap.
+        let (sender, receiver) = mpsc::channel(2);
+        let error_sender = sender.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let result = produce_wire_bytes(&kind, ChunkWriter::new(sender));
+            if let Err(error) = &result {
+                let _ = error_sender.blocking_send(Err(format!("{error:#}")));
             }
-            SendSourceKind::Zip(entries) => {
-                let entries = entries.clone();
-                // Two queued chunks plus the writer's current chunk keep peak
-                // archive memory bounded while allowing filesystem and crypto
-                // work to overlap.
-                let (sender, receiver) = mpsc::channel(2);
-                let error_sender = sender.clone();
-                let task = tokio::task::spawn_blocking(move || {
-                    let result =
-                        write_zip(&entries, ChunkWriter::new(sender)).and_then(ChunkWriter::finish);
-                    if let Err(error) = &result {
-                        let _ = error_sender.blocking_send(Err(format!("{error:#}")));
-                    }
-                    result
-                });
-                Ok(SendStream::Zip {
-                    receiver,
-                    task: Some(task),
-                })
-            }
+            result
+        });
+        Ok(SendStream {
+            receiver,
+            task: Some(task),
+        })
+    }
+}
+
+/// Produce the source's wire bytes into `writer`, on a blocking worker.
+fn produce_wire_bytes(kind: &SendSourceKind, writer: ChunkWriter) -> Result<()> {
+    match kind {
+        SendSourceKind::File(path) => {
+            // Raw DEFLATE, no zlib header, matching the browser's
+            // CompressionStream('deflate-raw'). Level 6 is flate2's default,
+            // as it is the browser's.
+            let mut encoder = DeflateEncoder::new(writer, Compression::default());
+            let mut file =
+                fs::File::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
+            std::io::copy(&mut file, &mut encoder)
+                .with_context(|| format!("Cannot read {}", path.display()))?;
+            encoder
+                .finish()
+                .context("Cannot finish the compressed stream")?
+                .finish()
         }
+        SendSourceKind::Zip(entries) => write_zip(entries, writer).and_then(ChunkWriter::finish),
     }
 }
 
 impl SendStream {
     /// Read the next non-empty chunk, coalesced to 128 KiB except at EOF.
     pub(crate) async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
-        match self {
-            SendStream::File(file) => {
-                let mut chunk = vec![0; ENCRYPTION_CHUNK_SIZE];
-                let mut filled = 0;
-                while filled < chunk.len() {
-                    let read = file.read(&mut chunk[filled..]).await?;
-                    if read == 0 {
-                        break;
-                    }
-                    filled += read;
+        match self.receiver.recv().await {
+            Some(Ok(chunk)) => Ok(Some(chunk)),
+            Some(Err(message)) => Err(anyhow!(message)),
+            None => {
+                if let Some(task) = self.task.take() {
+                    task.await.context("transfer source worker failed")??;
                 }
-                if filled == 0 {
-                    return Ok(None);
-                }
-                chunk.truncate(filled);
-                Ok(Some(chunk))
+                Ok(None)
             }
-            SendStream::Zip { receiver, task } => match receiver.recv().await {
-                Some(Ok(chunk)) => Ok(Some(chunk)),
-                Some(Err(message)) => Err(anyhow!(message)),
-                None => {
-                    if let Some(task) = task.take() {
-                        task.await.context("ZIP worker failed")??;
-                    }
-                    Ok(None)
-                }
-            },
         }
     }
 }
@@ -172,9 +162,11 @@ fn prepare_send_source_with_cap(inputs: &[PathBuf], cap: u64) -> Result<SendSour
 
     Ok(SendSource {
         file_name: archive_name,
-        file_size: None,
         estimated_size,
         mime_type: "application/zip",
+        // The ZIP's entries are already deflated, so the transfer layer must
+        // not compress it again.
+        wire_encoding: WireEncoding::Identity,
         kind: SendSourceKind::Zip(entries),
     })
 }
@@ -197,9 +189,9 @@ fn single_file_source(path: &Path, file_size: u64, cap: u64) -> Result<SendSourc
 
     Ok(SendSource {
         file_name,
-        file_size: Some(file_size),
         estimated_size: file_size,
         mime_type: "application/octet-stream",
+        wire_encoding: WireEncoding::DeflateRaw,
         kind: SendSourceKind::File(path.to_path_buf()),
     })
 }
@@ -326,10 +318,11 @@ fn input_name(path: &Path) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("File name is not valid UTF-8: {}", path.display()))
 }
 
-/// Write a standard ZIP without seeking. Store mode matches pTransfer's
-/// streamed archives and keeps production bounded without a deflate buffer.
+/// Write a standard ZIP without seeking, deflating each entry as pTransfer's
+/// streamed archives do. Entry-at-a-time deflate keeps production bounded: no
+/// entry, and no archive, is ever held whole.
 fn write_zip<W: Write>(entries: &[(String, PathBuf)], output: W) -> Result<W> {
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut zip = zip::ZipWriter::new_stream(output);
     for (key, path) in entries {
         zip.start_file(key, options)
@@ -405,6 +398,22 @@ mod tests {
         write_bytes(dir, rel, content.as_bytes())
     }
 
+    /// Deterministic, poorly-compressible bytes. Deflate cannot shrink these,
+    /// so an archive built from them still spans several chunks — which is
+    /// what the streaming and backpressure assertions need.
+    fn pseudo_random(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            // xorshift64
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.push((state >> 24) as u8);
+        }
+        out
+    }
+
     fn write_bytes(dir: &Path, rel: &str, content: &[u8]) -> PathBuf {
         let path = dir.join(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -430,16 +439,46 @@ mod tests {
     }
 
     #[test]
-    fn single_file_is_passthrough() {
+    fn single_file_travels_deflated() {
         let dir = tempfile::tempdir().unwrap();
         let file = write(dir.path(), "report.pdf", "data");
         let source = prepare_send_source(std::slice::from_ref(&file)).unwrap();
         assert_eq!(source.file_name, "report.pdf");
-        assert_eq!(source.file_size, Some(4));
         assert_eq!(source.estimated_size, 4);
-        assert!(source.size_is_exact());
+        assert_eq!(source.wire_encoding, WireEncoding::DeflateRaw);
         assert_eq!(source.mime_type, "application/octet-stream");
         assert!(matches!(&source.kind, SendSourceKind::File(path) if path == &file));
+    }
+
+    #[tokio::test]
+    async fn single_file_stream_is_a_raw_deflate_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        // Highly compressible, so "the wire is shorter than the input" is a
+        // real assertion rather than an accident of framing overhead.
+        let plain = vec![b'z'; ENCRYPTION_CHUNK_SIZE * 3];
+        let file = write_bytes(dir.path(), "big.log", &plain);
+        let source = prepare_send_source(std::slice::from_ref(&file)).unwrap();
+
+        let mut stream = source.open().await.unwrap();
+        let mut wire = Vec::new();
+        while let Some(chunk) = stream.next_chunk().await.unwrap() {
+            assert!(!chunk.is_empty() && chunk.len() <= ENCRYPTION_CHUNK_SIZE);
+            wire.extend_from_slice(&chunk);
+        }
+
+        assert!(
+            wire.len() < plain.len() / 10,
+            "expected the wire payload to be compressed, got {} bytes",
+            wire.len()
+        );
+
+        // Raw deflate: it must inflate without a zlib header, which is what
+        // the browser's DecompressionStream('deflate-raw') expects.
+        let mut inflater = crate::wire::Inflater::new(MAX_MESSAGE_SIZE);
+        let mut restored = Vec::new();
+        restored.extend_from_slice(inflater.push(&wire).unwrap());
+        restored.extend_from_slice(inflater.finish().unwrap());
+        assert_eq!(restored, plain);
     }
 
     #[test]
@@ -526,25 +565,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zip_stream_round_trips_with_forward_slash_stored_entries() {
+    async fn zip_stream_round_trips_with_forward_slash_deflated_entries() {
         let dir = tempfile::tempdir().unwrap();
-        let a_data = vec![b'a'; ENCRYPTION_CHUNK_SIZE * 2 + 17];
-        let b_data = vec![b'b'; ENCRYPTION_CHUNK_SIZE + 29];
+        // Incompressible, so the deflated archive still spans several chunks
+        // and the backpressure assertions below have something to hold.
+        let a_data = pseudo_random(1, ENCRYPTION_CHUNK_SIZE * 2 + 17);
+        let b_data = pseudo_random(2, ENCRYPTION_CHUNK_SIZE + 29);
         write_bytes(dir.path(), "bundle/a.bin", &a_data);
         write_bytes(dir.path(), "bundle/sub/b.bin", &b_data);
         let source = prepare_send_source(&[dir.path().join("bundle")]).unwrap();
         assert_stamped_name(&source.file_name, "bundle");
         assert_eq!(source.mime_type, "application/zip");
-        assert_eq!(source.file_size, None);
         assert_eq!(source.estimated_size, (a_data.len() + b_data.len()) as u64);
         assert!(source.estimated_size > (ENCRYPTION_CHUNK_SIZE * 3) as u64);
-        assert!(!source.size_is_exact());
+        // A ZIP is already compressed entry by entry, so it travels as-is.
+        assert_eq!(source.wire_encoding, WireEncoding::Identity);
 
         let mut stream = source.open().await.unwrap();
         {
-            let SendStream::Zip { receiver, task } = &stream else {
-                panic!("expected ZIP stream");
-            };
+            let SendStream { receiver, task } = &stream;
             tokio::time::timeout(Duration::from_secs(5), async {
                 while receiver.len() < 2 {
                     tokio::task::yield_now().await;
@@ -560,9 +599,7 @@ mod tests {
         let first = stream.next_chunk().await.unwrap().unwrap();
         assert_eq!(first.len(), ENCRYPTION_CHUNK_SIZE);
         {
-            let SendStream::Zip { receiver, task } = &stream else {
-                panic!("expected ZIP stream");
-            };
+            let SendStream { receiver, task } = &stream;
             tokio::time::timeout(Duration::from_secs(5), async {
                 while receiver.len() < 2 {
                     tokio::task::yield_now().await;
@@ -589,6 +626,9 @@ mod tests {
         assert!(chunks.last().unwrap().len() <= ENCRYPTION_CHUNK_SIZE);
 
         let bytes: Vec<u8> = chunks.into_iter().flatten().collect();
+        // Deflate on incompressible input costs a few bytes per block, so the
+        // archive is still larger than its input — the point is only that the
+        // stream is intact, not that it shrank.
         assert!(bytes.len() > source.estimated_size as usize);
 
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
@@ -597,7 +637,7 @@ mod tests {
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).unwrap();
             assert!(!entry.is_dir());
-            assert_eq!(entry.compression(), CompressionMethod::Stored);
+            assert_eq!(entry.compression(), CompressionMethod::Deflated);
             let mut content = Vec::new();
             entry.read_to_end(&mut content).unwrap();
             seen.push((entry.name().to_string(), content));
@@ -623,10 +663,7 @@ mod tests {
         let consumer_error = stream.next_chunk().await.unwrap_err();
         assert!(consumer_error.to_string().contains("Cannot open"));
 
-        let SendStream::Zip { task, .. } = &mut stream else {
-            panic!("expected ZIP stream");
-        };
-        let task = task.take().expect("missing ZIP producer task");
+        let task = stream.task.take().expect("missing ZIP producer task");
         let producer_error = tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("ZIP producer did not terminate")
