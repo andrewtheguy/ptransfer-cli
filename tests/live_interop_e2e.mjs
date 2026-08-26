@@ -14,6 +14,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  writeFile,
 } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -448,6 +449,38 @@ async function readWebConfirmationCode(page) {
   return `${match[1]}${match[2]}`;
 }
 
+/// Bytes for the multi-chunk fixture: a poorly-compressible half (deflate
+/// barely shrinks it, so the wire payload stays large) followed by a highly
+/// compressible half (so the deflate/inflate path does real work in both
+/// directions). Deterministic, so a failure is reproducible.
+function multiChunkBytes(byteLength) {
+  const out = Buffer.alloc(byteLength);
+  const half = byteLength >> 1;
+  let state = 0x9e3779b9n;
+  for (let i = 0; i < half; i += 1) {
+    state ^= (state << 13n) & 0xffffffffffffffffn;
+    state ^= state >> 7n;
+    state ^= (state << 17n) & 0xffffffffffffffffn;
+    out[i] = Number((state >> 24n) & 0xffn);
+  }
+  out.fill('pTransfer interop payload, repeating so deflate has work to do. ', half);
+  return out;
+}
+
+/// A payload large enough to span many 128 KiB wire chunks in both directions.
+///
+/// The small fixtures fit in a single chunk, so they exercise none of the
+/// streaming path: chunk indices stay at 0, backpressure never engages, and a
+/// data channel that negotiated *unordered* delivery looks perfectly healthy.
+/// That is exactly how a reliable-unordered channel reached a browser
+/// undetected, so the browser legs carry a multi-chunk payload.
+async function multiChunkFixture() {
+  const path = join(ARTIFACTS, 'bulk-payload.bin');
+  const bytes = multiChunkBytes(12 * 1024 * 1024);
+  await writeFile(path, bytes);
+  return path;
+}
+
 async function assertSameBytes(expectedPath, actualPath, label) {
   const [expected, actual] = await Promise.all([
     readFile(expectedPath),
@@ -503,7 +536,7 @@ async function cliToWeb() {
   const page = await context.newPage();
   const assertNoPageErrors = instrumentPage(page, 'CLI -> web');
   try {
-    const source = join(CLI_ROOT, 'README.md');
+    const source = await multiChunkFixture();
     const sender = runCli(['test', 'send', source], 'CLI sender');
     const pin = await waitForStdoutLine(
       sender,
@@ -540,7 +573,7 @@ async function cliToWeb() {
     const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
     await downloadButton.click();
     const download = await downloadPromise;
-    const downloaded = join(ARTIFACTS, 'cli-to-web-README.md');
+    const downloaded = join(ARTIFACTS, 'cli-to-web-bulk-payload.bin');
     await download.saveAs(downloaded);
     await assertSameBytes(source, downloaded, 'CLI -> web downloaded file');
     assertNoPageErrors();
@@ -555,7 +588,7 @@ async function webToCli() {
   const page = await context.newPage();
   const assertNoPageErrors = instrumentPage(page, 'web -> CLI');
   try {
-    const source = join(CLI_ROOT, 'docs', 'USE_CASES.md');
+    const source = await multiChunkFixture();
     const outputDir = await mkdtemp(join(ARTIFACTS, 'web-to-cli-'));
 
     await page.goto(new URL('/send', webUrl).href, {
@@ -597,7 +630,7 @@ async function webToCli() {
     });
     await assertSameBytes(
       source,
-      join(outputDir, 'USE_CASES.md'),
+      join(outputDir, 'bulk-payload.bin'),
       'web -> CLI saved file',
     );
     assertNoPageErrors();

@@ -220,6 +220,17 @@ data-channel order — there is no positional write path, because a chunk index
 cannot be turned into a file offset when the total is unknown — then persists
 the full file and replies:
 
+That ordering is a requirement on the channel, not an assumption: the CLI
+creates its data channel with `ordered: true` explicitly, because `rtc` derives
+its data-channel parameters from a plain `Default` and an omitted
+`RTCDataChannelInit` negotiates *reliable unordered* instead. Every message
+still arrives, but SCTP delivers each one as soon as it reassembles, so one
+retransmit is enough for a later chunk to overtake an earlier one and for the
+peer to reject the out-of-order index mid-transfer. Loopback never reorders, so
+`tests/cli_to_cli_transfer.rs` asserts the negotiated ordering directly (the
+answering end decodes it from the offerer's DCEP) rather than hoping a transfer
+notices.
+
 ```text
 ACK
 ```

@@ -148,6 +148,22 @@ async fn connect_pair() -> (Arc<WebRtcPeer>, DcMessenger, Arc<WebRtcPeer>, DcMes
         "sender peer did not reach Connected"
     );
 
+    // The channel must be *ordered*. `rtc` derives its data-channel parameters
+    // from a plain `Default`, so an omitted `RTCDataChannelInit` silently
+    // negotiates reliable-unordered; the answering side's view here is decoded
+    // from the DCEP the offerer actually sent, so it catches that on the wire.
+    // Loopback never reorders, so nothing else in this test would notice —
+    // against a browser it corrupts every transfer that outlives one
+    // retransmit.
+    assert!(
+        sender_msg.is_ordered().await.unwrap(),
+        "offered data channel is not ordered"
+    );
+    assert!(
+        receiver_msg.is_ordered().await.unwrap(),
+        "answered data channel is not ordered"
+    );
+
     (sender, sender_msg, receiver, receiver_msg)
 }
 
