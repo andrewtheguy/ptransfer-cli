@@ -953,10 +953,6 @@ impl DcMessenger {
             .await
     }
 
-    pub fn buffered_amount(&self) -> usize {
-        0
-    }
-
     /// Whether the channel negotiated ordered delivery.
     pub async fn is_ordered(&self) -> Result<bool> {
         let (response, rx) = oneshot::channel();
@@ -969,10 +965,6 @@ impl DcMessenger {
             .await
             .context("Peer connection closed")?;
         receive_response(rx, "query data-channel ordering").await
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.channel.closed.load(Ordering::SeqCst)
     }
 }
 

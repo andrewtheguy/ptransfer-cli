@@ -33,8 +33,6 @@ use crate::wire::{Inflater, WireEncoding};
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Idle/stall window for active P2P transfer activity.
 const STALL_TIMEOUT: Duration = Duration::from_secs(60);
-/// SCTP send-buffer high-water mark for backpressure (matches web's 1 MiB).
-const MAX_BUFFERED: usize = 1024 * 1024;
 /// The chunk index is a 2-byte big-endian field, so valid totals are 0..=65536.
 const MAX_CHUNKS: u64 = 0x10000;
 
@@ -70,9 +68,12 @@ pub async fn run_sender(
 
         let index = chunks_sent as u16;
         let encrypted = encrypt_chunk(key, &chunk, index)?;
+        // `send_binary` is where backpressure happens: it parks until the SCTP
+        // send buffer drains below the channel's low-water mark, so the stall
+        // window covers waiting for room as well as the hand-off itself.
         match tokio::time::timeout(
             STALL_TIMEOUT,
-            send_binary_with_backpressure(messenger, Bytes::from(encrypted)),
+            messenger.send_binary(Bytes::from(encrypted)),
         )
         .await
         {
@@ -97,17 +98,6 @@ pub async fn run_sender(
     ui::status("Waiting for receiver acknowledgment...");
 
     wait_for_ack(messenger).await
-}
-
-async fn send_binary_with_backpressure(messenger: &DcMessenger, data: Bytes) -> Result<()> {
-    while messenger.buffered_amount() > MAX_BUFFERED {
-        if messenger.is_closed() {
-            bail!("data channel closed during transfer");
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-
-    messenger.send_binary(data).await
 }
 
 async fn wait_for_ack(messenger: &mut DcMessenger) -> Result<()> {
