@@ -200,6 +200,27 @@ pub fn is_pin_bucket_active(bucket: u64, now_ms: u64) -> bool {
     bucket == current || bucket.checked_add(1) == Some(current)
 }
 
+/// Whether a rendezvous event stamped `created_at_secs` (the Nostr
+/// `created_at`) is still claimable at `now_ms`: the bucket it was published in
+/// must be one the sender still honors, which is the same window the receiver
+/// derives hints for.
+///
+/// Deliberately a bucket test rather than an age test. An age test
+/// (`now - created_at <= PIN_TTL_MS`) is unbounded above: an event stamped a
+/// year from now has no age at all, so it never expires, and because candidates
+/// are considered newest first it also sorts ahead of the real sender and eats
+/// the [`MAX_CLAIM_CANDIDATES`] budget. Anchoring to the bucket bounds the
+/// timestamp in both directions and costs honest peers nothing — the sender
+/// stamps `created_at` and derives the `h` tag from the same clock reading, so a
+/// clock skewed far enough to fail this test already skews the hint out of the
+/// queried set. Mirrors pTransfer's `isRendezvousFresh`.
+pub fn is_rendezvous_fresh(created_at_secs: u64, now_ms: u64) -> bool {
+    match created_at_secs.checked_mul(1000) {
+        Some(created_at_ms) => is_pin_bucket_active(pin_bucket(created_at_ms), now_ms),
+        None => false,
+    }
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -289,5 +310,23 @@ mod tests {
         assert!(is_pin_bucket_active(9, now));
         assert!(!is_pin_bucket_active(8, now));
         assert!(!is_pin_bucket_active(11, now));
+    }
+
+    #[test]
+    fn rendezvous_freshness_follows_the_publishing_bucket() {
+        let now = 10 * PIN_ROTATION_MS + 1;
+        let at_bucket = |bucket: u64| bucket * PIN_ROTATION_MS / 1000;
+
+        // Current and immediately previous bucket: claimable.
+        assert!(is_rendezvous_fresh(at_bucket(10), now));
+        assert!(is_rendezvous_fresh(at_bucket(9), now));
+        // One bucket further back: the sender no longer honors that PIN.
+        assert!(!is_rendezvous_fresh(at_bucket(8), now));
+        // The whole point: a future stamp has no age, so an age test would
+        // accept it forever and sort it ahead of the real sender.
+        assert!(now.saturating_sub(at_bucket(11) * 1000) < PIN_TTL_MS);
+        assert!(!is_rendezvous_fresh(at_bucket(11), now));
+        assert!(!is_rendezvous_fresh(u64::MAX, now));
+        assert!(!is_rendezvous_fresh(0, now));
     }
 }

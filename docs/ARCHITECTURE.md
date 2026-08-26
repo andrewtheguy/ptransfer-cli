@@ -84,7 +84,9 @@ generation's budget and stall it until rotation — a nuisance, not a compromise
 (`PIN_ROTATION_MS`), honors only PINs minted in its current or immediately
 previous bucket, and attaches a NIP-40 expiration at the end of the PIN's
 second bucket. The receiver derives hints for its current and previous buckets
-and refuses rendezvous events older than the 4-minute maximum (`PIN_TTL_MS`).
+and refuses any rendezvous event whose `created_at` did not land in one of
+those same two buckets — a bucket test rather than a maximum age, so an event
+stamped in the future cannot claim to be newer than the real sender forever.
 The TUI `r` key (and the web app's
 refresh button) mints a fresh PIN immediately, dropping all retained
 generations. The sender keeps rotating for up to 30 minutes — a resource

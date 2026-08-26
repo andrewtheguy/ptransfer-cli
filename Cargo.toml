@@ -10,7 +10,7 @@ publish = false
 # in the pTransfer web app's src/lib/protocol.ts, specified by its
 # docs/INTEROP_PROTOCOL.md. Deliberately not pTransfer's npm version — that moves
 # for web-only changes (Code Exchange, the relay fallback) this CLI does not implement.
-ptransfer-protocol-version = "1"
+ptransfer-protocol-version = "2"
 
 [lib]
 name = "ptransfer_cli"

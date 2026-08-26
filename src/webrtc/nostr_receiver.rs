@@ -25,8 +25,8 @@ use crate::crypto::aes;
 use crate::crypto::chunk::MAX_MESSAGE_SIZE;
 use crate::crypto::kdf::{ConfirmationCodeBinding, HandshakeSealKeys, NostrSessionKeys, PakeRoot};
 use crate::crypto::pin::{
-    MAX_CLAIM_ATTEMPTS, MAX_CLAIM_CANDIDATES, PIN_HINT_LOOKBACK_BUCKETS, PIN_TTL_MS, is_valid_pin,
-    now_ms, pin_bucket, pin_hint_for_bucket, pin_locator,
+    MAX_CLAIM_ATTEMPTS, MAX_CLAIM_CANDIDATES, PIN_HINT_LOOKBACK_BUCKETS, is_rendezvous_fresh,
+    is_valid_pin, now_ms, pin_bucket, pin_hint_for_bucket, pin_locator,
 };
 use crate::crypto::spake2::{
     PakeIdentities, PakeRole, PakeRun, derive_pake_secret, is_valid_pake_message,
@@ -410,6 +410,7 @@ async fn find_rendezvous_candidates(
 
     let mut saw_expired = false;
     let mut candidates: Vec<RendezvousCandidate> = Vec::new();
+    let now = now_ms();
 
     for event in events {
         if candidates.len() >= MAX_CLAIM_CANDIDATES {
@@ -417,11 +418,15 @@ async fn find_rendezvous_candidates(
         }
 
         // A rendezvous event is only claimable while the sender still honors
-        // its PIN generation. Tracked here (not in the shared helper) so the
-        // "PIN expired" message can distinguish stale transfers.
-        let created_at_ms = event.created_at.as_secs() * 1000;
-        if now_ms().saturating_sub(created_at_ms) > PIN_TTL_MS {
-            saw_expired = true;
+        // the bucket it was published in. Tracked here (not in the shared
+        // helper) so the "PIN expired" message can distinguish a rotated
+        // transfer. Only a bucket in the past means the PIN moved on: a
+        // future-dated event is forged or badly clocked, and telling the user
+        // to retype would send them after the wrong problem.
+        if !is_rendezvous_fresh(event.created_at.as_secs(), now) {
+            if pin_bucket(event.created_at.as_secs().saturating_mul(1000)) < pin_bucket(now) {
+                saw_expired = true;
+            }
             continue;
         }
 
@@ -458,11 +463,11 @@ async fn find_rendezvous_candidates(
 
 /// Structural validation of a rendezvous event, shared by the initial fetch
 /// and the replacement events that arrive while waiting for the confirm: the
-/// event must be fresh, its payload must name the event's own author and
-/// transfer id, and its element must be a valid non-identity curve point.
+/// event must have been published in a bucket the sender still honors, its
+/// payload must name the event's own author and transfer id, and its element
+/// must be a valid non-identity curve point.
 fn parse_claimable_rendezvous(event: &Event) -> Option<RendezvousCandidate> {
-    let created_at_ms = event.created_at.as_secs() * 1000;
-    if now_ms().saturating_sub(created_at_ms) > PIN_TTL_MS {
+    if !is_rendezvous_fresh(event.created_at.as_secs(), now_ms()) {
         return None;
     }
     let parsed = parse_rendezvous_event(event)?;
