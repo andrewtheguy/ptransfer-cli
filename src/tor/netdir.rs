@@ -477,8 +477,20 @@ pub async fn keep_current<R: Runtime>(
         log::info!("refreshing the Tor directory before it expires");
         match download(&runtime, &circmgr, &config, Some(netdir.as_ref())).await {
             Ok(fresh) => {
-                log::info!("refreshed the Tor directory");
+                let extended = fresh.lifetime().valid_until() > expires;
                 provider.publish(Arc::new(fresh));
+                if extended {
+                    log::info!("refreshed the Tor directory");
+                } else {
+                    // The authorities had not published the next consensus
+                    // yet, so we fetched the one we already had: `renew_at`
+                    // is still in the past and the loop would come straight
+                    // back here and download it again.
+                    log::debug!(
+                        "the refreshed Tor directory expires no later than the one it replaced"
+                    );
+                    runtime.sleep(REFRESH_RETRY_DELAY).await;
+                }
             }
             Err(error) => {
                 log::warn!("failed to refresh the Tor directory: {error:#}");

@@ -192,11 +192,12 @@ async fn serve_one_transfer(
     ui::status("Waiting for a receiver...");
 
     tokio::select! {
-        // A signal unwinds normally: the throwaway Tor storage is only removed
-        // by its destructor, which a signal-killed process never runs.
+        // Unwinding lets the service tell its introduction points it is going
+        // away. Nothing has to be cleaned up: the client only ever existed in
+        // this process's memory.
         result = shutdown_signal() => {
             result.context("failed to listen for a shutdown signal")?;
-            log::info!("shutting down and removing the Tor client state");
+            log::info!("shutting down");
             Ok(())
         }
         result = serve_until_sent(listener, port, onion, password, source) => result,

@@ -51,7 +51,9 @@ use tor_hscrypto::time::TimePeriod;
 use tor_hscrypto::{RevisionCounter, Subcredential};
 use tor_linkspec::verbatim::VerbatimLinkSpecCircTarget;
 use tor_linkspec::decode::Strictness;
-use tor_linkspec::{CircTarget, EncodedLinkSpec, OwnedChanTargetBuilder, OwnedCircTarget};
+use tor_linkspec::{
+    CircTarget, EncodedLinkSpec, HasRelayIds as _, OwnedChanTargetBuilder, OwnedCircTarget,
+};
 use tor_llcrypto::pk::ed25519;
 use tor_netdir::{NetDir, NetDirProvider as _, Timeliness, WeightRole};
 use tor_netdoc::NetdocBuilder as _;
@@ -84,6 +86,17 @@ const CREATE2_FORMATS: &[HandshakeType] = &[HandshakeType::NTOR];
 /// so a service that uploads once stops being reachable a few hours later
 /// while still looking healthy from the inside.
 const REPUBLISH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// How long to wait before trying again when a republication failed.
+///
+/// Shorter than [`REPUBLISH_INTERVAL`]: a descriptor that did not go up is the
+/// case where waiting an hour actually costs reachability.
+const REPUBLISH_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// How often the service checks that its introduction points are still up.
+///
+/// A relay that drops the circuit stops forwarding introductions, and the
+/// published descriptor still names it, so a client that picks it waits for an
+/// answer that cannot arrive. This bounds how long that lasts.
+const INTRO_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Time limit on establishing one introduction point.
 const ESTABLISH_INTRO_TIMEOUT: Duration = Duration::from_secs(90);
@@ -267,33 +280,80 @@ impl Service {
     async fn run(self: &Arc<Self>, published: oneshot::Sender<Result<()>>) -> Result<()> {
         let (introduce_tx, mut introduce_rx) = mpsc::channel(CHANNEL_DEPTH);
 
-        let intro_points = self
-            .establish_intro_points_with_retry(introduce_tx)
+        let mut intro_points = self
+            .establish_intro_points_with_retry(introduce_tx.clone())
             .await
             .context("failed to establish any introduction point")?;
-        // Held for as long as the service runs: dropping a circuit tells its
-        // introduction point we are gone.
-        let _circuits: Vec<_> = intro_points.iter().map(|p| Arc::clone(&p.tunnel)).collect();
-        let descriptors: Vec<IntroPointDesc> =
-            intro_points.iter().map(|p| p.descriptor.clone()).collect();
 
-        let first = self.publish(&descriptors).await;
+        let first = self.publish(&descriptors_of(&intro_points)).await;
         let ok = first.is_ok();
         let _ = published.send(first);
         if !ok {
             bail!("failed to publish the descriptor");
         }
 
-        // Republish for as long as we run, and answer clients meanwhile.
-        let republish = {
+        // Keep the introduction points and the descriptor up for as long as we
+        // run, and answer clients meanwhile. This owns `intro_points`, so the
+        // circuits live exactly as long as this loop does: dropping one tells
+        // its introduction point we are gone.
+        let maintain = {
             let service = Arc::clone(self);
-            let descriptors = descriptors.clone();
             async move {
+                let mut next_republish = tokio::time::Instant::now() + REPUBLISH_INTERVAL;
                 loop {
-                    tokio::time::sleep(REPUBLISH_INTERVAL).await;
-                    if let Err(error) = service.publish(&descriptors).await {
-                        log::warn!("failed to republish the descriptor: {error:#}");
+                    tokio::time::sleep(INTRO_CHECK_INTERVAL).await;
+
+                    // An introduction point whose circuit has closed is not
+                    // one any more, however healthy the descriptor naming it
+                    // looks. Drop it, replace it, and publish the new list.
+                    let before = intro_points.len();
+                    intro_points.retain(|point| !point.tunnel.is_closed());
+                    let mut changed = intro_points.len() < before;
+                    if changed {
+                        log::warn!(
+                            "{} introduction point(s) closed; re-establishing",
+                            before - intro_points.len()
+                        );
                     }
+
+                    if intro_points.len() < INTRO_POINTS {
+                        let live: HashSet<ed25519::Ed25519Identity> =
+                            intro_points.iter().map(|point| point.relay).collect();
+                        let wanted = INTRO_POINTS - intro_points.len();
+                        match service
+                            .establish_intro_points(introduce_tx.clone(), wanted, &live)
+                            .await
+                        {
+                            Ok(fresh) => {
+                                changed = true;
+                                intro_points.extend(fresh);
+                            }
+                            // Not fatal while any introduction point is left:
+                            // the service is still reachable through the rest,
+                            // and the next pass tries again.
+                            Err(error) => {
+                                log::warn!("failed to replace an introduction point: {error:#}");
+                            }
+                        }
+                    }
+
+                    if intro_points.is_empty() {
+                        return Err(anyhow!(
+                            "every introduction point closed and none could be replaced; \
+                             the service is no longer reachable"
+                        ));
+                    }
+
+                    if !changed && tokio::time::Instant::now() < next_republish {
+                        continue;
+                    }
+                    next_republish = match service.publish(&descriptors_of(&intro_points)).await {
+                        Ok(()) => tokio::time::Instant::now() + REPUBLISH_INTERVAL,
+                        Err(error) => {
+                            log::warn!("failed to republish the descriptor: {error:#}");
+                            tokio::time::Instant::now() + REPUBLISH_RETRY_INTERVAL
+                        }
+                    };
                 }
             }
         };
@@ -310,14 +370,14 @@ impl Service {
         };
 
         tokio::select! {
-            // Never returns; it republishes for as long as the service runs.
-            _ = republish => Ok(()),
-            // Returns only when every introduction point has closed its
-            // circuit, which leaves the address published but unreachable.
-            // Say so rather than exiting quietly as though the work were done.
-            _ = answer => Err(anyhow!(
-                "every introduction point closed; the service is no longer reachable"
-            )),
+            // Returns only when the service has no introduction point left,
+            // which leaves the address published but unreachable. Say so
+            // rather than exiting quietly as though the work were done.
+            result = maintain => result,
+            // Cannot finish while the loop above holds a sender to re-establish
+            // introduction points with; it is here because selecting on it is
+            // what drives the introductions clients send us.
+            _ = answer => Ok(()),
         }
     }
 
@@ -333,7 +393,10 @@ impl Service {
         let deadline = tokio::time::Instant::now() + ESTABLISH_INTRO_DEADLINE;
         let last_error;
         loop {
-            match self.establish_intro_points(introduce.clone()).await {
+            match self
+                .establish_intro_points(introduce.clone(), INTRO_POINTS, &HashSet::new())
+                .await
+            {
                 Ok(points) => return Ok(points),
                 Err(error) => log::debug!("no introduction point yet: {error:#}"),
             }
@@ -346,18 +409,24 @@ impl Service {
         Err(last_error)
     }
 
-    /// Build a circuit to a few relays and ask each to be an introduction point.
+    /// Build a circuit to `wanted` relays and ask each to be an introduction
+    /// point, picking none of the relays in `avoid`.
+    ///
+    /// `avoid` is how a replacement is kept off a relay that is already an
+    /// introduction point for this service.
     async fn establish_intro_points(
         self: &Arc<Self>,
         introduce: mpsc::Sender<(Arc<IntroPointKeys>, Introduce2)>,
+        wanted: usize,
+        avoid: &HashSet<ed25519::Ed25519Identity>,
     ) -> Result<Vec<EstablishedIntroPoint>> {
         let netdir = self.timely_netdir()?;
 
         let mut established = Vec::new();
-        let mut used: HashSet<ed25519::Ed25519Identity> = HashSet::new();
+        let mut used: HashSet<ed25519::Ed25519Identity> = avoid.clone();
         let mut last_error = None;
 
-        for _ in 0..INTRO_POINTS {
+        for _ in 0..wanted {
             let target = {
                 let mut rng = rand::rng();
                 let relay = netdir.pick_relay(&mut rng, WeightRole::HsIntro, |relay| {
@@ -475,7 +544,15 @@ impl Service {
             .build()
             .map_err(|e| anyhow!("failed to describe the introduction point: {e}"))?;
 
-        Ok(EstablishedIntroPoint { tunnel, descriptor })
+        Ok(EstablishedIntroPoint {
+            // Always present: the target came from the directory, which
+            // does not list a relay without an Ed25519 identity.
+            relay: *target
+                .ed_identity()
+                .ok_or_else(|| anyhow!("the introduction point has no Ed25519 identity"))?,
+            tunnel,
+            descriptor,
+        })
     }
 
     /// Sign a descriptor for every live time period and store it on the HSDirs
@@ -800,6 +877,14 @@ impl Service {
     }
 }
 
+/// How `intro_points` are named in the descriptor.
+fn descriptors_of(intro_points: &[EstablishedIntroPoint]) -> Vec<IntroPointDesc> {
+    intro_points
+        .iter()
+        .map(|point| point.descriptor.clone())
+        .collect()
+}
+
 /// The keys that identify this service at one introduction point.
 struct IntroPointKeys {
     /// Signs `ESTABLISH_INTRO`, and identifies us to that relay.
@@ -812,6 +897,9 @@ struct IntroPointKeys {
 
 /// An introduction point that has acknowledged `ESTABLISH_INTRO`.
 struct EstablishedIntroPoint {
+    /// Which relay this is, so that a replacement for some other introduction
+    /// point is not established at the same one.
+    relay: ed25519::Ed25519Identity,
     /// Held open for as long as the service runs: dropping it retires the
     /// introduction point.
     tunnel: Arc<tor_circmgr::ServiceOnionServiceIntroTunnel>,
