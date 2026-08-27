@@ -38,8 +38,10 @@ pub enum FileExistsChoice {
 #[derive(Debug)]
 pub enum UiEvent {
     Status(String),
-    /// Completion of the most recent [`UiEvent::Status`] step ("Doing X..." →
-    /// "Did X (elapsed)"); the TUI replaces that line instead of appending.
+    /// A newer form of the most recent [`UiEvent::Status`] line — its progress
+    /// while it runs, or its completion ("Doing X..." → "Did X (elapsed)").
+    /// The TUI replaces that line instead of appending, so a step that reports
+    /// a hundred times still costs one row.
     StatusDone(String),
     Progress {
         dir: Direction,
@@ -135,6 +137,20 @@ pub fn status_timed(line: &str, elapsed: Duration) {
         let _ = tx.send(UiEvent::StatusDone(full));
     } else {
         eprintln!("{full}");
+    }
+}
+
+/// Replace the most recent status line with a newer form of the same step.
+///
+/// For a long step whose only news is that it is still going. The TUI
+/// overwrites the row it already has, so a minute of Tor bootstrap progress
+/// costs one line rather than a scrolling wall of them; without a sink each
+/// update is its own line on stderr, which is why callers throttle.
+pub fn status_update(line: &str) {
+    if let Some(tx) = sink() {
+        let _ = tx.send(UiEvent::StatusDone(line.to_string()));
+    } else {
+        eprintln!("{line}");
     }
 }
 

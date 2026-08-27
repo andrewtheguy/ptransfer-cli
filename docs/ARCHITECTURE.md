@@ -12,9 +12,15 @@ the spec wins.
 The web app's Code Exchange — hand-carried QR/clipboard offer and answer codes —
 is deliberately outside that contract while it is still taking shape, and is not
 implemented here. PIN exchange is the CLI's only signaling mode. The wizard's
-mode menu still lists Code Exchange in the web app's position, so a mode's
+send mode menu still lists Code Exchange in the web app's position, so a mode's
 number means the same thing in both interfaces; selecting it reports that it is
 not implemented and goes no further.
+
+That menu belongs to the sending side alone. The receiving side is handed one
+value and the modes are distinguishable by it — a 12-character PIN, or a v3
+onion address with a valid checksum — so the wizard classifies what was pasted
+rather than asking, as the web app's receive screen does. Only the Tor mode then
+needs a second input, its one-time password.
 
 ## PIN Exchange
 

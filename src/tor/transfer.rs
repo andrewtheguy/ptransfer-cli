@@ -102,10 +102,13 @@ const MAX_FAILED_HANDSHAKES: u32 = 20;
 /// connecting.
 pub async fn send(paths: Vec<PathBuf>, port: u16) -> Result<()> {
     // Fail on an oversized selection before spending a minute bootstrapping.
+    ui::status("Preparing the files to send...");
+    let step = Instant::now();
     let source = tokio::task::spawn_blocking(move || {
         prepare_send_source_with_cap(&paths, MAX_TRANSFER_BYTES)
     })
     .await??;
+    ui::status_timed("Prepared the files to send", step.elapsed());
     // A ZIP's headers and entry paths are wire bytes that no file size
     // accounts for, so a selection of many tiny files can pass the input cap
     // and still not fit. Refusing here costs a moment; finding out while
@@ -131,6 +134,7 @@ pub async fn send(paths: Vec<PathBuf>, port: u16) -> Result<()> {
     let password = generate_pin()?;
 
     let tor = EphemeralTorClient::bootstrap().await?;
+    ui::status("Launching the onion service...");
     let mut listener = OnionListener::launch(&tor, NICKNAME)?;
     // Two spellings of one address: the canonical form the handshake binds,
     // and the shorter form the receiver is asked to retype.
@@ -143,7 +147,10 @@ pub async fn send(paths: Vec<PathBuf>, port: u16) -> Result<()> {
         &password,
     );
     log::info!("publishing the descriptor; this usually takes under a minute");
+    ui::status("Publishing the onion descriptor...");
+    let step = Instant::now();
     listener.wait_until_published().await?;
+    ui::status_timed("Published the onion descriptor", step.elapsed());
     ui::tor_published();
 
     serve_one_transfer(listener, port, &onion, &password, &source).await
@@ -295,6 +302,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     metadata: &TransferMetadata,
     source: &SendSource,
 ) -> Result<ServedConnection> {
+    let step = Instant::now();
     let handshake = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         run_service_handshake(messenger, password, onion, metadata),
@@ -309,7 +317,8 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     match handshake {
         ServiceHandshake::Ready(keys) => {
-            ui::status("Receiver authenticated; sending...");
+            ui::status_timed("Receiver authenticated", step.elapsed());
+            ui::status("Sending...");
             run_sender(messenger, &keys.content, source, MAX_WIRE_BYTES).await?;
             Ok(ServedConnection::Sent)
         }
@@ -339,11 +348,13 @@ pub async fn receive(
         "Connecting to {}...",
         display_address(&host, port)
     ));
+    let step = Instant::now();
     let stream = tor
         .client()
         .connect((host.as_str(), port))
         .await
         .with_context(|| format!("failed to connect to {onion}"))?;
+    ui::status_timed("Connected to the onion service", step.elapsed());
 
     let mut messenger = TorMessenger::new(stream);
     let result = receive_over(&mut messenger, password, &onion, output, on_conflict).await;
@@ -365,8 +376,11 @@ async fn receive_over<S: AsyncRead + AsyncWrite + Unpin + Send>(
     output: Option<PathBuf>,
     on_conflict: OnConflict,
 ) -> Result<Option<PathBuf>> {
+    ui::status("Authenticating with the sender's password...");
+    let step = Instant::now();
     let ClientHandshake { keys, metadata } =
         run_client_handshake(messenger, password, onion).await?;
+    ui::status_timed("Authenticated with the sender", step.elapsed());
 
     // `file_size` is the sender's input size — a progress hint that bounds
     // nothing on the wire, but a sender offering more than the limit is not

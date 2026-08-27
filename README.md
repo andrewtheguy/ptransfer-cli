@@ -99,18 +99,25 @@ arguments at all:
 ptransfer
 ```
 
-The wizard covers everything interactively: choose send or receive, choose the
-transfer mode, pick files and/or folders in the built-in browser (Space to
-multi-select), and when receiving, browse to the output directory (or create a
-new folder with `n`) and enter the PIN. Transfers run inside the TUI with live
-status and progress.
+The wizard covers everything interactively: choose send or receive; when
+sending, choose the transfer mode and pick files and/or folders in the built-in
+browser (Space to multi-select); when receiving, browse to the output directory
+(or create a new folder with `n`) and paste whatever the sender handed over.
+Transfers run inside the TUI with live status and progress.
 
-The mode menu lists the web app's modes in the web app's order, so an option's
-position means the same thing in both, and adds the CLI's own Tor Onion Service
-as a third entry in a build with the `tor` feature. Picking Code Exchange says it
-is not implemented and stays on the menu; the other modes run a transfer. Over
-Tor the wizard shows the sender's address and password on the transfer screen,
-and asks the receiver for both.
+Only the sending side picks a mode. Its menu lists the web app's modes in the
+web app's order, so an option's position means the same thing in both, and adds
+the CLI's own Tor Onion Service as a third entry in a build with the `tor`
+feature. Picking Code Exchange says it is not implemented and stays on the menu;
+the other modes run a transfer.
+
+The receiving side is never asked which mode to use. A PIN and an onion address
+are told apart by their own contents, so the single receive box reads the mode
+off what lands in it and names what it recognized — the same way the web app's
+receive screen works. A PIN starts the transfer; an onion address asks for the
+one-time password on the next screen, since that is a separate secret. Something
+of the right shape that fails its checksum is called out as a typo while it is
+still being typed.
 
 ### Non-Interactive Test Mode
 
@@ -158,7 +165,12 @@ it in (`printf '%s\n' "$PASSWORD" | ptransfer tor receive <address>`).
 
 `send` prints the address and password as soon as they exist, then `ready` once
 the descriptor is published and the service is actually reachable — wait for
-`ready` before connecting. The printed address leaves the default virtual
+`ready` before connecting. Those three lines are all that goes to stdout, so
+redirecting it still yields just them; both ends narrate the rest on stderr —
+Tor's own bootstrap percentage, the descriptor going up, the connection and the
+handshake, each with how long it took, then byte progress. A Tor transfer spends
+a minute or two before anything moves, and that time is accounted for rather
+than silent. The printed address leaves the default virtual
 port (9735) implicit, since neither side offers it as a choice; `--port` sets
 another one, which then shows up in the address, and a port in the address wins
 over `--port` on the receiving side. Multiple paths or a folder
@@ -173,7 +185,8 @@ worth it is your call, not the tool's. The other end may be another CLI or a
 pTransfer browser tab; both speak the same handshake.
 
 These `tor` subcommands are the non-interactive form. The wizard covers the same
-transfer under **Tor Onion Service** in its mode menu.
+transfer: the sender picks **Tor Onion Service** from its mode menu, and the
+receiver just pastes the address into the one box it asks for.
 
 The password authenticates both ends through the same SPAKE2 exchange PIN
 Exchange uses, with the relay-shaped parts removed, and the `.onion` address is
