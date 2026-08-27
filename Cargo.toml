@@ -140,7 +140,9 @@ tor-checkable = { version = "0.45", optional = true }
 
 tor-bytes = { version = "0.45", optional = true }
 tor-cell = { version = "0.45", optional = true, features = ["hs"] }
-tor-hscrypto = { version = "0.45", optional = true }
+# `ope` is the order-preserving encryption a service uses to make descriptor
+# revision counters that do not leak this machine's clock skew.
+tor-hscrypto = { version = "0.45", optional = true, features = ["ope"] }
 tor-linkspec = { version = "0.45", optional = true, features = ["decode", "verbatim"] }
 tor-llcrypto = { version = "0.45", optional = true }
 tor-memquota = { version = "0.45", optional = true }

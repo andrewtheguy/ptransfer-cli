@@ -18,9 +18,9 @@
 //! remains Arti's.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt as _;
 use futures_util::stream::BoxStream;
 use tor_chanmgr::{ChanMgr, ChanMgrConfig, ChannelConfig, Dormancy};
@@ -41,6 +41,22 @@ use crate::ui;
 use super::config::TorConfig;
 use super::memstate::MemoryStateMgr;
 use super::netdir::{self, MemoryNetDirProvider};
+
+/// How long to wait for a service to answer a `BEGIN`.
+///
+/// Arti's own stream timeout is ten seconds. This is longer because the peer
+/// on the other end is one CLI serving one transfer: it answers a second
+/// connection only when it comes back round to accepting, which can be after
+/// it has finished with somebody else.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Arti's default memory quota, sized from this machine's memory.
+fn memory_quota(runtime: &PreferredRuntime) -> Result<Arc<MemoryQuotaTracker>> {
+    let config = tor_memquota::Config::builder()
+        .build()
+        .context("failed to work out how much memory the Tor client may use")?;
+    MemoryQuotaTracker::new(runtime, config).context("failed to set up memory accounting")
+}
 
 /// A bootstrapped Tor client that exists only in this process.
 ///
@@ -78,7 +94,7 @@ impl TorClient {
             .context("failed to find the async runtime the Tor client should use")?;
         let config = Arc::new(TorConfig::new()?);
         let statemgr = MemoryStateMgr::new();
-        let netdir = Arc::new(MemoryNetDirProvider::new());
+        let netdir = Arc::new(MemoryNetDirProvider::new(config.tolerance().clone()));
 
         let chanmgr = Arc::new(
             ChanMgr::new(
@@ -86,9 +102,12 @@ impl TorClient {
                 ChanMgrConfig::new(ChannelConfig::default()),
                 Dormancy::Active,
                 &NetParameters::default(),
-                // No memory quota: one transfer's worth of circuits cannot
-                // exhaust anything, and there is no other client to be fair to.
-                MemoryQuotaTracker::new_noop(),
+                // Arti's own default quota, sized from the machine's memory.
+                // A published onion service takes introductions from anyone
+                // who has the address, so the queues behind those circuits are
+                // reachable by a stranger; leaving them unaccounted is how a
+                // stranger turns them into all of this machine's memory.
+                memory_quota(&runtime)?,
             )
             .context("failed to set up the Tor channel manager")?,
         );
@@ -130,7 +149,7 @@ impl TorClient {
         let directory = netdir::download(&runtime, &circmgr, &config, None)
             .await
             .context("failed to fetch the Tor directory")?;
-        netdir.publish(Arc::new(directory));
+        netdir.publish(directory);
         ui::status_timed("Fetched the Tor directory", started.elapsed());
 
         // The consensus expires; `serve` can outlive it.
@@ -196,10 +215,20 @@ impl TorClient {
             .suppress_begin_flags()
             .optimistic(false);
 
-        tunnel
-            .begin_stream("", port, Some(params))
-            .await
-            .with_context(|| format!("failed to open a stream to {host}:{port}"))
+        // `begin_stream` waits for the service to answer BEGIN and has no
+        // deadline of its own, so a service that takes the stream and says
+        // nothing would hang the command for good. Generous, because a service
+        // that is busy with another transfer answers only when it comes back
+        // round to accepting.
+        tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tunnel.begin_stream("", port, Some(params)),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!("the onion service at {host}:{port} accepted a stream but never answered")
+        })?
+        .with_context(|| format!("failed to open a stream to {host}:{port}"))
     }
 
     /// The async runtime this client runs on.

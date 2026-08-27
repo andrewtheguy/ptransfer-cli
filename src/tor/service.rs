@@ -43,6 +43,7 @@ use tor_cell::relaycell::{RelayCmd, RelayMsg as _};
 use tor_circmgr::build::onion_circparams_from_netparams;
 use tor_circmgr::hspool::HsCircPool;
 use tor_dirclient::request::HsDescUploadRequest;
+use tor_hscrypto::ope::AesOpeKey;
 use tor_hscrypto::pk::{
     HsBlindId, HsId, HsIdKey, HsIdKeypair, HsIntroPtSessionIdKey, HsIntroPtSessionIdKeypair,
     HsSvcNtorKeypair,
@@ -118,6 +119,14 @@ const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_CONCURRENT_STREAMS: usize = 16;
 /// Depth of the queues between the circuit reactors and the service task.
 const CHANNEL_DEPTH: usize = 8;
+/// How many clients may be in the middle of an introduction at once.
+///
+/// Each one is a rendezvous circuit built on somebody else's say-so: anyone who
+/// has the address can send `INTRODUCE2`, and none of them has authenticated
+/// yet. Without a bound they are as many circuits as a stranger cares to ask
+/// for. Introductions past the bound wait, and are dropped once the queue
+/// behind them fills, which is what a busy service is supposed to do.
+const MAX_CONCURRENT_INTRODUCTIONS: usize = 8;
 /// How many introductions to remember for replay detection.
 ///
 /// Each entry is 32 bytes, so even the cap is trivial; it exists only so that
@@ -359,9 +368,17 @@ impl Service {
         };
 
         let answer = async {
+            let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INTRODUCTIONS));
             while let Some((keys, message)) = introduce_rx.next().await {
+                let permit = Arc::clone(&permits)
+                    .acquire_owned()
+                    .await
+                    .expect("the introduction semaphore is never closed");
                 let service = Arc::clone(self);
                 tokio::spawn(async move {
+                    // Held for the whole introduction, rendezvous circuit and
+                    // client streams included.
+                    let _permit = permit;
                     if let Err(error) = service.serve_introduction(&keys, message).await {
                         log::warn!("an introduction from a client failed: {error:#}");
                     }
@@ -560,7 +577,11 @@ impl Service {
     async fn publish(self: &Arc<Self>, intro_points: &[IntroPointDesc]) -> Result<()> {
         let netdir = self.timely_netdir()?;
         let now = SystemTime::now();
-        let mut stored_anywhere = false;
+        // The ring a client searches right now. The others are the rollover
+        // ones a service publishes to in advance, or has just come off; a
+        // descriptor on those alone is one nobody looks for.
+        let current_period = netdir.hs_time_period();
+        let mut stored_on_current_ring = false;
         let mut last_error = None;
         let mut published = Vec::new();
 
@@ -584,25 +605,44 @@ impl Service {
                     &params,
                     now,
                     &mut rng,
-                )?
+                )
+            };
+            // One unusable time period must not cost us the others: the ring
+            // that matters is `current_period`, and the loop is still to reach
+            // it or has already passed it.
+            let descriptor = match descriptor {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    log::warn!("failed to build a descriptor for {period:?}: {error:#}");
+                    if period == current_period {
+                        last_error = Some(error);
+                    }
+                    continue;
+                }
             };
 
             let blind_id: HsBlindId = blind_key.id();
             match self.upload(&netdir, blind_id, period, &descriptor).await {
-                Ok(()) => stored_anywhere = true,
+                Ok(()) => stored_on_current_ring |= period == current_period,
                 Err(error) => {
                     log::warn!("failed to publish for time period {period:?}: {error:#}");
-                    last_error = Some(error);
+                    if period == current_period {
+                        last_error = Some(error);
+                    }
                 }
             }
         }
 
         self.forget_stale_subcredentials(&published);
 
-        if stored_anywhere {
+        if stored_on_current_ring {
             Ok(())
         } else {
-            Err(last_error.unwrap_or_else(|| anyhow!("no HSDir accepted the descriptor")))
+            Err(last_error
+                .unwrap_or_else(|| anyhow!("no HSDir accepted the descriptor"))
+                .context(
+                    "the descriptor did not reach the hash ring clients are searching now",
+                ))
         }
     }
 
@@ -925,13 +965,20 @@ fn build_descriptor<R: rand::Rng + rand::CryptoRng>(
 
     // Descriptors for the same blinded identity are ordered by this counter,
     // and an HSDir keeps the copy it already holds unless a new one raises it,
-    // so it has to grow across every republication. Counting from the start of
-    // the shared random value the ring is built from gives that, including for
-    // the period ahead, which is published before it begins.
-    let revision = now
-        .duration_since(params.start_of_shard_rand_period())
-        .unwrap_or_default()
-        .as_secs();
+    // so it has to grow across every republication.
+    //
+    // rend-spec-v3 does not let it be the plain time: an HSDir that could read
+    // the clock inside it would learn this host's clock skew, which is a
+    // fingerprint that survives across otherwise unrelated services. The
+    // "encrypted time in period" scheme keeps the ordering while hiding the
+    // offset it was made from, and it is order-preserving so that the same
+    // service run twice still produces comparable counters. The key is the
+    // blinded identity's secret, exactly as `tor-hsservice` derives it.
+    let ope_key = AesOpeKey::from_secret(&blind_keypair.as_ref().to_secret_key_bytes()[0..32]);
+    let offset = params.offset_within_srv_period(now).ok_or_else(|| {
+        anyhow!("the clock is before the start of this time period's shared random value")
+    })?;
+    let revision = ope_key.encrypt(offset);
 
     HsDescBuilder::default()
         .blinded_id(blind_key)

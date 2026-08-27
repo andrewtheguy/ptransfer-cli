@@ -246,16 +246,20 @@ two, each of which takes its storage as a trait:
 - The directory is downloaded and validated here (`src/tor/netdir.rs`) and
   served through `tor_netdir::NetDirProvider` from an `RwLock`. The checks are
   the ones Arti's own directory manager makes, in the same order: the consensus
-  must be timely, it must be signed by enough directory authorities from Arti's
-  built-in list, every authority certificate is signature- and lifetime-checked
-  before it may vouch for anything, and a microdescriptor is only accepted if
-  the consensus asked for its digest. `tor-netdoc`'s `dangerously_assume_timely`
-  and `dangerously_assume_wellsigned` escape hatches are not used.
+  must be timely (within Arti's own tolerance for clock skew), it must be signed
+  by enough directory authorities from Arti's built-in list, every authority
+  certificate is signature- and lifetime-checked before it may vouch for
+  anything, a microdescriptor is only accepted if the consensus asked for its
+  digest, and a consensus that requires subprotocols this build does not
+  implement is refused rather than used anyway. `tor-netdoc`'s
+  `dangerously_assume_timely` and `dangerously_assume_wellsigned` escape hatches
+  are not used.
 - The onion service is implemented here (`src/tor/service.rs`) on `tor-proto`:
   identity key, `ESTABLISH_INTRO`, descriptor signing and upload, and the
-  `INTRODUCE2` → `RENDEZVOUS1` handshake. Introductions already answered are
-  remembered in memory, which is the replay defence `tor-hsservice` writes to
-  a per-introduction-point log on disk.
+  `INTRODUCE2` → `RENDEZVOUS1` handshake. Introduction points that drop their
+  circuits are replaced and the descriptor republished; introductions already
+  answered are remembered in memory, which is the replay defence
+  `tor-hsservice` writes to a per-introduction-point log on disk.
 
 Because nothing is cached between runs, every command bootstraps the Tor
 directory from scratch; expect around a minute before the serving side prints an

@@ -16,6 +16,7 @@
 use anyhow::{Context, Result};
 use tor_circmgr::{CircuitTiming, PathConfig, PreemptiveCircuitConfig};
 use tor_dircommon::authority::AuthorityContacts;
+use tor_dircommon::config::DirTolerance;
 use tor_dircommon::fallback::{FallbackList, FallbackListBuilder};
 use tor_guardmgr::VanguardConfig;
 use tor_guardmgr::bridge::BridgeConfig;
@@ -37,6 +38,9 @@ pub struct TorConfig {
     timing: CircuitTiming,
     /// How many circuits to build ahead of being asked.
     preemptive: PreemptiveCircuitConfig,
+    /// How far outside its stated validity a directory document is still
+    /// accepted.
+    tolerance: DirTolerance,
 }
 
 impl TorConfig {
@@ -53,6 +57,7 @@ impl TorConfig {
             vanguards: VanguardConfig::default(),
             timing: CircuitTiming::default(),
             preemptive: PreemptiveCircuitConfig::default(),
+            tolerance: DirTolerance::default(),
         })
     }
 
@@ -64,6 +69,17 @@ impl TorConfig {
     /// The relays to bootstrap the directory from.
     pub fn fallbacks(&self) -> &FallbackList {
         &self.fallbacks
+    }
+
+    /// How far outside its stated validity a directory document is accepted.
+    ///
+    /// Arti's defaults: a day early, three days late. The early margin absorbs
+    /// a machine whose clock is somewhat fast, and the late one is prop212 --
+    /// an old consensus beats no consensus when the authorities are having
+    /// trouble agreeing. Refusing everything outside the literal interval
+    /// would make a moderately wrong clock look like a broken network.
+    pub fn tolerance(&self) -> &DirTolerance {
+        &self.tolerance
     }
 }
 

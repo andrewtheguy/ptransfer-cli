@@ -25,6 +25,13 @@
 //! 4. The consensus signatures are then verified against those certificates.
 //! 5. Each microdescriptor is accepted only if its **digest is one the
 //!    consensus asked for** — [`MdReceiver::add_microdesc`] rejects the rest.
+//! 6. The subprotocol versions the consensus **requires of clients** must be
+//!    ones this build implements; a consensus that requires something we do
+//!    not is refused rather than used anyway.
+//!
+//! Steps 1 and 3 are applied with Arti's own tolerances ([`TorConfig::tolerance`]),
+//! not to the literal interval: a machine whose clock is off by an hour is far
+//! more common than a directory that is genuinely invalid.
 //!
 //! `tor-netdoc` offers `dangerously_assume_timely` and
 //! `dangerously_assume_wellsigned` to skip steps 1 and 4. They are not used
@@ -41,13 +48,16 @@ use futures_util::stream::{BoxStream, StreamExt as _};
 use tor_checkable::{ExternallySigned, SelfSigned, TimeBound};
 use tor_circmgr::{CircMgr, DirInfo};
 use tor_dirclient::request::{AuthCertRequest, ConsensusRequest, MicrodescRequest};
+use tor_dircommon::config::DirTolerance;
 use tor_llcrypto::pk::rsa::RsaIdentity;
 use tor_netdir::params::NetParameters;
 use tor_netdir::{DirEvent, MdReceiver, NetDir, NetDirProvider, PartialNetDir, Timeliness};
 use tor_netdoc::AllowAnnotations;
 use tor_netdoc::doc::authcert::{AuthCert, AuthCertKeyIds};
 use tor_netdoc::doc::microdesc::{MdDigest, MicrodescReader};
-use tor_netdoc::doc::netstatus::{ConsensusFlavor, MdConsensus};
+use tor_netdoc::doc::netstatus::{
+    ConsensusFlavor, MdConsensus, ProtoStatuses, ProtocolSupportError,
+};
 use tor_rtcompat::{Runtime, SleepProviderExt as _};
 
 use super::config::TorConfig;
@@ -87,6 +97,11 @@ pub struct MemoryNetDirProvider {
     /// The directory we are currently handing out, once one has been
     /// downloaded and validated.
     current: RwLock<Option<Arc<NetDir>>>,
+    /// What the consensus behind `current` says clients should support, and
+    /// when that consensus became valid.
+    protocols: RwLock<Option<(SystemTime, Arc<ProtoStatuses>)>>,
+    /// How far outside its stated lifetime a directory is still handed out.
+    tolerance: DirTolerance,
     /// Publishes a tick whenever `current` changes. Arti's managers subscribe
     /// to this to notice a new consensus.
     events: std::sync::Mutex<postage::watch::Sender<DirEvent>>,
@@ -94,7 +109,7 @@ pub struct MemoryNetDirProvider {
 
 impl MemoryNetDirProvider {
     /// Create a provider that has no directory yet.
-    pub fn new() -> Self {
+    pub fn new(tolerance: DirTolerance) -> Self {
         // Deliberately not `NewConsensus`. A `watch` receiver is handed the
         // current value the moment it subscribes, and Arti's vanguard manager
         // responds to `NewConsensus` by calling `netdir(Timeliness::Timely)`
@@ -107,13 +122,17 @@ impl MemoryNetDirProvider {
         let (tx, _rx) = postage::watch::channel_with(DirEvent::NewDescriptors);
         Self {
             current: RwLock::new(None),
+            protocols: RwLock::new(None),
+            tolerance,
             events: std::sync::Mutex::new(tx),
         }
     }
 
-    /// Install `netdir` as the directory this provider hands out.
-    pub fn publish(&self, netdir: Arc<NetDir>) {
-        *self.current.write().expect("poisoned lock") = Some(netdir);
+    /// Install `directory` as the directory this provider hands out.
+    pub fn publish(&self, directory: Directory) {
+        let Directory { netdir, protocols } = directory;
+        *self.current.write().expect("poisoned lock") = Some(Arc::new(netdir));
+        *self.protocols.write().expect("poisoned lock") = Some(protocols);
         // Wakes `wait_for_netdir` and prompts the managers to re-read.
         let _ = postage::sink::Sink::try_send(
             &mut *self.events.lock().expect("poisoned lock"),
@@ -127,30 +146,24 @@ impl MemoryNetDirProvider {
     }
 }
 
-impl Default for MemoryNetDirProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl NetDirProvider for MemoryNetDirProvider {
     fn netdir(&self, timeliness: Timeliness) -> tor_netdir::Result<Arc<NetDir>> {
         let netdir = self.peek().ok_or(tor_netdir::Error::NoInfo)?;
 
         // `Unchecked` is for callers that would rather have a stale directory
         // than none — reporting relay information for a circuit that is
-        // already open, say. The other two are held to the consensus's own
-        // lifetime rather than to a tolerance, because the refresh task
-        // replaces the directory well before it expires: if we are outside
-        // the interval at all, something is wrong, and saying so beats
-        // building circuits from a directory we cannot vouch for.
-        match timeliness {
+        // already open, say. `Strict` is held to the consensus's own interval.
+        // `Timely` — which is what nearly every caller asks for — is held to
+        // that interval widened by the configured tolerance, exactly as Arti's
+        // directory manager does it: a clock that is an hour out must not look
+        // like a network that is down.
+        let lifetime = match timeliness {
             Timeliness::Unchecked => return Ok(netdir),
-            Timeliness::Timely | Timeliness::Strict => {}
-        }
+            Timeliness::Strict => netdir.lifetime().clone(),
+            Timeliness::Timely => self.tolerance.extend_lifetime(netdir.lifetime()),
+        };
 
         let now = SystemTime::now();
-        let lifetime = netdir.lifetime();
         if now < lifetime.valid_after() {
             // Almost always a wrong local clock rather than a bad directory.
             Err(tor_netdir::Error::DirNotYetValid)
@@ -178,13 +191,24 @@ impl NetDirProvider for MemoryNetDirProvider {
         }
     }
 
-    fn protocol_statuses(
-        &self,
-    ) -> Option<(SystemTime, Arc<tor_netdoc::doc::netstatus::ProtoStatuses>)> {
-        // Arti's directory manager reads these out of the consensus to warn
-        // that the running software is too old for the network. We do not
-        // surface that, and the trait allows saying so.
-        None
+    fn protocol_statuses(&self) -> Option<(SystemTime, Arc<ProtoStatuses>)> {
+        self.protocols.read().expect("poisoned lock").clone()
+    }
+}
+
+/// A validated directory, and what its consensus asks of client software.
+pub struct Directory {
+    /// The relays and network parameters.
+    netdir: NetDir,
+    /// When the consensus became valid, and the subprotocol versions it
+    /// recommends and requires of clients.
+    protocols: (SystemTime, Arc<ProtoStatuses>),
+}
+
+impl Directory {
+    /// The relays and network parameters.
+    pub fn netdir(&self) -> &NetDir {
+        &self.netdir
     }
 }
 
@@ -197,18 +221,102 @@ pub async fn download<R: Runtime>(
     circmgr: &Arc<CircMgr<R>>,
     config: &TorConfig,
     netdir: Option<&NetDir>,
-) -> Result<NetDir> {
+) -> Result<Directory> {
     let consensus = fetch_consensus(runtime, circmgr, config, netdir).await?;
+
+    // (6) Before anything is built from this consensus, check that we are
+    // software it is willing to have on the network.
+    let protocols = (
+        consensus.lifetime().valid_after(),
+        Arc::clone(consensus.protocol_statuses()),
+    );
+    check_protocols(&protocols.1)?;
 
     let mut partial = PartialNetDir::new(consensus, None);
     fetch_microdescs(runtime, circmgr, config, netdir, &mut partial).await?;
 
-    partial.unwrap_if_sufficient().map_err(|partial| {
+    let netdir = partial.unwrap_if_sufficient().map_err(|partial| {
         anyhow!(
             "the directory is missing too many relays to build circuits ({} still missing)",
             partial.missing_microdescs().count()
         )
-    })
+    })?;
+    Ok(Directory { netdir, protocols })
+}
+
+/// The subprotocol versions this build implements, as a client and as a
+/// service.
+///
+/// The same union `arti-client` assembles, minus the directory-cache protocols
+/// it claims for consensus diffs, which we do not fetch. Claiming a protocol we
+/// do not implement is the dangerous direction: it is what would let us keep
+/// talking to a network that has moved on without us.
+fn supported_protocols() -> tor_protover::Protocols {
+    use tor_protover::named::*;
+
+    let protocols = tor_proto::supported_client_protocols()
+        .union(&tor_netdoc::supported_protocols())
+        .union(&tor_hsclient::supported_hsclient_protocols());
+
+    // The service side is this crate's own code rather than `tor-hsservice`'s,
+    // so there is no crate to ask; these are what `service.rs` speaks.
+    protocols.union(
+        &[HSINTRO_V3, HSREND_V3, HSDIR_V3]
+            .into_iter()
+            .collect::<tor_protover::Protocols>(),
+    )
+}
+
+/// Recommended subprotocols this build knowingly does not implement.
+///
+/// Arti keeps the same list for the same reason: a recommendation we have
+/// already decided not to follow is not news, and logging it every run would
+/// train the operator to ignore the line that does matter.
+fn expected_missing() -> tor_protover::Protocols {
+    use tor_protover::named::*;
+
+    [
+        // Congestion control, which Arti itself has not finished and does not
+        // claim by default either.
+        FLOWCTRL_CC,
+        // Consensus diffs. This crate downloads a whole consensus each run and
+        // keeps no cached one to patch, so there is nothing to apply a diff to.
+        DIRCACHE_CONSDIFF,
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Refuse a consensus that requires a subprotocol this build does not have.
+///
+/// A client that keeps working from a consensus whose requirements it does not
+/// meet looks for relay behaviour that no longer exists, which is a load on the
+/// network and a broken transfer here. Arti shuts down in this case; so do we.
+fn check_protocols(statuses: &ProtoStatuses) -> Result<()> {
+    match statuses.client().check_protocols(&supported_protocols()) {
+        Ok(()) => Ok(()),
+        Err(ProtocolSupportError::MissingRecommended(missing)) => {
+            if missing.difference(&expected_missing()).is_empty() {
+                log::debug!("the Tor network recommends {missing}, which we do not implement");
+            } else {
+                log::warn!(
+                    "the Tor network recommends subprotocols this build does not have \
+                     ({missing}); it should still work, but it is time to update"
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if error.should_shutdown() {
+                bail!(
+                    "the Tor network requires subprotocols this build does not have ({error}); \
+                     refusing to use the network with software this old"
+                );
+            }
+            log::warn!("unexpected problem with the consensus's protocol list: {error}");
+            Ok(())
+        }
+    }
 }
 
 /// Fetch a consensus and verify it against the built-in directory authorities.
@@ -233,9 +341,12 @@ async fn fetch_consensus<R: Runtime>(
     let (_signed, _remainder, parsed) =
         MdConsensus::parse(&text).context("failed to parse the Tor consensus")?;
 
-    // (1) Timeliness. `dangerously_assume_timely` would skip this.
+    // (1) Timeliness, within the tolerance Arti applies to the same document.
+    // `dangerously_assume_timely` would skip this altogether.
     let now = runtime.wallclock();
-    let timely = parsed
+    let timely = config
+        .tolerance()
+        .extend_tolerance(parsed)
         .if_valid_at(&now)
         .context("the Tor consensus is not valid at the current time; check this machine's clock")?;
 
@@ -311,7 +422,7 @@ async fn fetch_certs<R: Runtime>(
                 continue;
             }
         };
-        let cert = match cert.if_valid_at(&now) {
+        let cert = match config.tolerance().extend_tolerance(cert).if_valid_at(&now) {
             Ok(timely) => timely,
             Err(error) => {
                 log::warn!("discarding an untimely authority certificate: {error}");
@@ -477,8 +588,8 @@ pub async fn keep_current<R: Runtime>(
         log::info!("refreshing the Tor directory before it expires");
         match download(&runtime, &circmgr, &config, Some(netdir.as_ref())).await {
             Ok(fresh) => {
-                let extended = fresh.lifetime().valid_until() > expires;
-                provider.publish(Arc::new(fresh));
+                let extended = fresh.netdir().lifetime().valid_until() > expires;
+                provider.publish(fresh);
                 if extended {
                     log::info!("refreshed the Tor directory");
                 } else {
@@ -506,7 +617,7 @@ mod tests {
 
     #[test]
     fn a_provider_with_no_directory_reports_that() {
-        let provider = MemoryNetDirProvider::new();
+        let provider = MemoryNetDirProvider::new(DirTolerance::default());
         assert!(matches!(
             provider.netdir(Timeliness::Unchecked),
             Err(tor_netdir::Error::NoInfo)
@@ -517,11 +628,54 @@ mod tests {
         ));
     }
 
+    /// A consensus that requires something this build does not implement must
+    /// stop the client rather than be used anyway.
+    #[test]
+    fn a_consensus_requiring_the_impossible_is_refused() {
+        let statuses: ProtoStatuses = serde_json::from_str(
+            r#"{
+                "client": { "recommended": "Relay=1-63", "required": "Relay=63" },
+                "relay": { "recommended": "", "required": "" }
+            }"#,
+        )
+        .unwrap();
+        let error = check_protocols(&statuses).expect_err("nothing implements Relay=63");
+        assert!(
+            error.to_string().contains("requires subprotocols"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// What the live network actually asks of clients today must not stop us,
+    /// and the protocols we knowingly lack must not be treated as a problem.
+    #[test]
+    fn the_protocols_the_network_requires_today_are_all_present() {
+        let statuses: ProtoStatuses = serde_json::from_str(
+            r#"{
+                "client": {
+                    "recommended": "Cons=2 Desc=2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4 HSRend=2 Link=4-5 Microdesc=2 Relay=2",
+                    "required": "Cons=2 Desc=2 Link=4 Microdesc=2 Relay=2"
+                },
+                "relay": { "recommended": "", "required": "" }
+            }"#,
+        )
+        .unwrap();
+        check_protocols(&statuses).expect("this build must satisfy what clients are required to have");
+        // The two recommended ones we do not implement are expected, not news.
+        assert!(
+            statuses
+                .client()
+                .check_protocols(&supported_protocols())
+                .is_err(),
+            "the fixture is meant to include protocols we lack"
+        );
+    }
+
     /// Before a directory exists, callers still ask for network parameters;
     /// they must get Arti's defaults rather than a panic.
     #[test]
     fn parameters_fall_back_to_the_defaults() {
-        let provider = MemoryNetDirProvider::new();
+        let provider = MemoryNetDirProvider::new(DirTolerance::default());
         let params = provider.params();
         let params: &NetParameters = params.as_ref().as_ref();
         assert_eq!(
