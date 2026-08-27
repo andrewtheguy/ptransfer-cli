@@ -1,213 +1,241 @@
-//! Bootstrapping an Arti client that leaves nothing behind.
+//! A Tor client assembled from Arti's managers, with nothing on disk.
+//!
+//! `arti-client` would do all of this for us, but it reaches the network
+//! through `tor-dirmgr` and stores onion-service state through
+//! `tor-hsservice`, and those two are the only parts of Arti that require a
+//! filesystem. So this module does what `arti-client` does — channel manager,
+//! guard manager, circuit manager, onion-service circuit pool, onion-service
+//! client — and supplies the two missing pieces from memory instead:
+//! [`MemoryStateMgr`] for the guard and vanguard state, and
+//! [`MemoryNetDirProvider`] for the directory.
+//!
+//! Everything below the directory is still Arti's, deliberately. In
+//! particular the channel manager owns the TLS connection to each relay and
+//! the link handshake that authenticates it: Tor relays present self-signed
+//! certificates and are identified by the CERTS cell instead, so replacing
+//! that layer would mean writing a certificate verifier that accepts anything
+//! and re-implementing the check that makes it safe. This way that check
+//! remains Arti's.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
-use arti_client::TorClient;
-use arti_client::config::{CfgPath, TorClientConfig};
-use arti_client::status::BootstrapStatus;
 use futures_util::StreamExt as _;
-use tor_config::ExplicitOrAuto;
-use tor_keymgr::config::ArtiKeystoreKind;
+use futures_util::stream::BoxStream;
+use tor_chanmgr::{ChanMgr, ChanMgrConfig, ChannelConfig, Dormancy};
+use tor_circmgr::CircMgr;
+use tor_circmgr::hspool::HsCircPool;
+use tor_guardmgr::GuardMgr;
+use tor_hsclient::{HsClientConnector, HsClientSecretKeys};
+use tor_hscrypto::pk::HsId;
+use tor_circmgr::isolation::StreamIsolation;
+use tor_netdir::params::NetParameters;
+use tor_netdir::{DirEvent, NetDirProvider as _, Timeliness, UpcastArcNetDirProvider as _};
+use tor_proto::client::stream::{DataStream, StreamParameters};
+use tor_memquota::MemoryQuotaTracker;
 use tor_rtcompat::PreferredRuntime;
 
 use crate::ui;
 
-use super::storage::EphemeralStorage;
+use super::config::TorConfig;
+use super::memstate::MemoryStateMgr;
+use super::netdir::{self, MemoryNetDirProvider};
 
-/// Shortest gap between two bootstrap progress lines.
+/// A bootstrapped Tor client that exists only in this process.
 ///
-/// Arti's status stream coalesces to the most recent value but still ticks
-/// several times a second while microdescriptors download. In the TUI each
-/// update replaces the line before it, so the rate costs nothing there; without
-/// a sink every update is its own line on stderr, and an unthrottled bootstrap
-/// would bury everything printed before it.
-const REPORT_INTERVAL: Duration = Duration::from_secs(1);
-
-/// A bootstrapped Arti client plus the throwaway storage it is using.
-///
-/// The storage must outlive the client, so the two are kept together and
-/// dropped together.
-pub struct EphemeralTorClient {
-    /// The bootstrapped client.
-    client: Arc<TorClient<PreferredRuntime>>,
-    /// Deleted when this struct is dropped; the client borrows nothing from it,
-    /// but reads and writes the paths it hands out.
-    _storage: EphemeralStorage,
+/// There is no storage to clean up: when this is dropped, or when the process
+/// dies for any reason including being killed outright, everything it knew —
+/// the directory, the guards, the onion-service keys — goes with it.
+pub struct TorClient {
+    /// The async runtime everything runs on.
+    runtime: PreferredRuntime,
+    /// The directory, held in memory. Also the thing every manager reads the
+    /// network's shape from.
+    netdir: Arc<MemoryNetDirProvider>,
+    /// Builds and reuses circuits. Held so the manager outlives every circuit
+    /// taken from it, including the ones inside the onion-service pool.
+    _circmgr: Arc<CircMgr<PreferredRuntime>>,
+    /// Circuits for onion-service use, kept separate from ordinary ones.
+    hs_pool: Arc<HsCircPool<PreferredRuntime>>,
+    /// Connects to onion services.
+    hsclient: HsClientConnector<PreferredRuntime>,
+    /// Settings, shared with the directory refresh task.
+    config: Arc<TorConfig>,
+    /// Background tasks stop when their handles drop, so they are kept here
+    /// for as long as the client lives.
+    _tasks: Vec<tor_rtcompat::scheduler::TaskHandle>,
 }
 
-impl EphemeralTorClient {
-    /// Build a client on fresh throwaway storage and bootstrap it.
+impl TorClient {
+    /// Build a client and fetch a directory for it.
     ///
-    /// This talks to the real Tor network and typically takes a few tens of
-    /// seconds, because nothing is cached: the directory has to be fetched from
-    /// scratch every time.
-    ///
-    /// That wait is the longest unexplained pause in a Tor transfer, so it is
-    /// bootstrapped in two steps rather than with `create_bootstrapped`: an
-    /// unbootstrapped client first, so its status stream can be read while the
-    /// bootstrap it belongs to runs.
+    /// This talks to the real Tor network and takes a few tens of seconds:
+    /// there is no cached directory to start from, by design, so the consensus
+    /// and every microdescriptor are downloaded each run.
     pub async fn bootstrap() -> Result<Self> {
-        let storage = EphemeralStorage::new()?;
-        log::info!("Tor client state: {} (removed on exit)", storage.root().display());
+        let runtime = PreferredRuntime::current()
+            .context("failed to find the async runtime the Tor client should use")?;
+        let config = Arc::new(TorConfig::new()?);
+        let statemgr = MemoryStateMgr::new();
+        let netdir = Arc::new(MemoryNetDirProvider::new());
 
-        let config = ephemeral_config(&storage)?;
-        let client = TorClient::builder()
-            .config(config)
-            .create_unbootstrapped()
-            .context("failed to create the Tor client")?;
+        let chanmgr = Arc::new(
+            ChanMgr::new(
+                runtime.clone(),
+                ChanMgrConfig::new(ChannelConfig::default()),
+                Dormancy::Active,
+                &NetParameters::default(),
+                // No memory quota: one transfer's worth of circuits cannot
+                // exhaust anything, and there is no other client to be fair to.
+                MemoryQuotaTracker::new_noop(),
+            )
+            .context("failed to set up the Tor channel manager")?,
+        );
 
-        ui::status("Bootstrapping the Tor client; this usually takes under a minute...");
+        let guardmgr = GuardMgr::new(runtime.clone(), statemgr.clone(), config.as_ref())
+            .context("failed to set up the Tor guard manager")?;
+
+        let circmgr = Arc::new(
+            CircMgr::new(
+                config.as_ref(),
+                statemgr.clone(),
+                &runtime,
+                Arc::clone(&chanmgr),
+                &guardmgr,
+            )
+            .context("failed to set up the Tor circuit manager")?,
+        );
+
+        let mut tasks = circmgr
+            .launch_background_tasks(&runtime, &netdir, statemgr.clone())
+            .context("failed to start the circuit manager's background tasks")?;
+        tasks.extend(
+            chanmgr
+                .launch_background_tasks(&runtime, Arc::clone(&netdir).upcast_arc())
+                .context("failed to start the channel manager's background tasks")?,
+        );
+
+        let hs_pool = Arc::new(HsCircPool::new(&circmgr));
+        tasks.extend(
+            hs_pool
+                .launch_background_tasks(&runtime, &Arc::clone(&netdir).upcast_arc())
+                .context("failed to start the onion-service circuit pool")?,
+        );
+
+        // Nothing above can build a multi-hop circuit until this lands: the
+        // managers are all waiting on a directory that only arrives here.
+        ui::status("Fetching the Tor directory; this usually takes under a minute...");
         let started = Instant::now();
-        bootstrap_reporting_progress(&client)
+        let directory = netdir::download(&runtime, &circmgr, &config, None)
             .await
-            .context("failed to bootstrap the Tor client")?;
-        ui::status_timed("Bootstrapped the Tor client", started.elapsed());
+            .context("failed to fetch the Tor directory")?;
+        netdir.publish(Arc::new(directory));
+        ui::status_timed("Fetched the Tor directory", started.elapsed());
+
+        // The consensus expires; `serve` can outlive it.
+        tokio::spawn(netdir::keep_current(
+            runtime.clone(),
+            Arc::clone(&circmgr),
+            Arc::clone(&config),
+            Arc::clone(&netdir),
+        ));
+
+        let hsclient = HsClientConnector::new(
+            runtime.clone(),
+            Arc::clone(&hs_pool),
+            config.as_ref(),
+            housekeeping(&netdir),
+        )
+        .context("failed to set up the onion-service client")?;
 
         Ok(Self {
-            client,
-            _storage: storage,
+            runtime,
+            netdir,
+            _circmgr: circmgr,
+            hs_pool,
+            hsclient,
+            config,
+            _tasks: tasks,
         })
     }
 
-    /// The underlying Arti client.
-    pub fn client(&self) -> &TorClient<PreferredRuntime> {
-        &self.client
-    }
-}
-
-/// Bootstrap `client`, reporting Arti's own progress as it goes.
-///
-/// The bootstrap future is what decides the outcome; the status stream is only
-/// read alongside it. If Arti stops reporting, the bootstrap is still awaited
-/// to completion — losing the commentary is not a failure.
-async fn bootstrap_reporting_progress(client: &TorClient<PreferredRuntime>) -> Result<()> {
-    let mut bootstrapping = std::pin::pin!(client.bootstrap());
-    let mut events = client.bootstrap_events();
-    let mut reporter = ProgressReporter::default();
-
-    loop {
-        tokio::select! {
-            result = &mut bootstrapping => return Ok(result?),
-            status = events.next() => match status {
-                Some(status) => reporter.report(&status),
-                None => return Ok(bootstrapping.await?),
-            },
-        }
-    }
-}
-
-/// Throttles bootstrap status lines to something a person can read.
-#[derive(Default)]
-struct ProgressReporter {
-    last: Option<Instant>,
-    /// The line most recently shown. Arti re-reports an unchanged status while
-    /// it waits on a slow step, and repeating it says nothing new.
-    line: String,
-    /// Whether the last line said the client was stuck. A blockage appearing or
-    /// clearing is news at any moment: it is the difference between "slow" and
-    /// "this machine cannot reach Tor at all", which is the one thing worth
-    /// interrupting a long silence for.
-    blocked: bool,
-}
-
-impl ProgressReporter {
-    fn report(&mut self, status: &BootstrapStatus) {
-        // Arti's own wording, which names the phase it is in and counts the
-        // microdescriptors it is still fetching.
-        let line = format!("Tor bootstrap: {status}");
-        self.emit(status.blocked().is_some(), line, Instant::now());
-    }
-
-    /// Show `line`, unless it repeats the last one or follows it too closely.
+    /// Open a stream to `port` on the onion service at `host`.
     ///
-    /// Returns whether it was shown.
-    fn emit(&mut self, blocked: bool, line: String, now: Instant) -> bool {
-        let due = blocked != self.blocked
-            || self
-                .last
-                .is_none_or(|last| now.duration_since(last) >= REPORT_INTERVAL);
-        if !due || line == self.line {
-            return false;
-        }
+    /// `host` must already be a canonical `.onion` address; [`super::split_address`]
+    /// is what turns typed input into one.
+    pub async fn connect(&self, host: &str, port: u16) -> Result<DataStream> {
+        let hsid: HsId = host
+            .parse()
+            .with_context(|| format!("invalid v3 onion address {host:?}"))?;
 
-        self.last = Some(now);
-        self.blocked = blocked;
-        self.line = line;
-        ui::status_update(&self.line);
-        true
+        let netdir = self
+            .netdir
+            .netdir(Timeliness::Timely)
+            .context("no usable Tor directory")?;
+
+        let tunnel = self
+            .hsclient
+            .get_or_launch_tunnel(
+                &netdir,
+                hsid,
+                HsClientSecretKeys::default(),
+                // One client, one purpose: every stream this process opens is
+                // part of the same transfer, so there is nothing to isolate
+                // from anything else.
+                StreamIsolation::no_isolation(),
+            )
+            .await
+            .with_context(|| format!("failed to reach the onion service at {host}"))?;
+
+        // The service already knows which service it is, and telling it the
+        // hostname again leaks nothing useful; Arti suppresses it, so we do.
+        let mut params = StreamParameters::default();
+        params
+            .suppress_hostname()
+            .suppress_begin_flags()
+            .optimistic(false);
+
+        tunnel
+            .begin_stream("", port, Some(params))
+            .await
+            .with_context(|| format!("failed to open a stream to {host}:{port}"))
+    }
+
+    /// The async runtime this client runs on.
+    pub fn runtime(&self) -> &PreferredRuntime {
+        &self.runtime
+    }
+
+    /// The circuit pool onion services build their circuits from.
+    pub fn hs_pool(&self) -> &Arc<HsCircPool<PreferredRuntime>> {
+        &self.hs_pool
+    }
+
+    /// The directory, for callers that need to pick relays themselves.
+    pub fn netdir_provider(&self) -> &Arc<MemoryNetDirProvider> {
+        &self.netdir
+    }
+
+    /// The settings this client was built with.
+    pub fn config(&self) -> &Arc<TorConfig> {
+        &self.config
     }
 }
 
-/// Build a `TorClientConfig` that uses `storage` and an in-memory keystore.
+/// A stream that ticks whenever a new consensus arrives.
 ///
-/// Everything else is Arti's default, which means the real Tor network, the
-/// built-in directory authorities and no bridges. Notably this does *not* read
-/// `arti.toml` or any other configuration file, so a machine-wide Arti or
-/// C Tor setup cannot change what this client does.
-fn ephemeral_config(storage: &EphemeralStorage) -> Result<TorClientConfig> {
-    let mut builder = TorClientConfig::builder();
-
-    builder
-        .storage()
-        .state_dir(CfgPath::new_literal(storage.state_dir()))
-        .cache_dir(CfgPath::new_literal(storage.cache_dir()));
-
-    // The onion service identity key is generated on first launch and only
-    // ever exists in this process's memory.
-    builder
-        .storage()
-        .keystore()
-        .primary()
-        .kind(ExplicitOrAuto::Explicit(ArtiKeystoreKind::Ephemeral));
-
-    builder
-        .build()
-        .context("failed to build the Tor client configuration")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bootstrap_progress_is_throttled_but_a_blockage_is_not() {
-        let now = Instant::now();
-        let mut reporter = ProgressReporter::default();
-
-        // Nothing said yet: the first status always earns a line, so the wait
-        // is never silent at the start.
-        assert!(reporter.emit(false, "15%".to_string(), now));
-        // Too soon, and then far enough apart to be worth another line.
-        assert!(!reporter.emit(false, "20%".to_string(), now + REPORT_INTERVAL / 2));
-        assert!(reporter.emit(false, "20%".to_string(), now + REPORT_INTERVAL));
-        // Arti re-reporting the same status is not news at any distance.
-        assert!(!reporter.emit(false, "20%".to_string(), now + REPORT_INTERVAL * 10));
-
-        // "This machine cannot reach Tor at all" is the one thing worth
-        // breaking the throttle for: it is the difference between slow and
-        // stuck, and only one of those is worth waiting out.
-        assert!(reporter.emit(true, "stuck at 20%".to_string(), now + REPORT_INTERVAL * 10));
-    }
-
-    #[test]
-    fn config_builds_from_ephemeral_storage() {
-        let storage = EphemeralStorage::new().unwrap();
-        // `state_dir`/`cache_dir` are not readable back off `TorClientConfig`,
-        // so all this can check is that the paths are accepted at all. The
-        // storage tests cover where those paths point.
-        ephemeral_config(&storage).unwrap();
-    }
-
-    #[test]
-    fn config_selects_the_in_memory_keystore() {
-        let storage = EphemeralStorage::new().unwrap();
-        let config = ephemeral_config(&storage).unwrap();
-
-        assert_eq!(
-            config.keystore().primary_kind(),
-            Some(ArtiKeystoreKind::Ephemeral)
-        );
-    }
+/// The onion-service client uses this to expire cached descriptors: a new
+/// consensus is a moment when it is already doing work, so it is a good moment
+/// to do a little more.
+fn housekeeping(netdir: &Arc<MemoryNetDirProvider>) -> BoxStream<'static, ()> {
+    netdir
+        .events()
+        .filter_map(|event| async move {
+            match event {
+                DirEvent::NewConsensus => Some(()),
+                _ => None,
+            }
+        })
+        .boxed()
 }

@@ -221,21 +221,45 @@ the whole line `serve` prints.
 
 #### How the Tor Client Is Set Up
 
-Each process runs its own Arti client that reads no configuration file and
-never touches a system Tor or an existing `~/.local/share/arti`. The service
-identity key lives only in Arti's in-memory keystore, so every `send` or `serve`
-gets a new address and there is no key on disk to lose. Arti still requires filesystem
-paths for its directory cache and client state (fully in-memory state is
-[arti#1186](https://gitlab.torproject.org/tpo/core/arti/-/work_items/1186), not
-scheduled), so those go in a private directory under `/dev/shm` — a tmpfs, so in
-RAM — falling back to the platform temp directory off Linux. That tree is
-deleted on a graceful shutdown: `send` and `serve` unwind on Ctrl-C or
-`SIGTERM`, and `receive` and `connect` on returning. A process killed outright leaves it behind until the
-next reboot (or the platform's temp-directory cleanup off Linux).
+Each process runs its own Tor client that reads no configuration file and never
+touches a system Tor or an existing `~/.local/share/arti`. It writes nothing,
+anywhere: the directory, the guard and vanguard state, and the onion service's
+identity key are all ordinary values in the process's memory. There is no
+storage to clean up, so a process killed outright leaves nothing behind, and
+the behaviour is identical on every platform.
+
+That takes some assembly, because `arti-client` cannot do it. Two crates in
+Arti require a filesystem and expose no seam to replace it: `tor-dirmgr` keeps
+the directory in a SQLite database plus a `dir_blobs/` directory, and
+`tor-hsservice` keeps onion-service state through `tor_persist::StateDirectory`,
+a concrete type whose `raw_subdir` hands out real files. Fully in-memory
+operation is [arti#1186](https://gitlab.torproject.org/tpo/core/arti/-/work_items/1186),
+which is not scheduled upstream. So this crate uses the layers *below* those
+two, each of which takes its storage as a trait:
+
+- `tor-chanmgr`, `tor-guardmgr`, `tor-circmgr` and `tor-hsclient` are Arti's,
+  unchanged. The guard and vanguard managers take any `tor_persist::StateMgr`,
+  so they get an in-memory one (`src/tor/memstate.rs`). Keeping `tor-chanmgr`
+  also keeps relay authentication Arti's: Tor relays present self-signed
+  certificates and are identified by the CERTS cell instead, so replacing that
+  layer would mean writing a certificate verifier that accepts anything.
+- The directory is downloaded and validated here (`src/tor/netdir.rs`) and
+  served through `tor_netdir::NetDirProvider` from an `RwLock`. The checks are
+  the ones Arti's own directory manager makes, in the same order: the consensus
+  must be timely, it must be signed by enough directory authorities from Arti's
+  built-in list, every authority certificate is signature- and lifetime-checked
+  before it may vouch for anything, and a microdescriptor is only accepted if
+  the consensus asked for its digest. `tor-netdoc`'s `dangerously_assume_timely`
+  and `dangerously_assume_wellsigned` escape hatches are not used.
+- The onion service is implemented here (`src/tor/service.rs`) on `tor-proto`:
+  identity key, `ESTABLISH_INTRO`, descriptor signing and upload, and the
+  `INTRODUCE2` → `RENDEZVOUS1` handshake. Introductions already answered are
+  remembered in memory, which is the replay defence `tor-hsservice` writes to
+  a per-introduction-point log on disk.
 
 Because nothing is cached between runs, every command bootstraps the Tor
-directory from scratch; expect several seconds before the serving side prints an
-address and up to a minute more before it prints `ready`.
+directory from scratch; expect around a minute before the serving side prints an
+address and a little more before it prints `ready`.
 
 ## Protocol Compatibility
 

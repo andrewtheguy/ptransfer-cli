@@ -9,26 +9,29 @@
 //!   one-time password, and the receiver needs nothing else to connect,
 //!   authenticate, and pull the file.
 //!
-//! The Arti client is deliberately not wired to the machine's Tor setup. It
-//! reads no configuration file, and its directory cache, client state and
-//! keystore all live in throwaway storage that disappears with the process —
-//! see [`storage`] for exactly how in-memory each of those is.
+//! The Tor client is deliberately not wired to the machine's Tor setup. It
+//! reads no configuration file and shares nothing with a system Tor or an
+//! existing `~/.local/share/arti`. It also writes nothing anywhere: the
+//! directory ([`netdir`]), the guard and vanguard state ([`memstate`]) and the
+//! onion-service keys ([`service`]) are ordinary values in this process's
+//! memory, so they need no cleanup and cannot outlive it.
 
 pub mod client;
+pub mod config;
 pub mod echo;
 pub mod handshake;
+pub mod memstate;
+pub mod netdir;
 pub mod service;
-pub mod storage;
 pub mod transfer;
 pub mod wire;
 
-pub use client::EphemeralTorClient;
+pub use client::TorClient;
 pub use service::OnionListener;
-pub use storage::EphemeralStorage;
 
 use anyhow::{Context, Result};
 use safelog::DisplayRedacted as _;
-use tor_hsservice::HsId;
+use tor_hscrypto::pk::HsId;
 
 /// Virtual port both onion services listen on. Onion services have their own
 /// port space, so this collides with nothing on either machine, and a process
@@ -41,10 +44,10 @@ pub const DEFAULT_PORT: u16 = 9735;
 /// A port in the address wins over `default_port`, so the line the serving side
 /// prints can be pasted straight into the connecting side.
 ///
-/// The host has to be a v3 `.onion` address, checksum and all. Arti would
-/// otherwise happily resolve anything else through an exit node, so a typo
-/// that drops the suffix would leave the onion network and reach the plain
-/// internet from this machine's Tor circuit.
+/// The host has to be a v3 `.onion` address, checksum and all. Nothing else is
+/// a thing this transport can reach: it only ever builds onion-service
+/// circuits, so a typo that drops the suffix has to be refused here rather
+/// than turning into a connection to somewhere else.
 ///
 /// The host comes back in `HsId`'s canonical spelling, which is what both peers
 /// bind their handshake to: two peers that typed the same address in different
@@ -107,9 +110,10 @@ pub fn is_disconnect(err: &std::io::Error) -> bool {
 
 /// Resolve when the process is asked to stop.
 ///
-/// A signal is how a serving command is meant to be stopped, so it unwinds
-/// normally: the throwaway storage is only removed by its destructor, which a
-/// signal-killed process never runs.
+/// A signal is how a serving command is meant to be stopped. Nothing has to be
+/// cleaned up on the way out — there is no storage to remove — but unwinding
+/// normally lets the onion service tell its introduction points it is going
+/// away, instead of leaving them to time it out.
 #[cfg(unix)]
 pub async fn shutdown_signal() -> std::io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};

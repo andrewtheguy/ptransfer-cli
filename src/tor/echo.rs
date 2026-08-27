@@ -9,13 +9,13 @@
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, AsyncWriteExt, BufReader};
-use arti_client::DataStream;
+use tor_proto::client::stream::DataStream;
 
-use super::client::EphemeralTorClient;
+use super::client::TorClient;
 use super::service::OnionListener;
 use super::{display_address, is_disconnect, shutdown_signal, split_address};
 
-/// Keystore nickname for the echo service.
+/// Name for the echo service, used only in this process's own logging.
 const NICKNAME: &str = "ptransfer-poc";
 
 /// Total bytes either side will read from one connection. A cap keeps a peer
@@ -27,7 +27,7 @@ const MAX_CONNECTION_BYTES: u64 = 64 * 1024;
 /// Prints the `.onion` address to stdout as soon as it is known, then a
 /// readiness line once the descriptor is published; progress goes to the log.
 pub async fn serve(port: u16) -> Result<()> {
-    let tor = EphemeralTorClient::bootstrap().await?;
+    let tor = TorClient::bootstrap().await?;
     let mut listener = OnionListener::launch(&tor, NICKNAME)?;
 
     println!("{}", display_address(listener.onion(), port));
@@ -40,12 +40,12 @@ pub async fn serve(port: u16) -> Result<()> {
 
     loop {
         let stream = tokio::select! {
-            // A signal is how this command is meant to be stopped, so unwind
-            // normally: the throwaway storage is only removed by its
-            // destructor, which a signal-killed process never runs.
+            // Unwinding lets the service tell its introduction points it is
+            // going away. Nothing has to be cleaned up: the client only ever
+            // existed in this process's memory.
             result = shutdown_signal() => {
                 result.context("failed to listen for a shutdown signal")?;
-                log::info!("shutting down and removing the Tor client state");
+                log::info!("shutting down");
                 return Ok(());
             }
             accepted = listener.accept(port) => match accepted? {
@@ -107,12 +107,11 @@ pub async fn connect(address: &str, port: u16, message: &str) -> Result<String> 
     // tens of seconds fetching a directory only to reject the address
     // afterwards.
     let (host, port) = split_address(address, port)?;
-    let tor = EphemeralTorClient::bootstrap().await?;
+    let tor = TorClient::bootstrap().await?;
 
     log::info!("connecting to {host}:{port}");
     let stream = tor
-        .client()
-        .connect((host.as_str(), port))
+        .connect(&host, port)
         .await
         .with_context(|| format!("failed to connect to {host}:{port}"))?;
 
@@ -147,13 +146,3 @@ pub async fn connect(address: &str, port: u16, message: &str) -> Result<String> 
     Ok(reply.trim_end_matches('\n').to_owned())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tor_hsservice::HsNickname;
-
-    #[test]
-    fn the_nickname_is_a_valid_slug() {
-        HsNickname::new(NICKNAME.to_owned()).unwrap();
-    }
-}

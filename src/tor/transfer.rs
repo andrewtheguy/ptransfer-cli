@@ -25,12 +25,12 @@ use crate::ui;
 use crate::util::{OnConflict, format_bytes, resolve_destination};
 use crate::wire::TransferMetadata;
 
-use super::client::EphemeralTorClient;
+use super::client::TorClient;
 use super::handshake::{
     ClientHandshake, ServiceHandshake, run_client_handshake, run_service_handshake, send_cancel,
     send_ready,
 };
-use arti_client::DataStream;
+use tor_proto::client::stream::DataStream;
 
 use super::service::OnionListener;
 use super::wire::TorMessenger;
@@ -60,9 +60,9 @@ pub const SUGGESTED_MAX_BYTES: u64 = 1024 * 1024;
 /// are what actually add up.
 const MAX_WIRE_BYTES: u64 = MAX_TRANSFER_BYTES + 1024 * 1024;
 
-/// Keystore nickname for the transfer service. With the in-memory keystore
-/// there is only ever one service per process and no key to look up again
-/// later, so the name is fixed.
+/// Name for the transfer service, used only in this process's own logging.
+/// There is one service per process and its key is never stored, so nothing
+/// ever has to look it up again by name.
 const NICKNAME: &str = "ptransfer-transfer";
 
 /// How long the sender waits for a receiver that can authenticate.
@@ -133,7 +133,7 @@ pub async fn send(paths: Vec<PathBuf>, port: u16) -> Result<()> {
     }
     let password = generate_pin()?;
 
-    let tor = EphemeralTorClient::bootstrap().await?;
+    let tor = TorClient::bootstrap().await?;
     ui::status("Launching the onion service...");
     let mut listener = OnionListener::launch(&tor, NICKNAME)?;
     // Two spellings of one address: the canonical form the handshake binds,
@@ -343,15 +343,14 @@ pub async fn receive(
     // Exactly the string the sender binds its side of the handshake to.
     let onion = format!("{host}:{port}");
 
-    let tor = EphemeralTorClient::bootstrap().await?;
+    let tor = TorClient::bootstrap().await?;
     ui::status(&format!(
         "Connecting to {}...",
         display_address(&host, port)
     ));
     let step = Instant::now();
     let stream = tor
-        .client()
-        .connect((host.as_str(), port))
+        .connect(&host, port)
         .await
         .with_context(|| format!("failed to connect to {onion}"))?;
     ui::status_timed("Connected to the onion service", step.elapsed());
