@@ -13,6 +13,7 @@ use ratatui::style::Stylize;
 use ratatui::widgets::Paragraph;
 
 use crate::crypto::pin::{PIN_LENGTH, is_valid_pin, pin_char};
+use crate::ui::Direction;
 
 use super::dir_picker::{DirPicker, DirPickerStep};
 use super::file_browser::{Browser, BrowserStep};
@@ -25,9 +26,28 @@ pub enum WizardPlan {
     ReceivePin { pin: String, output: PathBuf },
 }
 
+/// The transfer modes, in the pTransfer web app's order, so an option's
+/// number means the same thing in both interfaces.
+const MODES: [&str; 2] = ["PIN Exchange", "Code Exchange"];
+
+/// One line of explanation per entry in [`MODES`].
+const MODE_HINTS: [&str; 2] = [
+    "A short PIN over relays, then a direct WebRTC transfer.",
+    "Hand-carried connection codes. Not implemented in the CLI yet.",
+];
+
+const CODE_EXCHANGE_UNAVAILABLE: &str =
+    "Code Exchange is not implemented in the CLI yet — use PIN Exchange.";
+
 enum Screen {
     MainMenu {
         selected: usize,
+    },
+    ModeMenu {
+        direction: Direction,
+        selected: usize,
+        /// Set when the highlighted mode cannot be started, cleared on move.
+        notice: Option<String>,
     },
     FileBrowser(Browser),
     OutputDir {
@@ -82,14 +102,19 @@ pub async fn run_wizard(terminal: &mut DefaultTerminal) -> Result<Option<WizardP
 fn handle_key(screen: Screen, key: KeyEvent) -> Step {
     match screen {
         Screen::MainMenu { selected } => main_menu_key(selected, key),
+        Screen::ModeMenu {
+            direction,
+            selected,
+            ..
+        } => mode_menu_key(direction, selected, key),
         Screen::FileBrowser(mut browser) => match browser.handle_key(key) {
             BrowserStep::Stay => Step::Continue(Screen::FileBrowser(browser)),
-            BrowserStep::Back => Step::Continue(Screen::MainMenu { selected: 0 }),
+            BrowserStep::Back => Step::Continue(mode_menu(Direction::Send)),
             BrowserStep::Confirm => Step::Finish(WizardPlan::SendPin(browser.selection())),
         },
         Screen::OutputDir { mut picker } => match picker.handle_key(key) {
             DirPickerStep::Stay => Step::Continue(Screen::OutputDir { picker }),
-            DirPickerStep::Back => Step::Continue(Screen::MainMenu { selected: 1 }),
+            DirPickerStep::Back => Step::Continue(mode_menu(Direction::Receive)),
             DirPickerStep::Choose(output) => Step::Continue(Screen::PinEntry {
                 output,
                 input: String::new(),
@@ -117,19 +142,59 @@ fn menu_move(selected: usize, len: usize, key: &KeyEvent) -> usize {
 fn main_menu_key(selected: usize, key: KeyEvent) -> Step {
     match key.code {
         KeyCode::Enter => match selected {
-            0 => match Browser::new() {
-                Ok(browser) => Step::Continue(Screen::FileBrowser(browser)),
-                Err(_) => Step::Continue(Screen::MainMenu { selected }),
-            },
-            1 => match DirPicker::new() {
-                Ok(picker) => Step::Continue(Screen::OutputDir { picker }),
-                Err(_) => Step::Continue(Screen::MainMenu { selected }),
-            },
+            0 => Step::Continue(mode_menu(Direction::Send)),
+            1 => Step::Continue(mode_menu(Direction::Receive)),
             _ => Step::Quit,
         },
         KeyCode::Esc | KeyCode::Char('q') => Step::Quit,
         _ => Step::Continue(Screen::MainMenu {
             selected: menu_move(selected, 3, &key),
+        }),
+    }
+}
+
+/// The mode menu for `direction`, with the first mode highlighted.
+fn mode_menu(direction: Direction) -> Screen {
+    Screen::ModeMenu {
+        direction,
+        selected: 0,
+        notice: None,
+    }
+}
+
+fn mode_menu_key(direction: Direction, selected: usize, key: KeyEvent) -> Step {
+    let stay = |notice: Option<String>| {
+        Step::Continue(Screen::ModeMenu {
+            direction,
+            selected,
+            notice,
+        })
+    };
+
+    match key.code {
+        // Only PIN Exchange starts a transfer; the rest is a placeholder that
+        // keeps the CLI's mode numbering aligned with the web app's.
+        KeyCode::Enter => match (selected, direction) {
+            (0, Direction::Send) => match Browser::new() {
+                Ok(browser) => Step::Continue(Screen::FileBrowser(browser)),
+                Err(_) => stay(None),
+            },
+            (0, Direction::Receive) => match DirPicker::new() {
+                Ok(picker) => Step::Continue(Screen::OutputDir { picker }),
+                Err(_) => stay(None),
+            },
+            _ => stay(Some(CODE_EXCHANGE_UNAVAILABLE.to_string())),
+        },
+        KeyCode::Esc => Step::Continue(Screen::MainMenu {
+            selected: match direction {
+                Direction::Send => 0,
+                Direction::Receive => 1,
+            },
+        }),
+        _ => Step::Continue(Screen::ModeMenu {
+            direction,
+            selected: menu_move(selected, MODES.len(), &key),
+            notice: None,
         }),
     }
 }
@@ -221,6 +286,13 @@ fn handle_paste(screen: Screen, pasted: &str) -> Step {
     })
 }
 
+fn direction_title(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Send => "send",
+        Direction::Receive => "receive",
+    }
+}
+
 fn draw(f: &mut Frame, screen: &mut Screen) {
     match screen {
         Screen::MainMenu { selected } => {
@@ -240,6 +312,29 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
                 *selected,
             );
             widgets::key_hints(f, inner, "↑/↓ move · Enter select · q quit");
+        }
+
+        Screen::ModeMenu {
+            direction,
+            selected,
+            notice,
+        } => {
+            let inner = widgets::screen_frame(f, direction_title(*direction));
+            let area = widgets::centered(inner, 60, 7);
+            let [title, _, list, extra] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(MODES.len() as u16),
+                Constraint::Fill(1),
+            ])
+            .areas(area);
+            f.render_widget(Paragraph::new("How do you want to connect?"), title);
+            widgets::menu(f, list, &MODES, *selected);
+            match notice {
+                Some(notice) => widgets::error_line(f, extra, notice),
+                None => f.render_widget(Paragraph::new(MODE_HINTS[*selected]).dim(), extra),
+            }
+            widgets::key_hints(f, inner, "↑/↓ move · Enter select · Esc back");
         }
 
         Screen::FileBrowser(browser) => {
@@ -288,6 +383,48 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::from(code)
+    }
+
+    #[test]
+    fn code_exchange_reports_that_it_is_not_implemented() {
+        let step = mode_menu_key(Direction::Send, 1, press(KeyCode::Enter));
+
+        let Step::Continue(Screen::ModeMenu {
+            selected, notice, ..
+        }) = step
+        else {
+            panic!("Code Exchange should stay on the mode menu");
+        };
+        assert_eq!(selected, 1);
+        assert_eq!(notice.as_deref(), Some(CODE_EXCHANGE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn moving_off_a_notice_clears_it() {
+        let step = mode_menu_key(Direction::Send, 1, press(KeyCode::Up));
+
+        let Step::Continue(Screen::ModeMenu {
+            selected, notice, ..
+        }) = step
+        else {
+            panic!("expected the mode menu");
+        };
+        assert_eq!(selected, 0);
+        assert!(notice.is_none());
+    }
+
+    #[test]
+    fn escaping_the_mode_menu_reselects_its_direction() {
+        let Step::Continue(Screen::MainMenu { selected }) =
+            mode_menu_key(Direction::Receive, 0, press(KeyCode::Esc))
+        else {
+            panic!("Esc should return to the main menu");
+        };
+        assert_eq!(selected, 1);
+    }
 
     #[test]
     fn pasted_pin_replaces_input_and_filters_unsupported_characters() {

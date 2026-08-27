@@ -11,7 +11,10 @@ the spec wins.
 
 The web app's Code Exchange — hand-carried QR/clipboard offer and answer codes —
 is deliberately outside that contract while it is still taking shape, and is not
-implemented here. PIN exchange is the CLI's only signaling mode.
+implemented here. PIN exchange is the CLI's only signaling mode. The wizard's
+mode menu still lists Code Exchange in the web app's position, so a mode's
+number means the same thing in both interfaces; selecting it reports that it is
+not implemented and goes no further.
 
 ## PIN Exchange
 

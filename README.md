@@ -99,10 +99,15 @@ arguments at all:
 ptransfer
 ```
 
-The wizard covers everything interactively: choose send or receive, pick files
-and/or folders in the built-in browser (Space to multi-select), and when
-receiving, browse to the output directory (or create a new folder with `n`)
-and enter the PIN. Transfers run inside the TUI with live status and progress.
+The wizard covers everything interactively: choose send or receive, choose the
+transfer mode, pick files and/or folders in the built-in browser (Space to
+multi-select), and when receiving, browse to the output directory (or create a
+new folder with `n`) and enter the PIN. Transfers run inside the TUI with live
+status and progress.
+
+The mode menu lists the same modes in the same order as the web app's transfer
+mode selector, so an option's position means the same thing in both. Only PIN
+Exchange is implemented; picking Code Exchange says so and stays on the menu.
 
 ### Non-Interactive Test Mode
 
