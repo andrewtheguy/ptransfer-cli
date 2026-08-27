@@ -198,60 +198,50 @@ rather than route file bytes through a relay.
 
 ## Anonymous Signaling
 
-Behind the same non-default `tor` cargo feature, and experimental. The shared
-specification is the web app's
-[`docs/ANONYMOUS_SIGNALING.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/ANONYMOUS_SIGNALING.md);
-like the Tor transport it sits outside `INTEROP_PROTOCOL.md`, which is why an
+Behind the same non-default `tor` cargo feature, and experimental. The
+normative specification is the web app's
+[`docs/ANONYMOUS_SIGNALING.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/ANONYMOUS_SIGNALING.md):
+the PIN's length carrying the mode, the relay pool, the URL policy and the
+privacy boundary are defined there, once, for both implementations. Like the
+Tor transport it sits outside `INTEROP_PROTOCOL.md`, which is why an
 implementation of that document alone must refuse a PIN of any other length
 rather than guess. Either side of a transfer may be this CLI or a browser tab.
 
-It is PIN Exchange with one thing changed: the relay sockets. Every event,
-subscription, signature, SPAKE2 exchange, and sealed payload above the socket is
-the code the clearnet path runs, so `src/signaling/anonymous.rs` adds only a
-`WebSocketTransport` — the seam `nostr-sdk`'s relay pool already exposes — whose
-sockets are WebSocket handshakes run inside onion streams opened by the Tor
-client in `src/tor/client.rs`. Frames are `tokio-tungstenite`'s, capped at 1 MiB
-per message; a binary frame is a protocol error rather than a silent drop.
+This section describes only what is specific to the CLI's realization of it.
 
-**The PIN's length carries the mode.** The two sides only find each other on a
-shared relay and the two pools are disjoint, so both have to agree — and the PIN
-is the only thing the sender hands over. Turning the option on mints a
-16-character PIN instead of a 12-character one and the receiver reads the mode
-off the length (`PinKind`, `classify_pin`). Nothing else about a PIN changes:
-same alphabet, same weighted checksum, same rotation buckets, same
-three-character locator, so the published hint derivation is identical and the
-four extra characters are secret data. Two lengths four apart cannot be bridged
-by a single typo, and the checksum covers the rest — a mistyped PIN is rejected
-rather than reinterpreted as the other kind. There is no receive-side flag, and
-the Tor transport's one-time password is checked against the ordinary length
-alone, since it selects no relay pool.
+**Only the relay sockets are new.** Every event, subscription, signature,
+SPAKE2 exchange and sealed payload above the socket is the code the clearnet
+path runs, so `src/signaling/anonymous.rs` adds only a `WebSocketTransport` —
+the seam `nostr-sdk`'s relay pool already exposes — whose sockets are WebSocket
+handshakes run inside onion streams opened by the Tor client in
+`src/tor/client.rs`. Frames are `tokio-tungstenite`'s, capped at 1 MiB per
+message; a binary frame is a protocol error rather than a silent drop.
 
-**A separate pool, and it is onion services.** `ANONYMOUS_SIGNALING_RELAYS` must
-stay identical to the web app's. `normalize_onion_relay_url` is the mirror image
-of what a clearnet relay URL has to be: only `ws://<v3 address>.onion`, checksum
-included, with `wss://` and every clearnet host refused — TLS inside a circuit
-already authenticated by the key the address commits to would add nothing
-checkable, while refusing clearnet is what guarantees this path cannot open a
-socket that would see the device's IP address. Arti routes a non-onion host
-through an exit node, so the address is parsed as an `HsId` rather than
-pattern-matched.
+**Where the mode is read.** `PinKind` and `classify_pin` in `src/crypto/pin.rs`
+turn the PIN's length into the pool `NostrClient::connect` dials; nothing else
+in the CLI decides it and there is no receive-side flag. `test send
+--anonymous` mints the longer PIN. A build without the `tor` feature still
+recognizes such a PIN and says what is missing, rather than rejecting it as
+malformed. The Tor transfer mode's one-time password selects no relay pool, so
+it is checked against the ordinary length alone.
+
+**Where the URL policy is enforced.** `normalize_onion_relay_url` is applied to
+every pool entry before a socket is opened, and it parses the address as an
+Arti `HsId` rather than pattern-matching for `.onion` — Arti routes a non-onion
+host through an exit node, so this check is what stands between a bad pool
+entry and a socket that sees the device's IP address.
 
 **Timeouts and failure reporting.** A relay socket gets 180 seconds rather than
 3: it is a whole rendezvous — an HSDir descriptor fetch, an introduction circuit
 and a rendezvous circuit — and every socket pays for its own, which is why the
-pool is kept small. The wait is for *any* relay to connect, not all of them, and
-unlike the clearnet path it is a hard requirement: there is no silent fallback
-to a clearnet socket, so a pool that never opens is reported instead of being
-left for a publish to discover. Failing to reach Tor at all and failing to reach
-a relay through it are separate errors, because they are separate problems — the
-pool is community-maintained and monitored by nobody.
-
-**What it does and does not hide.** It removes the relays' view of both devices'
-IP addresses. It does not hide one from the other WebRTC peer or from STUN:
-**file data never goes through Tor**, it takes the same direct data channel as
-any other PIN Exchange transfer. Nostr events remain end-to-end protected
-exactly as before; Tor adds transport-level network privacy and replaces
-nothing.
+pool is kept small. The wait is for *any* relay to connect, and unlike the
+clearnet path it is a hard requirement: there is no silent fallback to a
+clearnet socket, so a pool that never opens is reported instead of being left
+for a publish to discover. Failing to reach Tor at all and failing to reach a
+relay through it are separate errors, because they are separate problems.
+Publishes go to the relays that have a socket open, so one relay that is still
+connecting cannot hold every event for its `OK` timeout after another relay has
+already accepted it.
 
 ## Tor Onion Transport
 
