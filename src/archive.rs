@@ -43,6 +43,17 @@ pub struct SendSource {
     /// the progress bar — never the wire length, which no source knows before
     /// it has been produced.
     pub estimated_size: u64,
+    /// An upper bound on what this payload will occupy on the wire, which is
+    /// not `estimated_size`: a single file is deflated (and incompressible
+    /// input comes out slightly *larger*), and a generated ZIP adds a header
+    /// pair and the entry path for every file it contains.
+    ///
+    /// The wire ceiling both peers enforce is a fixed constant, so a selection
+    /// whose bound exceeds it has to be refused while it is still a selection.
+    /// Discovering it while producing bytes means failing after a Tor
+    /// bootstrap and a handshake, and on a transport with no resume that is
+    /// the whole transfer.
+    pub projected_wire_size: u64,
     pub mime_type: &'static str,
     /// How the bytes travel; chosen by flow, never by sniffing content.
     pub wire_encoding: WireEncoding,
@@ -161,10 +172,12 @@ pub fn prepare_send_source_with_cap(inputs: &[PathBuf], cap: u64) -> Result<Send
             .context("Selected input size exceeds the supported range")
     })?;
     check_size_cap(estimated_size, cap)?;
+    let projected_wire_size = project_zip_wire_size(&entries)?;
 
     Ok(SendSource {
         file_name: archive_name,
         estimated_size,
+        projected_wire_size,
         mime_type: "application/zip",
         // The ZIP's entries are already deflated, so the transfer layer must
         // not compress it again.
@@ -192,10 +205,44 @@ fn single_file_source(path: &Path, file_size: u64, cap: u64) -> Result<SendSourc
     Ok(SendSource {
         file_name,
         estimated_size: file_size,
+        projected_wire_size: deflate_upper_bound(file_size),
         mime_type: "application/octet-stream",
         wire_encoding: WireEncoding::DeflateRaw,
         kind: SendSourceKind::File(path.to_path_buf()),
     })
+}
+
+/// The most raw DEFLATE can grow input it cannot compress: five bytes of block
+/// header per 16 KiB stored block, plus a few for the final block. Deliberately
+/// loose — the point is a bound that is never exceeded, not a tight estimate.
+fn deflate_upper_bound(bytes: u64) -> u64 {
+    bytes.saturating_add(bytes.div_ceil(16_383) * 5).saturating_add(64)
+}
+
+/// What one ZIP entry costs beyond its own bytes: a local file header, a
+/// streaming data descriptor, and a central directory record, plus zip64 extra
+/// fields. The entry path is stored twice, so it is counted separately.
+const ZIP_PER_ENTRY_BYTES: u64 = 160;
+/// End-of-central-directory, plus the zip64 records that may precede it.
+const ZIP_TRAILER_BYTES: u64 = 128;
+
+/// An upper bound on the archive a plan will produce. Every entry is deflated
+/// individually, so each contributes its own deflate bound as well as its
+/// share of the ZIP's bookkeeping — which is what makes a selection of many
+/// tiny files cost far more on the wire than the sum of its file sizes.
+fn project_zip_wire_size(entries: &[(String, PathBuf)]) -> Result<u64> {
+    entries
+        .iter()
+        .try_fold(ZIP_TRAILER_BYTES, |total, (key, path)| {
+            let size = fs::metadata(path)
+                .with_context(|| format!("Cannot read {}", path.display()))?
+                .len();
+            total
+                .checked_add(deflate_upper_bound(size))
+                .and_then(|t| t.checked_add(ZIP_PER_ENTRY_BYTES))
+                .and_then(|t| t.checked_add(2 * key.len() as u64))
+                .context("Selected input size exceeds the supported range")
+        })
 }
 
 fn check_size_cap(file_size: u64, cap: u64) -> Result<()> {
@@ -509,6 +556,63 @@ mod tests {
         let (entries, name) = plan_entries(&[a, b]).unwrap();
         assert_stamped_name(&name, "files");
         assert_eq!(keys(&entries), ["a.txt", "b.txt"]); // sorted by key
+    }
+
+    /// A ZIP of many tiny files costs far more on the wire than its input
+    /// bytes, and the projection has to see that — it is the number a
+    /// transport with a fixed wire ceiling refuses the selection on.
+    #[test]
+    fn many_small_entries_project_far_past_their_input_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir(&bundle).unwrap();
+        for i in 0..500 {
+            std::fs::write(bundle.join(format!("entry-{i:04}.txt")), b"x").unwrap();
+        }
+
+        let source = prepare_send_source(&[bundle]).unwrap();
+
+        // 500 bytes of input, but every entry carries two headers and its path
+        // twice. Anything close to `estimated_size` would be the bug this
+        // guards: a selection that passes an input cap and then blows the wire
+        // ceiling after the handshake.
+        assert_eq!(source.estimated_size, 500);
+        assert!(
+            source.projected_wire_size > 100 * source.estimated_size,
+            "projected {} for {} bytes of input",
+            source.projected_wire_size,
+            source.estimated_size
+        );
+    }
+
+    /// The projection is an upper bound, not an estimate: the archive the
+    /// writer actually produces has to fit inside it.
+    #[tokio::test]
+    async fn the_projection_bounds_the_archive_that_is_produced() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..200 {
+            // Incompressible, so deflate grows each entry rather than shrinking
+            // it — the case the bound has to survive.
+            write_bytes(
+                dir.path(),
+                &format!("bundle/noise-{i:03}.bin"),
+                &pseudo_random(i as u64, 2048),
+            );
+        }
+
+        let source = prepare_send_source(&[dir.path().join("bundle")]).unwrap();
+        let mut stream = source.open().await.unwrap();
+        let mut produced = 0u64;
+        while let Some(chunk) = stream.next_chunk().await.unwrap() {
+            produced += chunk.len() as u64;
+        }
+
+        assert!(produced > source.estimated_size, "deflate should have grown it");
+        assert!(
+            produced <= source.projected_wire_size,
+            "produced {produced} bytes, projected only {}",
+            source.projected_wire_size
+        );
     }
 
     #[test]

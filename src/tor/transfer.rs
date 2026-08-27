@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::Instant;
 
 use crate::archive::{SendSource, prepare_send_source_with_cap};
 use crate::crypto::pin::{generate_pin, is_valid_pin};
@@ -29,6 +30,8 @@ use super::handshake::{
     ClientHandshake, ServiceHandshake, run_client_handshake, run_service_handshake, send_cancel,
     send_ready,
 };
+use arti_client::DataStream;
+
 use super::service::OnionListener;
 use super::wire::TorMessenger;
 use super::{shutdown_signal, split_address};
@@ -62,9 +65,14 @@ const MAX_WIRE_BYTES: u64 = MAX_TRANSFER_BYTES + 1024 * 1024;
 /// later, so the name is fixed.
 const NICKNAME: &str = "ptransfer-transfer";
 
-/// How long the sender keeps the service up, from publish to a delivered file.
+/// How long the sender waits for a receiver that can authenticate.
+///
 /// A resource backstop, not a security control: the password is single-use by
-/// convention and the address dies with the process either way.
+/// convention and the address dies with the process either way. It bounds the
+/// *wait*, not a transfer — once a peer has proved it knows the password it is
+/// the receiver, and cutting its transfer off at an arbitrary minute would be
+/// a speed-based size limit in disguise, which this transport deliberately
+/// does not have. What polices a transfer is `run_sender`'s stall window.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// How long an accepted connection may take to authenticate before the sender
@@ -98,6 +106,20 @@ pub async fn send(paths: Vec<PathBuf>, port: u16) -> Result<()> {
         prepare_send_source_with_cap(&paths, MAX_TRANSFER_BYTES)
     })
     .await??;
+    // A ZIP's headers and entry paths are wire bytes that no file size
+    // accounts for, so a selection of many tiny files can pass the input cap
+    // and still not fit. Refusing here costs a moment; finding out while
+    // producing bytes costs a bootstrap, a handshake, and — with no resume —
+    // the whole transfer.
+    if source.projected_wire_size > MAX_WIRE_BYTES {
+        bail!(
+            "This selection needs up to {} on the wire, over the {} the Tor \
+             transport allows. Archive overhead grows with the number of \
+             files; send fewer of them.",
+            format_bytes(source.projected_wire_size),
+            format_bytes(MAX_WIRE_BYTES)
+        );
+    }
     // Advice, not a gate: the transfer goes ahead either way.
     if source.estimated_size > SUGGESTED_MAX_BYTES {
         ui::status(&format!(
@@ -142,9 +164,10 @@ fn describe(source: &SendSource) -> TransferMetadata {
 
 /// Wait for a receiver that can authenticate, then send it the file.
 ///
-/// The shutdown signal and the deadline wrap the whole wait rather than just
-/// the gaps between connections: a peer that opens the port and then says
-/// nothing is exactly when this command most needs to still be interruptible.
+/// The shutdown signal wraps everything, transfer included: Ctrl-C is how this
+/// command is meant to be stopped, and it has to work while bytes are moving.
+/// The deadline does not — it bounds the wait, inside the accept loop, so an
+/// authenticated transfer is never cut off by the clock.
 async fn serve_one_transfer(
     listener: OnionListener,
     port: u16,
@@ -155,25 +178,45 @@ async fn serve_one_transfer(
     ui::status("Waiting for a receiver...");
 
     tokio::select! {
-        // A signal is how this command is meant to be stopped, so unwind
-        // normally: the throwaway Tor storage is only removed by its
-        // destructor, which a signal-killed process never runs.
+        // A signal unwinds normally: the throwaway Tor storage is only removed
+        // by its destructor, which a signal-killed process never runs.
         result = shutdown_signal() => {
             result.context("failed to listen for a shutdown signal")?;
             log::info!("shutting down and removing the Tor client state");
             Ok(())
         }
-        _ = tokio::time::sleep(WAIT_TIMEOUT) => bail!(
-            "No transfer finished within {} minutes. Start a new transfer.",
-            WAIT_TIMEOUT.as_secs() / 60
-        ),
         result = serve_until_sent(listener, port, onion, password, source) => result,
     }
 }
 
+/// Where [`serve_until_sent`] gets its streams from.
+///
+/// A test seam, not an abstraction. The wait deadline lives in the accept loop
+/// and must never end up wrapping a transfer — it once did, and the only way
+/// to hold that line is to drive the loop without an onion service.
+trait StreamSource {
+    type Stream: AsyncRead + AsyncWrite + Unpin + Send;
+
+    fn accept(
+        &mut self,
+        port: u16,
+    ) -> impl Future<Output = Result<Option<Self::Stream>>> + Send;
+}
+
+impl StreamSource for OnionListener {
+    type Stream = DataStream;
+
+    fn accept(
+        &mut self,
+        port: u16,
+    ) -> impl Future<Output = Result<Option<Self::Stream>>> + Send {
+        OnionListener::accept(self, port)
+    }
+}
+
 /// Accept connections until one of them takes the file.
-async fn serve_until_sent(
-    mut listener: OnionListener,
+async fn serve_until_sent<L: StreamSource>(
+    mut listener: L,
     port: u16,
     onion: &str,
     password: &str,
@@ -181,9 +224,22 @@ async fn serve_until_sent(
 ) -> Result<()> {
     let metadata = describe(source);
     let mut failures = 0u32;
+    let deadline = Instant::now() + WAIT_TIMEOUT;
 
     loop {
-        let Some(stream) = listener.accept(port).await? else {
+        // The deadline covers waiting for a connection, not only the gaps
+        // between them: a service nobody ever reaches is exactly when this
+        // most needs to stop on its own. A connection that authenticates
+        // leaves it behind — see WAIT_TIMEOUT.
+        let accepted = tokio::time::timeout_at(deadline, listener.accept(port))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "No receiver authenticated within {} minutes. Start a new transfer.",
+                    WAIT_TIMEOUT.as_secs() / 60
+                )
+            })??;
+        let Some(stream) = accepted else {
             bail!("the onion service stopped accepting connections");
         };
 
@@ -463,6 +519,85 @@ mod tests {
             error.to_string().contains("went quiet"),
             "unexpected error: {error:#}"
         );
+    }
+
+    /// One stream, then nothing: enough to drive the accept loop once without
+    /// an onion service behind it.
+    struct OneStream(Option<tokio::io::DuplexStream>);
+
+    impl StreamSource for OneStream {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn accept(&mut self, _port: u16) -> Result<Option<Self::Stream>> {
+            match self.0.take() {
+                Some(stream) => Ok(Some(stream)),
+                // The loop must never come back for a second one here: the
+                // first connection is the transfer, and it succeeds.
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    /// The wait deadline bounds the wait, never a transfer.
+    ///
+    /// This is a regression test with a specific history: the deadline once
+    /// raced the whole accept loop, so an authenticated transfer still moving
+    /// bytes was cancelled 30 minutes after the *wait* began. Virtual time
+    /// jumps well past WAIT_TIMEOUT between chunks here while every hand-off
+    /// stays inside the stall window, which is the shape that used to fail.
+    #[tokio::test(start_paused = true)]
+    async fn a_transfer_outlives_the_wait_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("slow.bin");
+        // Several chunks, so there are hand-offs to advance the clock between.
+        let payload: Vec<u8> = (0..400_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&input, &payload).unwrap();
+        let output = dir.path().join("out");
+        std::fs::create_dir(&output).unwrap();
+        let source = prepare_send_source(&[input]).unwrap();
+
+        // Roomy enough that the sender's writes never block, so no stall
+        // window is ever pending while the clock below jumps.
+        let (service_side, client_side) = tokio::io::duplex(4 * 1024 * 1024);
+
+        let received = tokio::spawn(async move {
+            let mut client = TorMessenger::new(client_side);
+            let ClientHandshake { keys, metadata } =
+                run_client_handshake(&mut client, "ABCDEFGHJKLA", ONION)
+                    .await
+                    .unwrap();
+            let dest = output.join(&metadata.file_name);
+            send_ready(&mut client).await.unwrap();
+
+            // Authenticated. From here the peer is the receiver, and the wait
+            // deadline is no longer anything it has to race — so cross it.
+            tokio::time::advance(WAIT_TIMEOUT * 2).await;
+
+            run_receiver(
+                &mut client,
+                &keys.content,
+                &dest,
+                metadata.content_encoding,
+                metadata.file_size,
+                MAX_WIRE_BYTES,
+            )
+            .await
+            .unwrap();
+            dest
+        });
+
+        let sent = serve_until_sent(
+            OneStream(Some(service_side)),
+            9735,
+            ONION,
+            "ABCDEFGHJKLA",
+            &source,
+        )
+        .await;
+
+        sent.expect("the deadline must not cancel an authenticated transfer");
+        let dest = received.await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
     }
 
     #[tokio::test]
