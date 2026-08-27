@@ -98,10 +98,13 @@ impl OnionListener {
                 IncomingStreamRequest::Begin(begin) if begin.port() == port => {}
                 other => {
                     log::debug!("rejecting stream request: {other:?}");
-                    request
-                        .reject(End::new_misc())
-                        .await
-                        .context("failed to reject a stream")?;
+                    // A stream we did not want is not worth the listener over.
+                    // Whoever is waiting here is waiting for one specific peer,
+                    // and anyone can open a stream to a published address, so
+                    // failing to refuse an unwanted one must not end the wait.
+                    if let Err(error) = request.reject(End::new_misc()).await {
+                        log::warn!("failed to reject a stream: {error}");
+                    }
                     continue;
                 }
             }

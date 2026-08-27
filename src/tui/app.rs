@@ -415,19 +415,24 @@ fn tor_entry_key(
                 TorField::Password => password.len(),
             };
         }
-        // The password is a PIN, so it filters exactly like one. The address
-        // takes any printable character and is validated as a whole on submit:
-        // a rejected keystroke with no explanation is worse than a rejected
-        // address with one.
-        KeyCode::Char(c) if field == TorField::Password && password.len() < PIN_LENGTH => {
-            match pin_char(c) {
-                Some(c) => {
-                    password.insert(cursor, c);
-                    cursor += 1;
-                    edited = true;
-                }
-                None => {
-                    error = Some("That character is not supported in a password".to_string())
+        // The password is a PIN, so it filters exactly like one, and a full one
+        // swallows further characters instead of growing. Every `Char` on this
+        // field is handled here: falling through to the shared editor would
+        // insert whatever the filter just rejected. The address takes any
+        // printable character and is validated as a whole on submit: a rejected
+        // keystroke with no explanation is worse than a rejected address with
+        // one.
+        KeyCode::Char(c) if field == TorField::Password => {
+            if password.len() < PIN_LENGTH {
+                match pin_char(c) {
+                    Some(c) => {
+                        password.insert(cursor, c);
+                        cursor += 1;
+                        edited = true;
+                    }
+                    None => {
+                        error = Some("That character is not supported in a password".to_string())
+                    }
                 }
             }
         }
@@ -902,6 +907,31 @@ mod tests {
         };
         assert_eq!(address, "abc-");
         assert!(password.is_empty());
+    }
+
+    #[cfg(feature = "tor")]
+    #[test]
+    fn a_full_tor_password_stops_accepting_characters() {
+        // Regression: past PIN_LENGTH the typing guard failed and the keystroke
+        // fell through to the shared line editor, which inserted it into the
+        // focused field anyway — past the length cap and past the PIN filter.
+        let full = crate::crypto::pin::generate_pin().unwrap();
+        assert_eq!(full.len(), PIN_LENGTH);
+
+        for typed in ['x', '*'] {
+            let Step::Continue(Screen::TorEntry { password, .. }) = tor_entry_key(
+                PathBuf::from("."),
+                "kept.onion".to_string(),
+                full.clone(),
+                TorField::Password,
+                full.len(),
+                None,
+                press(KeyCode::Char(typed)),
+            ) else {
+                panic!("expected the Tor entry screen");
+            };
+            assert_eq!(password, full, "{typed:?} should have been ignored");
+        }
     }
 
     #[cfg(feature = "tor")]
