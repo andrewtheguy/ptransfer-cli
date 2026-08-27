@@ -1,5 +1,5 @@
-//! Message-oriented file transfer over a WebRTC data channel, matching
-//! pTransfer's transfer choreography:
+//! Message-oriented file transfer, matching pTransfer's transfer
+//! choreography:
 //!
 //! - Sender: consume a lazy source in 128 KiB wire chunks, send each as an
 //!   encrypted binary message (index 0..N-1), then send the text message
@@ -11,7 +11,12 @@
 //! There is no positional write path. No payload's wire length is known during
 //! signaling — a single file is deflated on the fly and a ZIP is generated
 //! while it is sent — so a chunk index can never be turned into a file offset.
+//!
+//! The choreography is the same on both transports, so it runs against any
+//! [`Messenger`]: a WebRTC data channel is message-oriented natively, and a
+//! Tor onion stream is made so by the framing in [`crate::tor::wire`].
 
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -22,12 +27,34 @@ use tokio::io::AsyncWriteExt;
 
 use crate::archive::SendSource;
 use crate::crypto::chunk::{
-    ENCRYPTION_CHUNK_SIZE, MAX_MESSAGE_SIZE, NONCE_LEN, TAG_LEN, decrypt_chunk, encrypt_chunk,
-    parse_chunk_message,
+    ENCRYPTION_CHUNK_SIZE, NONCE_LEN, TAG_LEN, decrypt_chunk, encrypt_chunk, parse_chunk_message,
 };
 use crate::ui::{self, Direction};
-use crate::webrtc::common::DcMessenger;
 use crate::wire::{Inflater, WireEncoding};
+
+/// One message on a message-oriented transport: an encrypted content chunk, or
+/// one of the `DONE`/`ACK` control strings.
+#[derive(Debug, Clone)]
+pub struct TransferMessage {
+    pub is_string: bool,
+    pub data: Bytes,
+}
+
+/// A reliable, ordered, message-oriented transport the choreography runs over.
+///
+/// Every payload appends in arrival order and only the final chunk may be
+/// short, so an implementation that reorders or drops messages breaks the
+/// transfer rather than degrading it.
+pub trait Messenger: Send {
+    /// The next message, or `None` once the transport is closed.
+    fn recv(&mut self) -> impl Future<Output = Option<TransferMessage>> + Send;
+
+    /// Send one binary message. Implementations apply backpressure here.
+    fn send_binary(&mut self, data: Bytes) -> impl Future<Output = Result<()>> + Send;
+
+    /// Send one control string.
+    fn send_text(&mut self, text: String) -> impl Future<Output = Result<()>> + Send;
+}
 
 /// How long the sender waits for the receiver's `ACK` after `DONE`.
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -38,10 +65,16 @@ const MAX_CHUNKS: u64 = 0x10000;
 
 /// Consume `source`, encrypt it chunk by chunk, and send it over `messenger`.
 /// Compression and ZIP generation begin only when the source is opened here.
-pub async fn run_sender(
-    messenger: &mut DcMessenger,
+///
+/// `max_bytes` bounds the wire bytes this transport allows. It is the
+/// transport's ceiling, not the selection's: the source was already checked
+/// against its input size, but a generated ZIP's wire length is only known as
+/// it is produced.
+pub async fn run_sender<M: Messenger>(
+    messenger: &mut M,
     key: &[u8; 32],
     source: &SendSource,
+    max_bytes: u64,
 ) -> Result<()> {
     // `sent` counts *wire* bytes against an *input*-byte total, so a deflated
     // payload's bar undershoots and then snaps to 100% at DONE, exactly as it
@@ -62,7 +95,7 @@ pub async fn run_sender(
         let next_sent = sent
             .checked_add(chunk.len() as u64)
             .context("generated payload size exceeds the supported range")?;
-        if next_sent > MAX_MESSAGE_SIZE {
+        if next_sent > max_bytes {
             bail!("Generated payload exceeds the transfer size limit");
         }
 
@@ -100,7 +133,7 @@ pub async fn run_sender(
     wait_for_ack(messenger).await
 }
 
-async fn wait_for_ack(messenger: &mut DcMessenger) -> Result<()> {
+async fn wait_for_ack<M: Messenger>(messenger: &mut M) -> Result<()> {
     let recv_ack = async {
         loop {
             match messenger.recv().await {
@@ -125,13 +158,16 @@ async fn wait_for_ack(messenger: &mut DcMessenger) -> Result<()> {
 ///
 /// `estimated_bytes` is the sender's advertised input size — a progress hint
 /// only, never a bound: the wire length is unknown until `DONE` seals it.
+/// `max_bytes` is the bound, applied to the wire bytes as they arrive and to
+/// the inflated output.
 /// Writes go to `<dest>.part` and are atomically renamed on success.
-pub async fn run_receiver(
-    messenger: &mut DcMessenger,
+pub async fn run_receiver<M: Messenger>(
+    messenger: &mut M,
     key: &[u8; 32],
     dest: &Path,
     encoding: WireEncoding,
     estimated_bytes: u64,
+    max_bytes: u64,
 ) -> Result<()> {
     let part_path = dest.with_extension(match dest.extension().and_then(|e| e.to_str()) {
         Some(ext) => format!("{ext}.part"),
@@ -144,7 +180,7 @@ pub async fn run_receiver(
     // Bound the *inflated* output, not the wire bytes: a deflate bomb is small
     // on the wire by construction.
     let mut inflater = match encoding {
-        WireEncoding::DeflateRaw => Some(Inflater::new(MAX_MESSAGE_SIZE)),
+        WireEncoding::DeflateRaw => Some(Inflater::new(max_bytes)),
         WireEncoding::Identity => None,
     };
     let mut received_count = 0u64;
@@ -166,8 +202,8 @@ pub async fn run_receiver(
 
             if msg.is_string {
                 let text = String::from_utf8_lossy(&msg.data);
-                let (final_chunks, final_bytes) =
-                    parse_done(&text).with_context(|| format!("invalid DONE message: {text:?}"))?;
+                let (final_chunks, final_bytes) = parse_done(&text, max_bytes)
+                    .with_context(|| format!("invalid DONE message: {text:?}"))?;
                 if final_chunks != received_count {
                     bail!(
                         "sender reported {final_chunks} chunks after {received_count} were received"
@@ -221,7 +257,7 @@ pub async fn run_receiver(
             let next_received_bytes = received_bytes
                 .checked_add(expect_plain as u64)
                 .context("transfer size exceeds the supported range")?;
-            if next_received_bytes > MAX_MESSAGE_SIZE {
+            if next_received_bytes > max_bytes {
                 bail!("Transfer exceeds the supported size limit");
             }
 
@@ -282,11 +318,11 @@ pub async fn run_receiver(
         .with_context(|| format!("Failed to move into place: {}", dest.display()))?;
 
     // Only acknowledge after the file is fully authenticated and persisted.
-    messenger.send_text("ACK").await?;
+    messenger.send_text("ACK".to_string()).await?;
     Ok(())
 }
 
-fn parse_done(message: &str) -> Result<(u64, u64)> {
+fn parse_done(message: &str, max_bytes: u64) -> Result<(u64, u64)> {
     let values = message
         .strip_prefix("DONE:")
         .context("missing DONE prefix")?;
@@ -300,7 +336,7 @@ fn parse_done(message: &str) -> Result<(u64, u64)> {
     }
     let chunks: u64 = chunks.parse().context("chunk count out of range")?;
     let bytes: u64 = bytes.parse().context("byte count out of range")?;
-    if chunks > MAX_CHUNKS || bytes > MAX_MESSAGE_SIZE {
+    if chunks > MAX_CHUNKS || bytes > max_bytes {
         bail!("DONE values exceed the supported transfer limits");
     }
     Ok((chunks, bytes))
@@ -309,20 +345,33 @@ fn parse_done(message: &str) -> Result<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::parse_done;
+    use crate::crypto::chunk::MAX_MESSAGE_SIZE;
+
+    fn parse(message: &str) -> anyhow::Result<(u64, u64)> {
+        parse_done(message, MAX_MESSAGE_SIZE)
+    }
 
     #[test]
     fn done_accepts_final_chunk_and_byte_counts() {
-        assert_eq!(parse_done("DONE:0:0").unwrap(), (0, 0));
-        assert_eq!(parse_done("DONE:42:123456").unwrap(), (42, 123456));
+        assert_eq!(parse("DONE:0:0").unwrap(), (0, 0));
+        assert_eq!(parse("DONE:42:123456").unwrap(), (42, 123456));
     }
 
     #[test]
     fn done_rejects_legacy_or_malformed_values() {
-        assert!(parse_done("DONE:42").is_err());
-        assert!(parse_done("DONE:42:1:2").is_err());
-        assert!(parse_done("DONE::42").is_err());
-        assert!(parse_done("DONE:42: 1").is_err());
-        assert!(parse_done("DONE:42x:1").is_err());
-        assert!(parse_done("ACK").is_err());
+        assert!(parse("DONE:42").is_err());
+        assert!(parse("DONE:42:1:2").is_err());
+        assert!(parse("DONE::42").is_err());
+        assert!(parse("DONE:42: 1").is_err());
+        assert!(parse("DONE:42x:1").is_err());
+        assert!(parse("ACK").is_err());
+    }
+
+    #[test]
+    fn done_rejects_a_byte_count_over_the_transport_limit() {
+        // A transport with a smaller ceiling than the protocol's rejects a
+        // DONE it could never have produced.
+        assert!(parse_done("DONE:1:1048577", 1024 * 1024).is_err());
+        assert!(parse_done("DONE:1:1048576", 1024 * 1024).is_ok());
     }
 }

@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 use crate::crypto::aes;
 use crate::crypto::chunk::fill_random;
 use crate::crypto::pin::{PIN_ACTIVE_BUCKETS, PIN_ROTATION_MS};
-use crate::wire::WireEncoding;
+use crate::wire::TransferMetadata;
 
 pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
@@ -74,24 +74,6 @@ pub struct RendezvousPayload {
     pub nonce: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relays: Option<Vec<String>>,
-}
-
-/// File metadata delivered inside the sender's sealed confirm — after the
-/// handshake, never on the public rendezvous. Both sides hash it into the
-/// confirmation code, so the code the humans compare attests to what is being
-/// transferred.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TransferMetadata {
-    /// Always `"file"`.
-    pub content_type: String,
-    pub file_name: String,
-    /// Input size of the payload: a progress hint, never the wire length.
-    pub file_size: u64,
-    /// How the payload travels; `deflate-raw` payloads are inflated by the
-    /// receiver after decryption.
-    pub content_encoding: WireEncoding,
-    pub mime_type: String,
 }
 
 /// Claim payload (receiver -> sender), sealed with the claim key derived from
@@ -680,6 +662,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::WireEncoding;
 
     /// Both kinds are wire constants pTransfer picked deliberately, and their
     /// *classes* matter as much as their values: 4243 is a regular kind so

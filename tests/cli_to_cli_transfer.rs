@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ptransfer_cli::archive::{SendSource, prepare_send_source};
+use ptransfer_cli::crypto::chunk::MAX_MESSAGE_SIZE;
 use ptransfer_cli::transfer::{run_receiver, run_sender};
 use ptransfer_cli::webrtc::common::{DcMessenger, WebRtcPeer, open_and_detach};
 use ptransfer_cli::wire::WireEncoding;
@@ -201,7 +202,7 @@ async fn multi_folder_zip_streams_cli_to_cli_without_stalling() {
 
     let (sender_peer, mut sender_msg, receiver_peer, mut receiver_msg) = connect_pair().await;
 
-    let send = async { run_sender(&mut sender_msg, &TEST_KEY, &source).await };
+    let send = async { run_sender(&mut sender_msg, &TEST_KEY, &source, MAX_MESSAGE_SIZE).await };
     let recv = async {
         run_receiver(
             &mut receiver_msg,
@@ -209,6 +210,7 @@ async fn multi_folder_zip_streams_cli_to_cli_without_stalling() {
             &dest,
             WireEncoding::Identity,
             estimated,
+            MAX_MESSAGE_SIZE,
         )
         .await
     };
@@ -281,7 +283,7 @@ async fn single_file_deflates_on_the_wire_and_inflates_on_receipt() {
 
     let (sender_peer, mut sender_msg, receiver_peer, mut receiver_msg) = connect_pair().await;
 
-    let send = async { run_sender(&mut sender_msg, &TEST_KEY, &source).await };
+    let send = async { run_sender(&mut sender_msg, &TEST_KEY, &source, MAX_MESSAGE_SIZE).await };
     let recv = async {
         run_receiver(
             &mut receiver_msg,
@@ -289,6 +291,7 @@ async fn single_file_deflates_on_the_wire_and_inflates_on_receipt() {
             &dest,
             WireEncoding::DeflateRaw,
             source.estimated_size,
+            MAX_MESSAGE_SIZE,
         )
         .await
     };

@@ -1,7 +1,7 @@
 [package]
 name = "ptransfer-cli"
 # does not have to match pTransfer's npm version
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 publish = false
 
@@ -114,6 +114,8 @@ futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+# `start_paused` runtimes, so a test can cross a timeout without waiting it out.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 strip = true

@@ -55,6 +55,18 @@ pub enum UiEvent {
     /// The PIN is no longer valid (a receiver claimed the transfer); stop
     /// displaying it.
     HidePin,
+    /// The Tor sender's onion address and password, which the receiver needs
+    /// both of.
+    #[cfg(feature = "tor")]
+    ShowTorAddress {
+        file_name: String,
+        size: u64,
+        address: String,
+        password: String,
+    },
+    /// The onion descriptor is published, so the address is now reachable.
+    #[cfg(feature = "tor")]
+    TorPublished,
     /// Receiver-side code the user must read to the sender.
     ShowConfirmationCode(String),
     HideConfirmationCode,
@@ -183,6 +195,41 @@ pub fn show_pin(file_name: &str, file_size: u64, pin: &str) {
         "(a fresh PIN is printed every {} min)",
         crate::crypto::pin::PIN_ROTATION_MS / 60_000
     );
+}
+
+/// Present the Tor sender's address and password. Both are needed to receive,
+/// and neither is a secret the sender keeps — they are meant to be handed over
+/// together.
+#[cfg(feature = "tor")]
+pub fn show_tor_address(file_name: &str, file_size: u64, address: &str, password: &str) {
+    if let Some(tx) = sink() {
+        let _ = tx.send(UiEvent::ShowTorAddress {
+            file_name: file_name.to_string(),
+            size: file_size,
+            address: address.to_string(),
+            password: password.to_string(),
+        });
+        return;
+    }
+    eprintln!(
+        "Ready to send \"{file_name}\" ({}). The receiver needs both of these:",
+        format_bytes(file_size)
+    );
+    println!("address:  {address}");
+    println!("password: {password}");
+    let _ = std::io::stdout().flush();
+}
+
+/// Report that the onion descriptor is published and the address is reachable.
+#[cfg(feature = "tor")]
+pub fn tor_published() {
+    if let Some(tx) = sink() {
+        let _ = tx.send(UiEvent::TorPublished);
+        return;
+    }
+    // The line callers script against: nothing can connect before it.
+    println!("ready");
+    let _ = std::io::stdout().flush();
 }
 
 /// Display the ECDH-derived code the receiver must read to the sender.

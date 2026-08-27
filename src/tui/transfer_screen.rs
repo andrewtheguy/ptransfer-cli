@@ -19,6 +19,8 @@ use crate::crypto::base32::{CONFIRMATION_CODE_LENGTH, normalize_crockford_base32
 use crate::crypto::pin::{PIN_ROTATION_MS, PIN_WAIT_TIMEOUT_MS};
 use crate::ui::{Direction, FileExistsChoice, UiEvent};
 use crate::util::{OnConflict, calc_percent, format_bytes};
+#[cfg(feature = "tor")]
+use crate::tor;
 use crate::{archive, ui, webrtc};
 
 use super::app::WizardPlan;
@@ -110,6 +112,23 @@ async fn run_plan(plan: WizardPlan) -> Result<()> {
         WizardPlan::ReceivePin { pin, output } => {
             webrtc::receive_file_nostr(&pin, Some(output), OnConflict::Prompt).await
         }
+        #[cfg(feature = "tor")]
+        WizardPlan::SendTor(paths) => tor::transfer::send(paths, tor::DEFAULT_PORT).await,
+        #[cfg(feature = "tor")]
+        WizardPlan::ReceiveTor {
+            address,
+            password,
+            output,
+        } => {
+            tor::transfer::receive(
+                &address,
+                tor::DEFAULT_PORT,
+                &password,
+                Some(output),
+                OnConflict::Prompt,
+            )
+            .await
+        }
     }
 }
 
@@ -124,6 +143,9 @@ struct State {
     /// across rotations.
     wait_started_at: Option<Instant>,
     incoming: Option<String>,
+    /// Sender-side onion address and password, while the Tor transport waits.
+    #[cfg(feature = "tor")]
+    tor: Option<TorRendezvous>,
     /// Receiver-side code to read to the sender.
     confirmation_code: Option<String>,
     /// Sender-side text entry while the transfer task waits for an attempt.
@@ -139,11 +161,24 @@ struct ConfirmationPrompt {
     reply: oneshot::Sender<String>,
 }
 
+/// What the Tor sender is showing its operator to hand over.
+#[cfg(feature = "tor")]
+struct TorRendezvous {
+    address: String,
+    password: String,
+    /// Until the descriptor is up, the address is not reachable yet.
+    published: bool,
+}
+
 impl State {
     fn new(plan: &WizardPlan) -> Self {
         let title = match plan {
             WizardPlan::SendPin(_) => "sending",
             WizardPlan::ReceivePin { .. } => "receiving",
+            #[cfg(feature = "tor")]
+            WizardPlan::SendTor(_) => "sending over Tor",
+            #[cfg(feature = "tor")]
+            WizardPlan::ReceiveTor { .. } => "receiving over Tor",
         };
         Self {
             title,
@@ -152,6 +187,8 @@ impl State {
             pin_shown_at: None,
             wait_started_at: None,
             incoming: None,
+            #[cfg(feature = "tor")]
+            tor: None,
             confirmation_code: None,
             confirmation_prompt: None,
             status_log: Vec::new(),
@@ -192,6 +229,26 @@ impl State {
                 self.pin = None;
                 self.pin_shown_at = None;
                 self.wait_started_at = None;
+            }
+            #[cfg(feature = "tor")]
+            UiEvent::ShowTorAddress {
+                file_name,
+                size,
+                address,
+                password,
+            } => {
+                self.outgoing = Some(format!("{file_name} ({})", format_bytes(size)));
+                self.tor = Some(TorRendezvous {
+                    address,
+                    password,
+                    published: false,
+                });
+            }
+            #[cfg(feature = "tor")]
+            UiEvent::TorPublished => {
+                if let Some(tor) = &mut self.tor {
+                    tor.published = true;
+                }
             }
             UiEvent::ShowConfirmationCode(code) => self.confirmation_code = Some(code),
             UiEvent::HideConfirmationCode => self.confirmation_code = None,
@@ -298,6 +355,11 @@ impl State {
             // Label, PIN, rotation countdown, wait backstop.
             height += 4;
         }
+        #[cfg(feature = "tor")]
+        if self.tor.is_some() {
+            // Label, address, password, publish state.
+            height += 4;
+        }
         if self.incoming.is_some() {
             height += 1;
         }
@@ -319,6 +381,21 @@ impl State {
             lines.push(pin.clone().green().bold().into());
             lines.push(self.rotation_line());
             lines.push(self.wait_backstop_line());
+        }
+        #[cfg(feature = "tor")]
+        if let Some(tor) = &self.tor {
+            lines.push("Give the receiver this address and password:".bold().into());
+            // The two things to read off this screen, in the same prominent
+            // color the PIN gets.
+            lines.push(tor.address.clone().green().bold().into());
+            lines.push(tor.password.clone().green().bold().into());
+            lines.push(if tor.published {
+                "Published — the address is reachable now.".dim().into()
+            } else {
+                "Publishing the onion descriptor; this can take a minute..."
+                    .dim()
+                    .into()
+            });
         }
         if let Some(incoming) = &self.incoming {
             lines.push(format!("Incoming file: {incoming}").bold().into());

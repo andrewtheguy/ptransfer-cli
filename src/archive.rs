@@ -136,7 +136,9 @@ pub fn prepare_send_source(inputs: &[PathBuf]) -> Result<SendSource> {
     prepare_send_source_with_cap(inputs, MAX_MESSAGE_SIZE)
 }
 
-fn prepare_send_source_with_cap(inputs: &[PathBuf], cap: u64) -> Result<SendSource> {
+/// As [`prepare_send_source`], with a transport-specific limit on the input
+/// size — the Tor transport carries far less than a WebRTC data channel does.
+pub fn prepare_send_source_with_cap(inputs: &[PathBuf], cap: u64) -> Result<SendSource> {
     if inputs.is_empty() {
         bail!("Nothing to send");
     }

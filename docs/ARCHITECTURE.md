@@ -5,13 +5,16 @@
 The normative wire contract is the web app's `docs/INTEROP_PROTOCOL.md`, which
 specifies PIN Exchange and the shared data-channel transfer layer and carries an
 interop protocol version independent of pTransfer's app version. This build
-implements version `1` (`package.metadata.ptransfer-protocol-version`). This
+implements version `2` (`package.metadata.ptransfer-protocol-version`). This
 document describes how the CLI realizes that contract; where the two disagree,
 the spec wins.
 
 The web app's Code Exchange — hand-carried QR/clipboard offer and answer codes —
 is deliberately outside that contract while it is still taking shape, and is not
-implemented here. PIN exchange is the CLI's only signaling mode.
+implemented here. PIN exchange is the CLI's only signaling mode. The wizard's
+mode menu still lists Code Exchange in the web app's position, so a mode's
+number means the same thing in both interfaces; selecting it reports that it is
+not implemented and goes no further.
 
 ## PIN Exchange
 
@@ -175,6 +178,79 @@ Default relays match pTransfer. Transport is direct-only: STUN servers
 assist NAT traversal, but no TURN relay is configured, so a transfer fails
 rather than route file bytes through a relay.
 
+## Tor Onion Transport
+
+Behind the non-default `tor` cargo feature, and deliberately outside the interop
+protocol: nothing here is specified by `INTEROP_PROTOCOL.md`, and the web app
+does not speak it. v1 is CLI to CLI, capped at 1 MiB per transfer.
+
+The sender publishes an ephemeral v3 onion service and mints a one-time
+password with the same generator PIN Exchange uses. Those two strings are the
+whole rendezvous: no relay, no lookup hint, no third-party identity, and no
+event to correlate. Unlike a PIN, the password's *entire* 12 characters are
+secret — there is no public locator segment, because there is nothing public to
+look anything up in.
+
+**Framing.** A Tor stream is a byte stream, so
+`[1-byte kind][4-byte big-endian length][payload]` frames restore the discrete
+binary/text messages the choreography needs, with the length capped at one
+encrypted chunk. Above that framing the transfer is the *same* code as PIN
+Exchange — `run_sender`/`run_receiver` are generic over a `Messenger`, and both
+transports implement it.
+
+**Handshake.** Both peers run SPAKE2 (RFC 9382, P-256) over the stream:
+
+```text
+receiver -> sender   hello    { version, pakeMessage: pB }
+sender   -> receiver offer    { version, pakeMessage: pA, salt }
+receiver -> sender   claim    { sealed }
+sender   -> receiver confirm  { sealed(metadata) }
+receiver -> sender   ready | cancel
+```
+
+The `<host>.onion:<port>` address stands in as the transfer identity in the
+SPAKE2 transcript, with fixed role labels for the two ends. Opening either seal
+*is* the key confirmation: a wrong password produces two different roots and the
+claim simply fails to open, so the sender hangs up without answering. Binding
+the address is what stops a handshake proxied through to a *different* onion
+service — both ends would derive different roots. Keys derive under
+`ptransfer:tor-session:v1:{claim,confirm,content}`, so no key is ever shared
+with the PIN Exchange path even off an identical root.
+
+There is no confirmation code for a human to compare. A PIN is short enough that
+a live guess can race the intended receiver, which is what that code catches;
+the address and password are only ever handed over as a pair, so there is no
+race to catch. The sender still counts failed connections and stops after 20.
+
+**What each layer contributes.** Tor authenticates the *service* to the client
+(the address is its public key) and encrypts the stream end to end. The password
+adds the other direction: proof the connecting peer is the intended receiver
+rather than anyone who came across the address. File bytes then travel under the
+same AES-256-GCM chunk format as every other transfer, encrypted a second time
+inside the Tor stream.
+
+**Bounds.** Anyone who has the address can open the port, so an accepted
+connection is not yet a receiver and never gets to hold the service against the
+real one. Each connection has 5 minutes for its whole turn; a stall is counted
+as a failed connection like any other and the sender goes back to waiting. The
+shutdown signal and the 30-minute overall deadline wrap the accept loop
+*including* connections in progress, so neither is blocked by a peer that opens
+the port and says nothing. On the receiver's side the password comes from stdin
+rather than argv, which would otherwise publish half the credential pair to
+every process on the machine for the length of a Tor bootstrap.
+
+Whoever sends the last frame waits for the peer to close before exiting: Arti
+hands bytes to the circuit from background tasks, so a process that writes and
+exits takes that frame with it. The close is therefore the delivery receipt for
+the receiver's `ACK`, and its absence is reported — but not as a failure, since
+by then the file is written and verified and only the sender's knowledge of
+that is in doubt.
+
+**Limits.** The 1 MiB cap is enforced on the *input* when the selection is
+prepared, and the wire ceiling carries a small margin over it — deflate grows
+incompressible input slightly and a ZIP adds per-entry headers, neither of which
+is known until the bytes are produced.
+
 ## Wire Encoding
 
 The compression rule is the web app's, and it is **flow-based, never
@@ -192,8 +268,8 @@ the archive itself is never compressed a second time.
 
 Either way the final wire length is unknown while signaling runs, which is why
 the advertised size is only a hint and `DONE` carries the real count. The
-receiver caps *inflated* output at `MAX_MESSAGE_SIZE` as a decompression-bomb
-guard, and a stream that has not ended by `DONE` is rejected as truncated —
+receiver caps *inflated* output at the transport's ceiling as a
+decompression-bomb guard, and a stream that has not ended by `DONE` is rejected as truncated —
 something the byte count alone cannot detect, since every promised wire byte did
 arrive.
 
@@ -242,8 +318,9 @@ arms the same window once the data channel is open and resets it for every
 incoming data-channel message, including
 `DONE:<total_chunks>:<total_bytes>`.
 
-The maximum transfer size is 2 GiB (`MAX_MESSAGE_SIZE`), matching pTransfer; both
-ends stream chunk by chunk, so the bound is not RAM.
+The maximum transfer size is the transport's: 2 GiB (`MAX_MESSAGE_SIZE`) over a
+data channel, matching pTransfer, and 1 MiB over Tor. Both ends stream chunk by
+chunk, so neither bound is RAM.
 
 Both send paths run the same shape: a blocking worker produces wire bytes — a
 deflater over one file, or a ZIP writer over a walked selection — into a chunk
@@ -258,4 +335,5 @@ enforces the limit against actual output and seals the final length in `DONE`.
 ## Scope
 
 The CLI intentionally has no legacy signaling protocol, no resume path, no QR
-support, no Code Exchange, no relay discovery, and no custom fallback mode.
+support, no Code Exchange, no relay discovery, and no custom fallback mode. The
+Tor transport is CLI to CLI only; CLI-to-web over Tor is phase 2.

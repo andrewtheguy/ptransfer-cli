@@ -148,6 +148,24 @@ pub struct PakeIdentities<'a> {
     pub receiver_pubkey: &'a str,
 }
 
+impl<'a> PakeIdentities<'a> {
+    /// Identities for the Tor onion transport, which has no Nostr keys.
+    ///
+    /// The `<host>.onion:<port>` address the peers agreed on stands in as the
+    /// transfer identity, and fixed role labels keep the two ends apart.
+    /// Binding the address is what stops a relay that proxies the handshake
+    /// through to a *different* onion service from sharing a root with either
+    /// side.
+    #[cfg(feature = "tor")]
+    pub fn tor(onion: &'a str) -> Self {
+        Self {
+            transfer_id: onion,
+            sender_pubkey: "ptransfer:tor:v1:sender",
+            receiver_pubkey: "ptransfer:tor:v1:receiver",
+        }
+    }
+}
+
 /// One side of one SPAKE2 run: an ephemeral scalar, its blinded element, and
 /// the password scalar the run is authenticated by.
 ///

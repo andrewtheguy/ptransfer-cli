@@ -99,10 +99,18 @@ arguments at all:
 ptransfer
 ```
 
-The wizard covers everything interactively: choose send or receive, pick files
-and/or folders in the built-in browser (Space to multi-select), and when
-receiving, browse to the output directory (or create a new folder with `n`)
-and enter the PIN. Transfers run inside the TUI with live status and progress.
+The wizard covers everything interactively: choose send or receive, choose the
+transfer mode, pick files and/or folders in the built-in browser (Space to
+multi-select), and when receiving, browse to the output directory (or create a
+new folder with `n`) and enter the PIN. Transfers run inside the TUI with live
+status and progress.
+
+The mode menu lists the web app's modes in the web app's order, so an option's
+position means the same thing in both, and adds the CLI's own Tor Onion Service
+as a third entry in a build with the `tor` feature. Picking Code Exchange says it
+is not implemented and stays on the menu; the other modes run a transfer. Over
+Tor the wizard shows the sender's address and password on the transfer screen,
+and asks the receiver for both.
 
 ### Non-Interactive Test Mode
 
@@ -121,14 +129,62 @@ transfer; enter the PIN currently shown exactly. The receiver then prints an
 continues. Multiple paths or a folder are sent as one ZIP. If the destination
 file already exists the receiver fails; pass `--overwrite` to replace it.
 
-### Tor Onion Service (Proof of Concept)
+### Tor Onion Service
 
 Built behind the non-default `tor` cargo feature (`cargo build --features tor`).
-This is not the file transfer — it is a v1 proof of concept that a v3 onion
-service comes up from the CLI and carries bytes in both directions.
+The sender publishes a throwaway v3 onion service and a one-time password; the
+`.onion` address and that password are the only things the receiver needs. No
+relay, no account, and no signaling server is involved — the address *is* the
+rendezvous.
 
-Instance A publishes an ephemeral onion address and echoes back every line it
-receives:
+```bash
+ptransfer tor send ./file.bin
+# address:  zrmxlosp6cvmkhxwhx7267wkvqyztsrmloqw76eu4fhn2gsbg5zk4kad.onion:9735
+# password: QBp9UR873Xzn
+# ready
+```
+
+Hand both lines to the receiver, who runs:
+
+```bash
+ptransfer tor receive <address> --output ./downloads
+# Password: <the password the sender printed>
+```
+
+The password is read from stdin, never taken as an argument — an argument would
+be readable by every other process on the machine for as long as the receiver
+spends bootstrapping Tor. At a terminal it is prompted for; from a script, pipe
+it in (`printf '%s\n' "$PASSWORD" | ptransfer tor receive <address>`).
+
+`send` prints the address and password as soon as they exist, then `ready` once
+the descriptor is published and the service is actually reachable — wait for
+`ready` before connecting. A port in the address wins over `--port`, which
+otherwise sets the onion virtual port on either side. Multiple paths or a folder
+are sent as one ZIP, exactly as in PIN Exchange. If the destination file already
+exists the receiver fails; pass `--overwrite` to replace it.
+
+v1 is CLI to CLI and carries at most **1 MiB** per transfer — a Tor circuit is
+slow enough that anything larger wants resume support, which this does not have.
+CLI-to-web is phase 2.
+
+These `tor` subcommands are the non-interactive form. The wizard covers the same
+transfer under **Tor Onion Service** in its mode menu.
+
+The password authenticates both ends through the same SPAKE2 exchange PIN
+Exchange uses, with the relay-shaped parts removed: no rendezvous to look up, no
+third-party identities, and no confirmation code for a human to compare. The
+`.onion` address is bound into the SPAKE2 transcript, so a handshake proxied
+through to a *different* onion service derives a different key and every seal
+under it fails. Tor already authenticates the service to the client and encrypts
+the stream; the password adds what that cannot — proof the *connecting* peer is
+the intended receiver rather than anyone who came across the address. File bytes
+then travel under the same encrypted chunk format as every other transfer, so
+they are encrypted a second time inside the Tor stream.
+
+#### Echo Proof of Concept
+
+The transport was built against a bare echo, which is still there. Instance A
+publishes an ephemeral onion address and echoes back every line it receives:
 
 ```bash
 ptransfer tor serve
@@ -144,26 +200,26 @@ ptransfer tor connect <address>.onion:9735 --message hello
 ```
 
 `serve` prints the `.onion` address as soon as the identity key exists, then
-`ready` once the descriptor is published and the service is actually reachable
-— wait for `ready` before connecting. `connect` takes the whole line `serve`
-prints; a port in the address wins over `--port`, which otherwise sets the
-onion virtual port on either side.
+`ready` once the descriptor is published, exactly like `send`. `connect` takes
+the whole line `serve` prints.
+
+#### How the Tor Client Is Set Up
 
 Each process runs its own Arti client that reads no configuration file and
 never touches a system Tor or an existing `~/.local/share/arti`. The service
-identity key lives only in Arti's in-memory keystore, so every `serve` gets a
-new address and there is no key on disk to lose. Arti still requires filesystem
+identity key lives only in Arti's in-memory keystore, so every `send` or `serve`
+gets a new address and there is no key on disk to lose. Arti still requires filesystem
 paths for its directory cache and client state (fully in-memory state is
 [arti#1186](https://gitlab.torproject.org/tpo/core/arti/-/work_items/1186), not
 scheduled), so those go in a private directory under `/dev/shm` — a tmpfs, so in
 RAM — falling back to the platform temp directory off Linux. That tree is
-deleted on a graceful shutdown: `serve` unwinds on Ctrl-C or `SIGTERM`, and
-`connect` on returning. A process killed outright leaves it behind until the
+deleted on a graceful shutdown: `send` and `serve` unwind on Ctrl-C or
+`SIGTERM`, and `receive` and `connect` on returning. A process killed outright leaves it behind until the
 next reboot (or the platform's temp-directory cleanup off Linux).
 
-Because nothing is cached between runs, both commands bootstrap the Tor
-directory from scratch; expect several seconds before `serve` prints an address
-and up to a minute more before it prints `ready`.
+Because nothing is cached between runs, every command bootstraps the Tor
+directory from scratch; expect several seconds before the serving side prints an
+address and up to a minute more before it prints `ready`.
 
 ## Protocol Compatibility
 
@@ -171,7 +227,7 @@ The normative wire contract is the sibling pTransfer checkout's
 [`docs/INTEROP_PROTOCOL.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/INTEROP_PROTOCOL.md).
 It covers PIN Exchange and the shared data-channel transfer layer — exactly what
 this CLI implements — and carries an interop protocol version independent of
-pTransfer's app version. This build implements version `1`, declared in
+pTransfer's app version. This build implements version `2`, declared in
 `package.metadata.ptransfer-protocol-version`.
 
 - Rendezvous event: Nostr kind `4243` (a regular kind, so relays retain it for a
@@ -219,6 +275,8 @@ pTransfer's app version. This build implements version `1`, declared in
 - No resume support.
 - No QR support.
 - No Code Exchange: hand-carried offer/answer codes are web-only.
+- The Tor transport carries at most 1 MiB per transfer, is CLI to CLI only, and
+  is not part of the interop protocol.
 - No custom relay/discovery mode.
 - Direct P2P only: no TURN relay fallback for the file bytes.
 
@@ -244,5 +302,3 @@ checkout in the sibling `ptransfer` folder. Set `PTRANSFER_WEB_ROOT`,
 the CLI with all features, starts the web development server when needed, and
 leaves byte-verified transfer artifacts in the temporary directory printed at
 the end.
-
-Do not run `cargo fmt` for this repo.

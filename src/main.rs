@@ -36,7 +36,7 @@ enum Commands {
         verbose: bool,
     },
 
-    /// Tor onion-service transport (proof of concept, not the file transfer)
+    /// Tor onion-service transport
     #[cfg(feature = "tor")]
     Tor {
         #[command(subcommand)]
@@ -48,15 +48,51 @@ enum Commands {
     },
 }
 
-/// Proof-of-concept echo over an ephemeral v3 onion service. `serve` prints the
-/// address it publishes; `connect` sends one line to it and prints the echo.
+/// File transfer over an ephemeral v3 onion service, plus the echo proof of
+/// concept the transport was built against.
+///
+/// `send` publishes an address and a one-time password; `receive` needs
+/// nothing but those two strings. `serve`/`connect` are the echo POC.
 #[cfg(feature = "tor")]
 #[derive(Subcommand)]
 enum TorCommands {
+    /// Publish an onion address and a password, then send to whoever
+    /// authenticates with them. Multiple inputs are bundled into one ZIP.
+    Send {
+        /// Files and/or directories to send
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
+
+        /// Onion virtual port to listen on
+        #[arg(short, long, default_value_t = tor::DEFAULT_PORT)]
+        port: u16,
+    },
+
+    /// Receive a file from an onion address, using the sender's password.
+    ///
+    /// The password is read from stdin — a prompt at a terminal, one line from
+    /// a pipe — never from the command line.
+    Receive {
+        /// The `.onion` address printed by `ptransfer tor send`
+        address: String,
+
+        /// Onion virtual port to connect to
+        #[arg(short, long, default_value_t = tor::DEFAULT_PORT)]
+        port: u16,
+
+        /// Output directory (defaults to the current directory)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Replace the destination file if it already exists (default: fail)
+        #[arg(long)]
+        overwrite: bool,
+    },
+
     /// Publish an ephemeral onion address and echo back every line received.
     Serve {
         /// Onion virtual port to listen on
-        #[arg(short, long, default_value_t = tor::echo::DEFAULT_PORT)]
+        #[arg(short, long, default_value_t = tor::DEFAULT_PORT)]
         port: u16,
     },
 
@@ -66,7 +102,7 @@ enum TorCommands {
         address: String,
 
         /// Onion virtual port to connect to
-        #[arg(short, long, default_value_t = tor::echo::DEFAULT_PORT)]
+        #[arg(short, long, default_value_t = tor::DEFAULT_PORT)]
         port: u16,
 
         /// Text to send
@@ -97,6 +133,37 @@ enum TestCommands {
         #[arg(long)]
         overwrite: bool,
     },
+}
+
+/// Read the transfer password from stdin.
+///
+/// It is not a command-line argument because an argument is public: every
+/// other process on the machine can read it out of the process list, and an
+/// interactive shell writes it to history. That would matter little for a
+/// secret with a short life, but the receiver holds this one across a Tor
+/// bootstrap — tens of seconds — and it is half of a credential pair that
+/// whoever grabs it can use to collect the file first.
+#[cfg(feature = "tor")]
+async fn read_tor_password() -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    tokio::task::spawn_blocking(|| {
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            eprint!("Password: ");
+            std::io::stderr().flush()?;
+        }
+        let mut input = String::new();
+        if stdin.lock().read_line(&mut input)? == 0 {
+            anyhow::bail!("no password on stdin");
+        }
+        let password = input.trim();
+        if password.is_empty() {
+            anyhow::bail!("no password entered");
+        }
+        Ok(password.to_string())
+    })
+    .await?
 }
 
 fn main() {
@@ -174,6 +241,30 @@ async fn async_main() -> Result<()> {
             init_logging(if verbose { "debug" } else { "info" });
 
             match command {
+                TorCommands::Send { paths, port } => tor::transfer::send(paths, port).await,
+
+                TorCommands::Receive {
+                    address,
+                    port,
+                    output,
+                    overwrite,
+                } => {
+                    let on_conflict = if overwrite {
+                        OnConflict::Overwrite
+                    } else {
+                        OnConflict::Fail
+                    };
+                    let password = read_tor_password().await?;
+                    tor::transfer::receive(
+                        address.trim(),
+                        port,
+                        &password,
+                        output,
+                        on_conflict,
+                    )
+                    .await
+                }
+
                 TorCommands::Serve { port } => tor::echo::serve(port).await,
 
                 TorCommands::Connect {
@@ -232,7 +323,7 @@ mod tests {
 
     #[cfg(feature = "tor")]
     #[test]
-    fn tor_serve_defaults_to_the_poc_port() {
+    fn tor_serve_defaults_to_the_onion_port() {
         let cli = Cli::try_parse_from(["ptransfer", "tor", "serve"]).unwrap();
         let Some(Commands::Tor {
             command: TorCommands::Serve { port },
@@ -241,7 +332,50 @@ mod tests {
         else {
             panic!("expected tor serve");
         };
-        assert_eq!(port, tor::echo::DEFAULT_PORT);
+        assert_eq!(port, tor::DEFAULT_PORT);
+    }
+
+    #[cfg(feature = "tor")]
+    #[test]
+    fn tor_send_takes_multiple_paths() {
+        let cli =
+            Cli::try_parse_from(["ptransfer", "tor", "send", "a.txt", "b", "dir"]).unwrap();
+        let Some(Commands::Tor {
+            command: TorCommands::Send { paths, port },
+            ..
+        }) = cli.command
+        else {
+            panic!("expected tor send");
+        };
+        assert_eq!(paths.len(), 3);
+        assert_eq!(port, tor::DEFAULT_PORT);
+    }
+
+    #[cfg(feature = "tor")]
+    #[test]
+    fn tor_receive_takes_an_address_and_never_a_password() {
+        assert!(Cli::try_parse_from(["ptransfer", "tor", "receive"]).is_err());
+        // The password comes from stdin, so an argument that looks like one is
+        // rejected rather than quietly published in the process list.
+        assert!(
+            Cli::try_parse_from(["ptransfer", "tor", "receive", "abc.onion", "PIN123"]).is_err()
+        );
+
+        let cli =
+            Cli::try_parse_from(["ptransfer", "tor", "receive", "abc.onion", "--overwrite"])
+                .unwrap();
+        let Some(Commands::Tor {
+            command:
+                TorCommands::Receive {
+                    address, overwrite, ..
+                },
+            ..
+        }) = cli.command
+        else {
+            panic!("expected tor receive");
+        };
+        assert_eq!(address, "abc.onion");
+        assert!(overwrite);
     }
 
     #[cfg(feature = "tor")]

@@ -33,7 +33,7 @@ use crate::crypto::spake2::{
 };
 use crate::signaling::nostr::{
     CandidatePayload, ClaimPayload, ConfirmPayload, HandshakeType, NostrClient, RendezvousPayload,
-    Signal, TransferMetadata, compute_rendezvous_transcript_hash, compute_transfer_metadata_hash,
+    Signal, compute_rendezvous_transcript_hash, compute_transfer_metadata_hash,
     confirm_filter, create_handshake_event, create_signal_event, generate_handshake_nonce,
     open_handshake_payload, parse_handshake_event, parse_rendezvous_event, parse_signal_event,
     rendezvous_filter, rendezvous_kind, seal_handshake_payload, signal_filter_from_sender,
@@ -43,6 +43,7 @@ use crate::ui;
 use crate::util::{OnConflict, format_bytes, resolve_destination};
 use crate::webrtc::common::{DcMessenger, WebRtcPeer, open_and_detach};
 use crate::webrtc::{add_ice_candidate_safely, advertise_max_message_size, candidate_strings};
+use crate::wire::TransferMetadata;
 
 /// Time to establish the WebRTC data channel once signaling has started.
 /// Mirrors the sender's timeout.
@@ -361,6 +362,7 @@ pub async fn receive_file_nostr(
         &dest,
         content_encoding,
         file_size,
+        MAX_MESSAGE_SIZE,
     )
     .await;
 

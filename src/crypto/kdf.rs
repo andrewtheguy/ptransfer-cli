@@ -23,6 +23,16 @@ const LABEL_CLAIM: &str = "ptransfer:nostr-session:v4:claim";
 const LABEL_CONFIRM: &str = "ptransfer:nostr-session:v4:confirm";
 const LABEL_CONFIRMATION: &str = "ptransfer:nostr-session:v4:confirmation";
 
+/// Labels for the Tor onion transport. It is not part of the interop protocol,
+/// so it derives under its own labels: a root that came out of a Tor handshake
+/// can never produce a key PIN Exchange would also produce.
+#[cfg(feature = "tor")]
+const LABEL_TOR_CLAIM: &str = "ptransfer:tor-session:v1:claim";
+#[cfg(feature = "tor")]
+const LABEL_TOR_CONFIRM: &str = "ptransfer:tor-session:v1:confirm";
+#[cfg(feature = "tor")]
+const LABEL_TOR_CONTENT: &str = "ptransfer:tor-session:v1:content";
+
 /// Session keys for PIN Exchange. Distinct HKDF info labels
 /// guarantee signaling and content never reuse the same AES-GCM key.
 pub struct NostrSessionKeys {
@@ -62,6 +72,22 @@ pub struct ConfirmationCodeBinding<'a> {
     /// rendezvous, so it is bound here — the code the humans compare attests to
     /// *what* is being transferred, not only to the key exchange.
     pub metadata_hash: &'a str,
+}
+
+/// Keys for one Tor onion transfer, all off the same SPAKE2 root.
+///
+/// The two seal keys carry the mutual key confirmation the transport needs:
+/// the receiver's sealed claim is the only proof the connecting peer knows the
+/// password, and the sender's sealed confirm — which carries the file metadata
+/// — is the only proof the onion service on the other end knows it too.
+#[cfg(feature = "tor")]
+pub struct TorSessionKeys {
+    /// Seals the receiver's claim (receiver -> sender).
+    pub claim: [u8; AES_KEY_LEN],
+    /// Seals the sender's confirm, metadata included (sender -> receiver).
+    pub confirm: [u8; AES_KEY_LEN],
+    /// Encrypts the file content chunks.
+    pub content: [u8; AES_KEY_LEN],
 }
 
 /// The SPAKE2 session root: the transcript digest returned by
@@ -148,6 +174,19 @@ impl PakeRoot {
         hkdf.expand(info.as_bytes(), &mut bytes)
             .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
         Ok(encode_crockford_base32(&bytes))
+    }
+}
+
+#[cfg(feature = "tor")]
+impl PakeRoot {
+    /// Derive every key one Tor onion transfer uses.
+    pub fn tor_session_keys(&self, salt: &[u8]) -> Result<TorSessionKeys> {
+        let hkdf = self.hkdf(salt)?;
+        Ok(TorSessionKeys {
+            claim: expand_key(&hkdf, LABEL_TOR_CLAIM)?,
+            confirm: expand_key(&hkdf, LABEL_TOR_CONFIRM)?,
+            content: expand_key(&hkdf, LABEL_TOR_CONTENT)?,
+        })
     }
 }
 
@@ -275,6 +314,26 @@ mod tests {
                 .unwrap(),
             base
         );
+    }
+
+    #[cfg(feature = "tor")]
+    #[test]
+    fn tor_keys_are_distinct_from_each_other_and_from_pin_exchange() {
+        let root = fixed_root();
+        let salt = [7u8; SALT_LEN];
+        let tor = root.tor_session_keys(&salt).unwrap();
+        let session = root.session_keys(&salt).unwrap();
+        let seals = root.handshake_seal_keys(&salt).unwrap();
+
+        assert_ne!(tor.claim, tor.confirm);
+        assert_ne!(tor.claim, tor.content);
+        assert_ne!(tor.confirm, tor.content);
+        // Same root, same salt, different transport: no key is shared.
+        for pin_key in [session.signals, session.content, seals.claim, seals.confirm] {
+            assert_ne!(tor.claim, pin_key);
+            assert_ne!(tor.confirm, pin_key);
+            assert_ne!(tor.content, pin_key);
+        }
     }
 
     #[test]
