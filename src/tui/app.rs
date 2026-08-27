@@ -367,31 +367,6 @@ fn pin_entry_key(
     })
 }
 
-/// One line-editing step on `value`, returning whether it changed.
-///
-/// Shared by every text field on the Tor screen; the PIN screen keeps its own
-/// because its editing is entangled with PIN character filtering.
-#[cfg(feature = "tor")]
-fn edit_line(value: &mut String, cursor: &mut usize, key: &KeyEvent) -> bool {
-    match key.code {
-        KeyCode::Left => *cursor = cursor.saturating_sub(1),
-        KeyCode::Right => *cursor = (*cursor + 1).min(value.len()),
-        KeyCode::Home => *cursor = 0,
-        KeyCode::End => *cursor = value.len(),
-        KeyCode::Backspace if *cursor > 0 => {
-            *cursor -= 1;
-            value.remove(*cursor);
-            return true;
-        }
-        KeyCode::Delete if *cursor < value.len() => {
-            value.remove(*cursor);
-            return true;
-        }
-        _ => {}
-    }
-    false
-}
-
 /// The Tor receive screen: an onion address and a password, both required.
 #[cfg(feature = "tor")]
 #[allow(clippy::too_many_arguments)]
@@ -440,16 +415,10 @@ fn tor_entry_key(
                 TorField::Password => password.len(),
             };
         }
-        // An onion address is lowercase base32 plus `.onion` and an optional
-        // port, but it is validated as a whole on submit rather than filtered
-        // per keystroke: a rejected character with no explanation is worse
-        // than a rejected address with one.
-        KeyCode::Char(c) if field == TorField::Address && !c.is_control() => {
-            address.insert(cursor, c);
-            cursor += 1;
-            edited = true;
-        }
-        // The password is a PIN, so it filters exactly like one.
+        // The password is a PIN, so it filters exactly like one. The address
+        // takes any printable character and is validated as a whole on submit:
+        // a rejected keystroke with no explanation is worse than a rejected
+        // address with one.
         KeyCode::Char(c) if field == TorField::Password && password.len() < PIN_LENGTH => {
             match pin_char(c) {
                 Some(c) => {
@@ -467,7 +436,7 @@ fn tor_entry_key(
                 TorField::Address => &mut address,
                 TorField::Password => &mut password,
             };
-            edited = edit_line(value, &mut cursor, &key);
+            edited = widgets::edit_line(value, &mut cursor, &key);
         }
     }
 
@@ -872,6 +841,45 @@ mod tests {
         };
         assert_eq!(address, onion, "the address is trimmed before use");
         assert_eq!(entered, password);
+    }
+
+    #[cfg(feature = "tor")]
+    #[test]
+    fn a_multi_byte_character_in_the_address_leaves_the_cursor_usable() {
+        // Regression: the cursor used to advance one byte per character, so a
+        // single non-ASCII character left it inside that character and the
+        // next redraw panicked.
+        let mut screen = Screen::TorEntry {
+            output: PathBuf::from("."),
+            address: String::new(),
+            password: String::new(),
+            field: TorField::Address,
+            cursor: 0,
+            error: None,
+        };
+
+        for c in "a│b".chars() {
+            let Step::Continue(next) = handle_key(screen, press(KeyCode::Char(c))) else {
+                panic!("expected the Tor entry screen");
+            };
+            screen = next;
+        }
+
+        let Screen::TorEntry {
+            address, cursor, ..
+        } = &screen
+        else {
+            panic!("expected the Tor entry screen");
+        };
+        assert_eq!(address, "a│b");
+        assert!(
+            address.is_char_boundary(*cursor),
+            "cursor {cursor} splits {address:?}"
+        );
+
+        // And such an address is refused with a message rather than accepted.
+        let password = crate::crypto::pin::generate_pin().unwrap();
+        assert!(validate_tor_entry(address, &password).is_err());
     }
 
     #[cfg(feature = "tor")]

@@ -107,34 +107,9 @@ impl DirPicker {
                     self.new_name = None;
                     self.error = None;
                 }
-                KeyCode::Left => {
-                    if let Some(c) = name[..self.name_cursor].chars().next_back() {
-                        self.name_cursor -= c.len_utf8();
-                    }
+                _ => {
+                    widgets::edit_line(name, &mut self.name_cursor, &key);
                 }
-                KeyCode::Right => {
-                    if let Some(c) = name[self.name_cursor..].chars().next() {
-                        self.name_cursor += c.len_utf8();
-                    }
-                }
-                KeyCode::Home => self.name_cursor = 0,
-                KeyCode::End => self.name_cursor = name.len(),
-                KeyCode::Backspace => {
-                    if let Some(c) = name[..self.name_cursor].chars().next_back() {
-                        self.name_cursor -= c.len_utf8();
-                        name.remove(self.name_cursor);
-                    }
-                }
-                KeyCode::Delete => {
-                    if self.name_cursor < name.len() {
-                        name.remove(self.name_cursor);
-                    }
-                }
-                KeyCode::Char(c) => {
-                    name.insert(self.name_cursor, c);
-                    self.name_cursor += c.len_utf8();
-                }
-                _ => {}
             }
             return DirPickerStep::Stay;
         }
