@@ -55,16 +55,21 @@ pub enum WizardPlan {
 /// The Tor transport is the CLI's own third mode, and only exists in a build
 /// with the `tor` feature.
 ///
+/// Anonymous signaling is deliberately not a fourth entry. It is not a mode:
+/// it changes which relays PIN Exchange signals over and nothing else, and the
+/// web app has it as an advanced option of the PIN Exchange choice rather than
+/// beside it. It is the same here — a toggle on the [`MODE_PIN`] row, off
+/// until asked for.
+///
 /// There is no matching menu on the receiving side: what the sender hands over
 /// says which mode it is, so [`classify`] reads the mode off it.
 #[cfg(not(feature = "tor"))]
 const MODES: [&str; 2] = ["PIN Exchange", "Code Exchange"];
 #[cfg(feature = "tor")]
-const MODES: [&str; 4] = [
+const MODES: [&str; 3] = [
     "PIN Exchange",
     "Code Exchange",
     "Tor Onion Service (experimental)",
-    "PIN Exchange, anonymous signaling (experimental)",
 ];
 
 /// One line of explanation per entry in [`MODES`].
@@ -74,21 +79,35 @@ const MODE_HINTS: [&str; 2] = [
     "Hand-carried connection codes. Not implemented in the CLI yet.",
 ];
 #[cfg(feature = "tor")]
-const MODE_HINTS: [&str; 4] = [
+const MODE_HINTS: [&str; 3] = [
     "A short PIN over relays, then a direct WebRTC transfer.",
     "Hand-carried connection codes. Not implemented in the CLI yet.",
     "An onion address and a password. Slow; up to 100 MiB.",
-    "The same transfer; signaling over Tor, so relays never see an IP.",
 ];
 
 const MODE_PIN: usize = 0;
 #[cfg(feature = "tor")]
 const MODE_TOR: usize = 2;
-/// PIN Exchange with the signaling carried to onion relays. Last rather than
-/// beside [`MODE_PIN`] so the first three rows keep the numbering the web app
-/// and the Tor mode already established.
+
+/// The key that turns anonymous signaling on and off on the [`MODE_PIN`] row.
 #[cfg(feature = "tor")]
-const MODE_ANONYMOUS: usize = 3;
+const ANONYMOUS_KEY: char = 'a';
+
+/// What the toggle under the menu says, given its state.
+#[cfg(feature = "tor")]
+fn anonymous_toggle_line(on: bool) -> &'static str {
+    if on {
+        "[x] Anonymous signaling (experimental)   a to turn off"
+    } else {
+        "[ ] Anonymous signaling (experimental)   a to turn on"
+    }
+}
+
+/// What the toggle does, said the same way whichever state it is in: this is
+/// the line someone reads to decide, so it cannot only appear once they have.
+#[cfg(feature = "tor")]
+const ANONYMOUS_TOGGLE_HINT: &str =
+    "Signaling over Tor, so relays never see an IP. Slow to start; longer PIN.";
 
 const CODE_EXCHANGE_UNAVAILABLE: &str =
     "Code Exchange is not implemented in the CLI yet — use PIN Exchange.";
@@ -123,12 +142,19 @@ enum Screen {
         selected: usize,
         /// Set when the highlighted mode cannot be started, cleared on move.
         notice: Option<String>,
+        /// Whether PIN Exchange will signal over the onion relay pool. Only a
+        /// `tor` build can turn it on — there is no client to reach that pool
+        /// with otherwise — so it is false throughout a build without one.
+        anonymous: bool,
     },
     /// The browser is shared by every send mode, so it carries the mode it was
     /// entered from: that decides which plan the wizard finishes with, and
     /// which row Esc returns to on the mode menu.
     FileBrowser {
         mode: usize,
+        /// Carried for the same reason as `mode`: it is part of the answer the
+        /// mode menu gave, and Esc has to return to the menu still holding it.
+        anonymous: bool,
         browser: Browser,
     },
     /// Receiving picks a directory first, because the mode is not known until
@@ -312,11 +338,21 @@ pub async fn run_wizard(terminal: &mut DefaultTerminal) -> Result<Option<WizardP
 fn handle_key(screen: Screen, key: KeyEvent) -> Step {
     match screen {
         Screen::MainMenu { selected } => main_menu_key(selected, key),
-        Screen::ModeMenu { selected, .. } => mode_menu_key(selected, key),
-        Screen::FileBrowser { mode, mut browser } => match browser.handle_key(key) {
-            BrowserStep::Stay => Step::Continue(Screen::FileBrowser { mode, browser }),
-            BrowserStep::Back => Step::Continue(mode_menu_at(mode)),
-            BrowserStep::Confirm => Step::Finish(send_plan(mode, browser.selection())),
+        Screen::ModeMenu {
+            selected, anonymous, ..
+        } => mode_menu_key(selected, anonymous, key),
+        Screen::FileBrowser {
+            mode,
+            anonymous,
+            mut browser,
+        } => match browser.handle_key(key) {
+            BrowserStep::Stay => Step::Continue(Screen::FileBrowser {
+                mode,
+                anonymous,
+                browser,
+            }),
+            BrowserStep::Back => Step::Continue(mode_menu_at(mode, anonymous)),
+            BrowserStep::Confirm => Step::Finish(send_plan(mode, anonymous, browser.selection())),
         },
         Screen::OutputDir { mut picker } => match picker.handle_key(key) {
             DirPickerStep::Stay => Step::Continue(Screen::OutputDir { picker }),
@@ -346,18 +382,20 @@ fn handle_key(screen: Screen, key: KeyEvent) -> Step {
 }
 
 /// The plan a confirmed send selection produces in `mode`.
-fn send_plan(mode: usize, paths: Vec<PathBuf>) -> WizardPlan {
+///
+/// `anonymous` only ever reaches PIN Exchange: it is the length its PINs are
+/// minted at, which is the whole of what the option changes.
+fn send_plan(mode: usize, anonymous: bool, paths: Vec<PathBuf>) -> WizardPlan {
     match mode {
         #[cfg(feature = "tor")]
         MODE_TOR => WizardPlan::SendTor(paths),
-        #[cfg(feature = "tor")]
-        MODE_ANONYMOUS => WizardPlan::SendPin {
-            paths,
-            pin_kind: PinKind::Anonymous,
-        },
         _ => WizardPlan::SendPin {
             paths,
-            pin_kind: PinKind::Standard,
+            pin_kind: if anonymous {
+                PinKind::Anonymous
+            } else {
+                PinKind::Standard
+            },
         },
     }
 }
@@ -389,36 +427,50 @@ fn main_menu_key(selected: usize, key: KeyEvent) -> Step {
     }
 }
 
-/// The send mode menu, with the first mode highlighted.
+/// The send mode menu, with the first mode highlighted and the option off.
 fn mode_menu() -> Screen {
-    mode_menu_at(MODE_PIN)
+    mode_menu_at(MODE_PIN, false)
 }
 
-/// The send mode menu with `selected` highlighted — what going back from the
-/// file browser returns to.
-fn mode_menu_at(selected: usize) -> Screen {
+/// The send mode menu as it was left — what going back from the file browser
+/// returns to.
+fn mode_menu_at(selected: usize, anonymous: bool) -> Screen {
     Screen::ModeMenu {
         selected,
         notice: None,
+        anonymous,
     }
 }
 
-fn mode_menu_key(selected: usize, key: KeyEvent) -> Step {
-    let stay = |notice: Option<String>| Step::Continue(Screen::ModeMenu { selected, notice });
+fn mode_menu_key(selected: usize, anonymous: bool, key: KeyEvent) -> Step {
+    let stay = |notice: Option<String>| {
+        Step::Continue(Screen::ModeMenu {
+            selected,
+            notice,
+            anonymous,
+        })
+    };
 
     // Code Exchange is a placeholder that keeps the CLI's mode numbering
     // aligned with the web app's; every other mode runs a transfer.
     #[cfg(not(feature = "tor"))]
     let implemented = selected == MODE_PIN;
     #[cfg(feature = "tor")]
-    let implemented =
-        selected == MODE_PIN || selected == MODE_TOR || selected == MODE_ANONYMOUS;
+    let implemented = selected == MODE_PIN || selected == MODE_TOR;
+
+    // The option belongs to PIN Exchange, so the key does nothing on any other
+    // row rather than setting something that row would ignore.
+    #[cfg(feature = "tor")]
+    if key.code == KeyCode::Char(ANONYMOUS_KEY) && selected == MODE_PIN {
+        return Step::Continue(mode_menu_at(selected, !anonymous));
+    }
 
     match key.code {
         KeyCode::Enter if !implemented => stay(Some(CODE_EXCHANGE_UNAVAILABLE.to_string())),
         KeyCode::Enter => match Browser::new() {
             Ok(browser) => Step::Continue(Screen::FileBrowser {
                 mode: selected,
+                anonymous,
                 browser,
             }),
             Err(_) => stay(None),
@@ -427,6 +479,7 @@ fn mode_menu_key(selected: usize, key: KeyEvent) -> Step {
         _ => Step::Continue(Screen::ModeMenu {
             selected: menu_move(selected, MODES.len(), &key),
             notice: None,
+            anonymous,
         }),
     }
 }
@@ -625,9 +678,15 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
             widgets::key_hints(f, inner, "↑/↓ move · Enter select · q quit");
         }
 
-        Screen::ModeMenu { selected, notice } => {
+        Screen::ModeMenu {
+            selected,
+            notice,
+            anonymous,
+        } => {
             let inner = widgets::screen_frame(f, "send");
-            let area = widgets::centered(inner, 60, 7);
+            // Three rows under the menu: the highlighted mode's hint, then the
+            // option that belongs to PIN Exchange and what it does.
+            let area = widgets::centered(inner, 76, MODES.len() as u16 + 5);
             let [title, _, list, extra] = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Length(1),
@@ -637,10 +696,23 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
             .areas(area);
             f.render_widget(Paragraph::new("How do you want to connect?"), title);
             widgets::menu(f, list, &MODES, *selected);
+            let [hint, option, option_hint] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .areas(extra);
             match notice {
-                Some(notice) => widgets::error_line(f, extra, notice),
-                None => f.render_widget(Paragraph::new(MODE_HINTS[*selected]).dim(), extra),
+                Some(notice) => widgets::error_line(f, hint, notice),
+                None => f.render_widget(Paragraph::new(MODE_HINTS[*selected]).dim(), hint),
             }
+            #[cfg(feature = "tor")]
+            if *selected == MODE_PIN {
+                f.render_widget(Paragraph::new(anonymous_toggle_line(*anonymous)), option);
+                f.render_widget(Paragraph::new(ANONYMOUS_TOGGLE_HINT).dim(), option_hint);
+            }
+            #[cfg(not(feature = "tor"))]
+            let _ = (anonymous, option, option_hint);
             widgets::key_hints(f, inner, "↑/↓ move · Enter select · Esc back");
         }
 
@@ -755,9 +827,12 @@ mod tests {
 
     #[test]
     fn code_exchange_reports_that_it_is_not_implemented() {
-        let step = mode_menu_key(1, press(KeyCode::Enter));
+        let step = mode_menu_key(1, false, press(KeyCode::Enter));
 
-        let Step::Continue(Screen::ModeMenu { selected, notice }) = step else {
+        let Step::Continue(Screen::ModeMenu {
+            selected, notice, ..
+        }) = step
+        else {
             panic!("Code Exchange should stay on the mode menu");
         };
         assert_eq!(selected, 1);
@@ -766,9 +841,12 @@ mod tests {
 
     #[test]
     fn moving_off_a_notice_clears_it() {
-        let step = mode_menu_key(1, press(KeyCode::Up));
+        let step = mode_menu_key(1, false, press(KeyCode::Up));
 
-        let Step::Continue(Screen::ModeMenu { selected, notice }) = step else {
+        let Step::Continue(Screen::ModeMenu {
+            selected, notice, ..
+        }) = step
+        else {
             panic!("expected the mode menu");
         };
         assert_eq!(selected, 0);
@@ -778,7 +856,8 @@ mod tests {
     #[test]
     fn escaping_the_mode_menu_reselects_send() {
         // The mode menu is the sending side's alone, so Esc lands back on Send.
-        let Step::Continue(Screen::MainMenu { selected }) = mode_menu_key(0, press(KeyCode::Esc))
+        let Step::Continue(Screen::MainMenu { selected }) =
+            mode_menu_key(0, false, press(KeyCode::Esc))
         else {
             panic!("Esc should return to the main menu");
         };
@@ -788,7 +867,7 @@ mod tests {
     #[cfg(feature = "tor")]
     #[test]
     fn the_tor_mode_starts_a_selection_rather_than_a_notice() {
-        let step = mode_menu_key(MODE_TOR, press(KeyCode::Enter));
+        let step = mode_menu_key(MODE_TOR, false, press(KeyCode::Enter));
         let Step::Continue(Screen::FileBrowser { mode, .. }) = step else {
             panic!("Tor should open the file browser");
         };
@@ -800,20 +879,77 @@ mod tests {
     #[test]
     fn the_selected_mode_decides_the_send_plan() {
         assert!(matches!(
-            send_plan(MODE_TOR, vec![PathBuf::from("a")]),
+            send_plan(MODE_TOR, false, vec![PathBuf::from("a")]),
             WizardPlan::SendTor(_)
         ));
         assert!(matches!(
-            send_plan(MODE_PIN, vec![PathBuf::from("a")]),
+            send_plan(MODE_PIN, false, vec![PathBuf::from("a")]),
             WizardPlan::SendPin {
                 pin_kind: PinKind::Standard,
                 ..
             }
         ));
-        // The only thing the anonymous entry changes is the length of the PIN
-        // this transfer mints, which is what carries the mode to the receiver.
+        // The only thing the option changes is the length of the PINs this
+        // transfer mints, which is what carries the mode to the receiver.
         assert!(matches!(
-            send_plan(MODE_ANONYMOUS, vec![PathBuf::from("a")]),
+            send_plan(MODE_PIN, true, vec![PathBuf::from("a")]),
+            WizardPlan::SendPin {
+                pin_kind: PinKind::Anonymous,
+                ..
+            }
+        ));
+    }
+
+    /// The option is PIN Exchange's, the way the web app has it under that
+    /// mode's advanced options rather than as a mode of its own.
+    #[cfg(feature = "tor")]
+    #[test]
+    fn the_anonymous_toggle_belongs_to_pin_exchange_alone() {
+        let toggle = press(KeyCode::Char(ANONYMOUS_KEY));
+
+        let Step::Continue(Screen::ModeMenu {
+            selected, anonymous, ..
+        }) = mode_menu_key(MODE_PIN, false, toggle)
+        else {
+            panic!("the toggle should stay on the mode menu");
+        };
+        assert_eq!(selected, MODE_PIN);
+        assert!(anonymous, "a should turn the option on");
+
+        // And back off again: it is a toggle, not a one-way switch.
+        let Step::Continue(Screen::ModeMenu { anonymous, .. }) =
+            mode_menu_key(MODE_PIN, true, toggle)
+        else {
+            panic!("the toggle should stay on the mode menu");
+        };
+        assert!(!anonymous);
+
+        // On the Tor row the key is not a toggle, so it falls through to the
+        // menu's ordinary handling and changes nothing.
+        let Step::Continue(Screen::ModeMenu {
+            selected, anonymous, ..
+        }) = mode_menu_key(MODE_TOR, false, toggle)
+        else {
+            panic!("expected the mode menu");
+        };
+        assert_eq!(selected, MODE_TOR);
+        assert!(!anonymous);
+    }
+
+    /// Turning it on and then picking files has to reach the plan: the browser
+    /// sits between the two and carries the answer across.
+    #[cfg(feature = "tor")]
+    #[test]
+    fn the_toggle_survives_the_file_browser() {
+        let Step::Continue(Screen::FileBrowser { mode, anonymous, .. }) =
+            mode_menu_key(MODE_PIN, true, press(KeyCode::Enter))
+        else {
+            panic!("PIN Exchange should open the file browser");
+        };
+        assert_eq!(mode, MODE_PIN);
+        assert!(anonymous);
+        assert!(matches!(
+            send_plan(mode, anonymous, vec![PathBuf::from("a")]),
             WizardPlan::SendPin {
                 pin_kind: PinKind::Anonymous,
                 ..

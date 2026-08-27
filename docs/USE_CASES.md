@@ -86,9 +86,10 @@ cold first, which takes about a minute before anything else happens, and the
 relay pool is community-maintained and monitored by nobody — expect this to fail
 more often than an ordinary PIN Exchange.
 
-In the wizard, the sending side chooses **Send** and then **PIN Exchange,
-anonymous signaling**; the receiving side does exactly what it does for any
-other PIN.
+In the wizard, the sending side chooses **Send**, then **PIN Exchange**, and
+presses `a` to turn **Anonymous signaling** on before picking files — it is an
+option of that mode, not a mode of its own, exactly as it is in the web app.
+The receiving side does exactly what it does for any other PIN.
 
 Test mode:
 

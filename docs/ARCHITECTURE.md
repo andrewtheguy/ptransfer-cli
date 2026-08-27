@@ -220,7 +220,9 @@ message; a binary frame is a protocol error rather than a silent drop.
 **Where the mode is read.** `PinKind` and `classify_pin` in `src/crypto/pin.rs`
 turn the PIN's length into the pool `NostrClient::connect` dials; nothing else
 in the CLI decides it and there is no receive-side flag. `test send
---anonymous` mints the longer PIN. A build without the `tor` feature still
+--anonymous` mints the longer PIN, and so does the wizard's `a` toggle on the
+PIN Exchange row — an option of that mode rather than a mode beside it, which
+is where the web app keeps it too. A build without the `tor` feature still
 recognizes such a PIN and says what is missing, rather than rejecting it as
 malformed. The Tor transfer mode's one-time password selects no relay pool, so
 it is checked against the ordinary length alone.

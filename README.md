@@ -113,10 +113,11 @@ Transfers run inside the TUI with live status and progress.
 
 Only the sending side picks a mode. Its menu lists the web app's modes in the
 web app's order, so an option's position means the same thing in both, and adds
-the CLI's own two Tor-backed entries — Tor Onion Service and PIN Exchange with
-anonymous signaling — after them in a build with the `tor` feature. Picking Code
-Exchange says it is not implemented and stays on the menu; the other modes run a
-transfer.
+the CLI's own Tor Onion Service after them in a build with the `tor` feature.
+Anonymous signaling is not a mode there either: it is an option of PIN
+Exchange, toggled with `a` on that row and off unless asked for, the same place
+the web app keeps it. Picking Code Exchange says it is not implemented and
+stays on the menu; the other modes run a transfer.
 
 The receiving side is never asked which mode to use. A PIN and an onion address
 are told apart by their own contents, and a PIN's length says which relay pool
