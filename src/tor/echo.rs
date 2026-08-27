@@ -13,7 +13,7 @@ use arti_client::DataStream;
 
 use super::client::EphemeralTorClient;
 use super::service::OnionListener;
-use super::{is_disconnect, shutdown_signal, split_address};
+use super::{display_address, is_disconnect, shutdown_signal, split_address};
 
 /// Keystore nickname for the echo service.
 const NICKNAME: &str = "ptransfer-poc";
@@ -30,7 +30,7 @@ pub async fn serve(port: u16) -> Result<()> {
     let tor = EphemeralTorClient::bootstrap().await?;
     let mut listener = OnionListener::launch(&tor, NICKNAME)?;
 
-    println!("{}:{port}", listener.onion());
+    println!("{}", display_address(listener.onion(), port));
     log::info!(
         "publishing descriptor for {}; this usually takes under a minute",
         listener.onion()
@@ -102,9 +102,10 @@ pub async fn connect(address: &str, port: u16, message: &str) -> Result<String> 
         bail!("the message must be a single line");
     }
 
-    // `serve` prints `<address>:<port>`, so accept that verbatim. Validate it
-    // before bootstrapping, which otherwise spends tens of seconds fetching a
-    // directory only to reject the address afterwards.
+    // `serve` prints the address with the default port left implicit, so accept
+    // that verbatim. Validate it before bootstrapping, which otherwise spends
+    // tens of seconds fetching a directory only to reject the address
+    // afterwards.
     let (host, port) = split_address(address, port)?;
     let tor = EphemeralTorClient::bootstrap().await?;
 

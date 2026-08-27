@@ -139,7 +139,7 @@ rendezvous.
 
 ```bash
 ptransfer tor send ./file.bin
-# address:  zrmxlosp6cvmkhxwhx7267wkvqyztsrmloqw76eu4fhn2gsbg5zk4kad.onion:9735
+# address:  zrmxlosp6cvmkhxwhx7267wkvqyztsrmloqw76eu4fhn2gsbg5zk4kad.onion
 # password: QBp9UR873Xzn
 # ready
 ```
@@ -158,8 +158,10 @@ it in (`printf '%s\n' "$PASSWORD" | ptransfer tor receive <address>`).
 
 `send` prints the address and password as soon as they exist, then `ready` once
 the descriptor is published and the service is actually reachable — wait for
-`ready` before connecting. A port in the address wins over `--port`, which
-otherwise sets the onion virtual port on either side. Multiple paths or a folder
+`ready` before connecting. The printed address leaves the default virtual
+port (9735) implicit, since neither side offers it as a choice; `--port` sets
+another one, which then shows up in the address, and a port in the address wins
+over `--port` on the receiving side. Multiple paths or a folder
 are sent as one ZIP, exactly as in PIN Exchange. If the destination file already
 exists the receiver fails; pass `--overwrite` to replace it.
 
@@ -189,14 +191,14 @@ publishes an ephemeral onion address and echoes back every line it receives:
 
 ```bash
 ptransfer tor serve
-# zrmxlosp6cvmkhxwhx7267wkvqyztsrmloqw76eu4fhn2gsbg5zk4kad.onion:9735
+# zrmxlosp6cvmkhxwhx7267wkvqyztsrmloqw76eu4fhn2gsbg5zk4kad.onion
 # ready
 ```
 
 Instance B sends one line to that address and prints the echo:
 
 ```bash
-ptransfer tor connect <address>.onion:9735 --message hello
+ptransfer tor connect <address>.onion --message hello
 # hello
 ```
 

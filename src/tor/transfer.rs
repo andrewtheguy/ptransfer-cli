@@ -34,7 +34,7 @@ use arti_client::DataStream;
 
 use super::service::OnionListener;
 use super::wire::TorMessenger;
-use super::{shutdown_signal, split_address};
+use super::{display_address, shutdown_signal, split_address};
 
 /// Largest payload a Tor transfer carries, measured on the input.
 ///
@@ -132,9 +132,16 @@ pub async fn send(paths: Vec<PathBuf>, port: u16) -> Result<()> {
 
     let tor = EphemeralTorClient::bootstrap().await?;
     let mut listener = OnionListener::launch(&tor, NICKNAME)?;
+    // Two spellings of one address: the canonical form the handshake binds,
+    // and the shorter form the receiver is asked to retype.
     let onion = format!("{}:{}", listener.onion(), port);
 
-    ui::show_tor_address(&source.file_name, source.estimated_size, &onion, &password);
+    ui::show_tor_address(
+        &source.file_name,
+        source.estimated_size,
+        &display_address(listener.onion(), port),
+        &password,
+    );
     log::info!("publishing the descriptor; this usually takes under a minute");
     listener.wait_until_published().await?;
     ui::tor_published();
@@ -328,7 +335,10 @@ pub async fn receive(
     let onion = format!("{host}:{port}");
 
     let tor = EphemeralTorClient::bootstrap().await?;
-    ui::status(&format!("Connecting to {onion}..."));
+    ui::status(&format!(
+        "Connecting to {}...",
+        display_address(&host, port)
+    ));
     let stream = tor
         .client()
         .connect((host.as_str(), port))
