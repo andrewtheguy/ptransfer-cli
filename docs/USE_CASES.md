@@ -47,7 +47,8 @@ ptransfer test receive <PIN>
 Needs a build with the `tor` feature. The sender publishes a throwaway onion
 service; the address and the printed password are the only things the receiver
 needs, and no relay or signaling server is involved at all. The other end may be
-another CLI or a pTransfer browser tab, at most 1 MiB per transfer.
+another CLI or a pTransfer browser tab, at most 100 MiB per transfer — and
+slow enough that far less than that is the sensible size.
 
 In the wizard, choose **Send** or **Receive** and then **Tor Onion Service**.
 The sending side shows the address and password to hand over; the receiving side

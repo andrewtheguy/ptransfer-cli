@@ -33,15 +33,29 @@ use super::service::OnionListener;
 use super::wire::TorMessenger;
 use super::{shutdown_signal, split_address};
 
-/// Largest payload a Tor transfer carries in v1, measured on the input.
-pub const MAX_TRANSFER_BYTES: u64 = 1024 * 1024;
+/// Largest payload a Tor transfer carries, measured on the input.
+///
+/// The spec's number, and the web app spends it on its relayed transfers too:
+/// both paths push bytes through third parties at a fraction of a data
+/// channel's speed and neither can resume. It is a hard limit because it is
+/// the receiver's rule as well as the sender's — a peer that ignored it would
+/// only find out after a bootstrap and a handshake.
+pub const MAX_TRANSFER_BYTES: u64 = 100 * 1024 * 1024;
+
+/// The size past which a Tor transfer is worth a word to the operator. Advice
+/// printed once, never enforced: a circuit's throughput is the luck of the
+/// relays it was built from, so the same size can arrive in moments or crawl.
+/// A fixed ceiling would refuse transfers that would have finished fine.
+pub const SUGGESTED_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Wire allowance for that payload. A single file is deflated on the wire,
 /// which grows incompressible input very slightly, and a generated ZIP adds
 /// per-entry headers — neither is known until the bytes are produced, so the
 /// wire ceiling carries a margin over the payload limit that is enforced on the
-/// input.
-const MAX_WIRE_BYTES: u64 = MAX_TRANSFER_BYTES + 64 * 1024;
+/// input. A flat 1 MiB: deflate's worst case is a fraction of a percent, and
+/// the rest is headroom for a selection of many small files, whose ZIP headers
+/// are what actually add up.
+const MAX_WIRE_BYTES: u64 = MAX_TRANSFER_BYTES + 1024 * 1024;
 
 /// Keystore nickname for the transfer service. With the in-memory keystore
 /// there is only ever one service per process and no key to look up again
@@ -53,15 +67,18 @@ const NICKNAME: &str = "ptransfer-transfer";
 /// convention and the address dies with the process either way.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// How long one accepted connection may take before the sender drops it and
-/// goes back to waiting.
+/// How long an accepted connection may take to authenticate before the sender
+/// drops it and goes back to waiting.
 ///
 /// Anyone who has the address can open the port, so an accepted connection is
 /// not yet a receiver, and it must not be able to hold the service against the
-/// real one. The bound covers a whole turn — the handshake, a human at the
-/// receiver's overwrite prompt, and a megabyte crawling down a Tor circuit —
-/// so it is generous; the point is only that it exists.
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// real one. It covers the handshake and the receiver's answer to it — a human
+/// at an overwrite prompt is inside that — but not the transfer: once a peer
+/// has proved it knows the password it is the receiver, and `run_sender`'s
+/// stall window is what polices it from there. A wall clock over the transfer
+/// would just be a second, worse size limit, since how long a hundred
+/// megabytes takes to crawl down a Tor circuit is not knowable in advance.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// How many connections may fail to authenticate before the sender gives up.
 ///
@@ -81,6 +98,14 @@ pub async fn send(paths: Vec<PathBuf>, port: u16) -> Result<()> {
         prepare_send_source_with_cap(&paths, MAX_TRANSFER_BYTES)
     })
     .await??;
+    // Advice, not a gate: the transfer goes ahead either way.
+    if source.estimated_size > SUGGESTED_MAX_BYTES {
+        ui::status(&format!(
+            "{} over Tor: speed depends on the circuit, and a transfer that \
+             drops starts over. Sending anyway.",
+            format_bytes(source.estimated_size)
+        ));
+    }
     let password = generate_pin()?;
 
     let tor = EphemeralTorClient::bootstrap().await?;
@@ -194,12 +219,12 @@ async fn serve_until_sent(
     }
 }
 
-/// The sender's side of one accepted connection, bounded by
-/// [`CONNECTION_TIMEOUT`].
+/// The sender's side of one accepted connection: authenticate the peer, then
+/// hand it the file.
 ///
-/// The bound is the whole point of this wrapper: a stalled turn is reported as
-/// a failed connection, which is what it is, and the caller goes back to
-/// waiting for the receiver it is actually expecting.
+/// Only the authentication is on a clock, and a peer that stalls through it is
+/// reported as a failed connection — which is what it is — so the caller goes
+/// back to waiting for the receiver it is actually expecting.
 async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     messenger: &mut TorMessenger<S>,
     password: &str,
@@ -207,28 +232,19 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     metadata: &TransferMetadata,
     source: &SendSource,
 ) -> Result<ServedConnection> {
-    tokio::time::timeout(
-        CONNECTION_TIMEOUT,
-        authenticate_and_send(messenger, password, onion, metadata, source),
+    let handshake = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        run_service_handshake(messenger, password, onion, metadata),
     )
     .await
     .map_err(|_| {
         anyhow!(
-            "the peer went quiet for {}s",
-            CONNECTION_TIMEOUT.as_secs()
+            "the peer went quiet for {}s without authenticating",
+            HANDSHAKE_TIMEOUT.as_secs()
         )
-    })?
-}
+    })??;
 
-/// Authenticate the peer, then hand it the file.
-async fn authenticate_and_send<S: AsyncRead + AsyncWrite + Unpin + Send>(
-    messenger: &mut TorMessenger<S>,
-    password: &str,
-    onion: &str,
-    metadata: &TransferMetadata,
-    source: &SendSource,
-) -> Result<ServedConnection> {
-    match run_service_handshake(messenger, password, onion, metadata).await? {
+    match handshake {
         ServiceHandshake::Ready(keys) => {
             ui::status("Receiver authenticated; sending...");
             run_sender(messenger, &keys.content, source, MAX_WIRE_BYTES).await?;

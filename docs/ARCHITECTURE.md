@@ -219,9 +219,11 @@ receiver's `ACK`, and its absence is reported — but not as a failure, since by
 then the file is written and verified and only the sender's knowledge of that
 is in doubt.
 
-**Input caps.** The spec's 1 MiB bound is enforced on the input when the
+**Input caps.** The spec's 100 MiB bound is enforced on the input when the
 selection is prepared (`prepare_send_source_with_cap`), and the wire ceiling
-carries the spec's margin over it.
+carries the spec's margin over it. The spec's 1 MiB *suggestion* is exactly
+that: an oversized selection prints a line saying the transfer will be slow and
+then goes ahead.
 
 ## Wire Encoding
 
@@ -291,8 +293,8 @@ incoming data-channel message, including
 `DONE:<total_chunks>:<total_bytes>`.
 
 The maximum transfer size is the transport's: 2 GiB (`MAX_MESSAGE_SIZE`) over a
-data channel, matching pTransfer, and 1 MiB over Tor. Both ends stream chunk by
-chunk, so neither bound is RAM.
+data channel, matching pTransfer, and 100 MiB over Tor. Both ends stream chunk
+by chunk, so neither bound is RAM.
 
 Both send paths run the same shape: a blocking worker produces wire bytes — a
 deflater over one file, or a ZIP writer over a walked selection — into a chunk
@@ -309,4 +311,4 @@ enforces the limit against actual output and seals the final length in `DONE`.
 The CLI intentionally has no legacy signaling protocol, no resume path, no QR
 support, no Code Exchange, no relay discovery, and no custom fallback mode. The
 Tor transport interoperates with the web app in both directions and is capped at
-1 MiB per transfer, with no resume.
+100 MiB per transfer, with no resume.

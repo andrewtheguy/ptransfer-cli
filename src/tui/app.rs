@@ -59,7 +59,7 @@ const MODE_HINTS: [&str; 2] = [
 const MODE_HINTS: [&str; 3] = [
     "A short PIN over relays, then a direct WebRTC transfer.",
     "Hand-carried connection codes. Not implemented in the CLI yet.",
-    "An onion address and a password. CLI to CLI, up to 1 MiB.",
+    "An onion address and a password. Slow; up to 100 MiB.",
 ];
 
 const MODE_PIN: usize = 0;
