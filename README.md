@@ -156,8 +156,10 @@ new address and there is no key on disk to lose. Arti still requires filesystem
 paths for its directory cache and client state (fully in-memory state is
 [arti#1186](https://gitlab.torproject.org/tpo/core/arti/-/work_items/1186), not
 scheduled), so those go in a private directory under `/dev/shm` — a tmpfs, so in
-RAM — falling back to the platform temp directory off Linux. The whole tree is
-deleted when the process exits.
+RAM — falling back to the platform temp directory off Linux. That tree is
+deleted on a graceful shutdown: `serve` unwinds on Ctrl-C or `SIGTERM`, and
+`connect` on returning. A process killed outright leaves it behind until the
+next reboot (or the platform's temp-directory cleanup off Linux).
 
 Because nothing is cached between runs, both commands bootstrap the Tor
 directory from scratch; expect several seconds before `serve` prints an address

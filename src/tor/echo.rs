@@ -14,7 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, AsyncWriteExt, BufReader};
 use tor_cell::relaycell::msg::{Connected, End};
 use tor_hsservice::config::OnionServiceConfigBuilder;
 use tor_hsservice::status::State;
-use tor_hsservice::{HsNickname, StreamRequest, handle_rend_requests};
+use tor_hsservice::{HsId, HsNickname, StreamRequest, handle_rend_requests};
 use tor_proto::stream::IncomingStreamRequest;
 
 use super::client::EphemeralTorClient;
@@ -189,18 +189,29 @@ fn is_disconnect(err: &std::io::Error) -> bool {
         .is_some_and(|e| matches!(e, tor_proto::Error::EndReceived(_)))
 }
 
-/// Split `address` into a host and a port, falling back to `default_port`.
+/// Split `address` into a v3 onion host and a port, falling back to
+/// `default_port`.
 ///
 /// A port in the address wins over `default_port`, so the line `serve` prints
 /// can be pasted straight into `connect`.
-fn split_address(address: &str, default_port: u16) -> Result<(&str, u16)> {
-    let Some((host, port)) = address.rsplit_once(':') else {
-        return Ok((address, default_port));
+///
+/// The host has to be a v3 `.onion` address, checksum and all. Arti would
+/// otherwise happily resolve anything else through an exit node, so a typo
+/// that drops the suffix would leave the onion network and reach the plain
+/// internet from this machine's Tor circuit.
+fn split_address(address: &str, default_port: u16) -> Result<(HsId, u16)> {
+    let (host, port) = match address.rsplit_once(':') {
+        Some((host, port)) => (
+            host,
+            port.parse()
+                .with_context(|| format!("invalid port in address {address:?}"))?,
+        ),
+        None => (address, default_port),
     };
 
-    let port = port
+    let host = host
         .parse()
-        .with_context(|| format!("invalid port in address {address:?}"))?;
+        .with_context(|| format!("invalid v3 onion address {host:?}"))?;
     Ok((host, port))
 }
 
@@ -210,14 +221,17 @@ pub async fn connect(address: &str, port: u16, message: &str) -> Result<String> 
         bail!("the message must be a single line");
     }
 
-    // `serve` prints `<address>:<port>`, so accept that verbatim.
+    // `serve` prints `<address>:<port>`, so accept that verbatim. Validate it
+    // before bootstrapping, which otherwise spends tens of seconds fetching a
+    // directory only to reject the address afterwards.
     let (host, port) = split_address(address, port)?;
+    let host = host.display_unredacted().to_string();
     let tor = EphemeralTorClient::bootstrap().await?;
 
     log::info!("connecting to {host}:{port}");
     let stream = tor
         .client()
-        .connect((host, port))
+        .connect((host.as_str(), port))
         .await
         .with_context(|| format!("failed to connect to {host}:{port}"))?;
 
@@ -256,26 +270,53 @@ pub async fn connect(address: &str, port: u16, message: &str) -> Result<String> 
 mod tests {
     use super::*;
 
+    /// A real address printed by `serve`, so the checksum is genuine.
+    const ONION: &str = "zrmxlosp6cvmkhxwhx7267wkvqyztsrmloqw76eu4fhn2gsbg5zk4kad.onion";
+
+    /// The host half of a successful split, back as a string.
+    fn split_host(address: &str, default_port: u16) -> (String, u16) {
+        let (host, port) = split_address(address, default_port).unwrap();
+        (host.display_unredacted().to_string(), port)
+    }
+
     #[test]
     fn a_bare_address_uses_the_default_port() {
         assert_eq!(
-            split_address("abc.onion", DEFAULT_PORT).unwrap(),
-            ("abc.onion", DEFAULT_PORT)
+            split_host(ONION, DEFAULT_PORT),
+            (ONION.to_owned(), DEFAULT_PORT)
         );
     }
 
     #[test]
     fn a_port_in_the_address_wins() {
         assert_eq!(
-            split_address("abc.onion:1234", DEFAULT_PORT).unwrap(),
-            ("abc.onion", 1234)
+            split_host(&format!("{ONION}:1234"), DEFAULT_PORT),
+            (ONION.to_owned(), 1234)
         );
     }
 
     #[test]
     fn a_non_numeric_port_is_an_error() {
-        assert!(split_address("abc.onion:", DEFAULT_PORT).is_err());
-        assert!(split_address("abc.onion:http", DEFAULT_PORT).is_err());
+        assert!(split_address(&format!("{ONION}:"), DEFAULT_PORT).is_err());
+        assert!(split_address(&format!("{ONION}:http"), DEFAULT_PORT).is_err());
+    }
+
+    #[test]
+    fn a_non_onion_host_is_an_error() {
+        // Without this, Arti would route these out through an exit node.
+        assert!(split_address("example.com", DEFAULT_PORT).is_err());
+        assert!(split_address("example.com:80", DEFAULT_PORT).is_err());
+        assert!(split_address("127.0.0.1:9735", DEFAULT_PORT).is_err());
+    }
+
+    #[test]
+    fn a_malformed_onion_host_is_an_error() {
+        // Too short to be v3, a bad checksum, and a subdomain.
+        assert!(split_address("abc.onion", DEFAULT_PORT).is_err());
+        let mut wrong = ONION.to_owned();
+        wrong.replace_range(0..1, "a");
+        assert!(split_address(&wrong, DEFAULT_PORT).is_err());
+        assert!(split_address(&format!("www.{ONION}"), DEFAULT_PORT).is_err());
     }
 
     #[test]
