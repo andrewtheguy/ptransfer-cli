@@ -3614,6 +3614,7 @@ version = "0.0.5"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "async-wsocket",
  "base64",
  "bytes",
  "chrono",
@@ -3640,6 +3641,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tor-bytes",
  "tor-cell",
  "tor-chanmgr",

@@ -17,7 +17,11 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Stylize;
 use ratatui::widgets::Paragraph;
 
-use crate::crypto::pin::{PIN_LENGTH, is_valid_pin, pin_char};
+use crate::crypto::pin::{PinKind, classify_pin, pin_char};
+// Only the Tor transport's password field is fixed to one length; a PIN
+// Exchange PIN has two, and `PinKind` is what names them.
+#[cfg(feature = "tor")]
+use crate::crypto::pin::PIN_LENGTH;
 
 use super::dir_picker::{DirPicker, DirPickerStep};
 use super::file_browser::{Browser, BrowserStep};
@@ -26,7 +30,12 @@ use super::widgets;
 
 /// The resolved outcome of the wizard: what to transfer and how.
 pub enum WizardPlan {
-    SendPin(Vec<PathBuf>),
+    SendPin {
+        paths: Vec<PathBuf>,
+        /// Which length the PINs this transfer mints are drawn at, and so
+        /// which relay pool they are published on.
+        pin_kind: PinKind,
+    },
     ReceivePin {
         pin: String,
         output: PathBuf,
@@ -51,10 +60,11 @@ pub enum WizardPlan {
 #[cfg(not(feature = "tor"))]
 const MODES: [&str; 2] = ["PIN Exchange", "Code Exchange"];
 #[cfg(feature = "tor")]
-const MODES: [&str; 3] = [
+const MODES: [&str; 4] = [
     "PIN Exchange",
     "Code Exchange",
     "Tor Onion Service (experimental)",
+    "PIN Exchange, anonymous signaling (experimental)",
 ];
 
 /// One line of explanation per entry in [`MODES`].
@@ -64,15 +74,21 @@ const MODE_HINTS: [&str; 2] = [
     "Hand-carried connection codes. Not implemented in the CLI yet.",
 ];
 #[cfg(feature = "tor")]
-const MODE_HINTS: [&str; 3] = [
+const MODE_HINTS: [&str; 4] = [
     "A short PIN over relays, then a direct WebRTC transfer.",
     "Hand-carried connection codes. Not implemented in the CLI yet.",
     "An onion address and a password. Slow; up to 100 MiB.",
+    "The same transfer; signaling over Tor, so relays never see an IP.",
 ];
 
 const MODE_PIN: usize = 0;
 #[cfg(feature = "tor")]
 const MODE_TOR: usize = 2;
+/// PIN Exchange with the signaling carried to onion relays. Last rather than
+/// beside [`MODE_PIN`] so the first three rows keep the numbering the web app
+/// and the Tor mode already established.
+#[cfg(feature = "tor")]
+const MODE_ANONYMOUS: usize = 3;
 
 const CODE_EXCHANGE_UNAVAILABLE: &str =
     "Code Exchange is not implemented in the CLI yet — use PIN Exchange.";
@@ -89,6 +105,13 @@ const ACCEPTED: &str = "a PIN";
 const ONION_REJECTED: &str = "Not a valid onion address — check for typos";
 #[cfg(not(feature = "tor"))]
 const ONION_REJECTED: &str = "This build has no Tor support — rebuild it with --features tor";
+
+/// What to say about a perfectly good anonymous-signaling PIN this build has
+/// no Tor client to act on. It is not a typo, so it must not be reported as
+/// one.
+#[cfg(not(feature = "tor"))]
+const ANONYMOUS_PIN_REJECTED: &str =
+    "That PIN needs anonymous signaling — rebuild this with --features tor";
 
 enum Screen {
     MainMenu {
@@ -144,7 +167,10 @@ enum Screen {
 /// afterwards, because its password is a separate secret.
 #[derive(Debug, PartialEq, Eq)]
 enum Pasted {
-    Pin(String),
+    /// A PIN, with the mode its length announced: an anonymous one is
+    /// published on a relay pool of onion services, and the receiver is told
+    /// which by the PIN rather than asked.
+    Pin { pin: String, kind: PinKind },
     /// A valid v3 onion address, in whichever of its two spellings was pasted;
     /// the transfer re-splits it into the `<host>:<port>` its handshake binds.
     #[cfg(feature = "tor")]
@@ -190,7 +216,8 @@ impl Rejection {
 /// [`classify`] alone cannot express. The alphabet is ASCII, so a byte length
 /// is a character count here.
 fn looks_like_pin(text: &str) -> bool {
-    text.len() == PIN_LENGTH && text.chars().all(|c| pin_char(c).is_some())
+    PinKind::ALL.iter().any(|kind| kind.length() == text.len())
+        && text.chars().all(|c| pin_char(c).is_some())
 }
 
 /// Whether the text has an onion address's shape, checksum aside.
@@ -214,8 +241,18 @@ fn classify(text: &str) -> Result<Pasted, Rejection> {
         return Err(Rejection::Empty);
     }
 
-    if is_valid_pin(text) {
-        return Ok(Pasted::Pin(text.to_string()));
+    if let Some(kind) = classify_pin(text) {
+        // An anonymous PIN reaches a pool of onion services and nothing else,
+        // so a build without the Tor client cannot act on one however valid it
+        // is.
+        #[cfg(not(feature = "tor"))]
+        if kind == PinKind::Anonymous {
+            return Err(Rejection::Malformed(ANONYMOUS_PIN_REJECTED));
+        }
+        return Ok(Pasted::Pin {
+            pin: text.to_string(),
+            kind,
+        });
     }
 
     // Checked in full, checksum included: Arti resolves anything that is not a
@@ -313,7 +350,15 @@ fn send_plan(mode: usize, paths: Vec<PathBuf>) -> WizardPlan {
     match mode {
         #[cfg(feature = "tor")]
         MODE_TOR => WizardPlan::SendTor(paths),
-        _ => WizardPlan::SendPin(paths),
+        #[cfg(feature = "tor")]
+        MODE_ANONYMOUS => WizardPlan::SendPin {
+            paths,
+            pin_kind: PinKind::Anonymous,
+        },
+        _ => WizardPlan::SendPin {
+            paths,
+            pin_kind: PinKind::Standard,
+        },
     }
 }
 
@@ -366,7 +411,8 @@ fn mode_menu_key(selected: usize, key: KeyEvent) -> Step {
     #[cfg(not(feature = "tor"))]
     let implemented = selected == MODE_PIN;
     #[cfg(feature = "tor")]
-    let implemented = selected == MODE_PIN || selected == MODE_TOR;
+    let implemented =
+        selected == MODE_PIN || selected == MODE_TOR || selected == MODE_ANONYMOUS;
 
     match key.code {
         KeyCode::Enter if !implemented => stay(Some(CODE_EXCHANGE_UNAVAILABLE.to_string())),
@@ -400,7 +446,9 @@ fn receive_entry_key(
     let mut edited = false;
     match key.code {
         KeyCode::Enter => match classify(&input) {
-            Ok(Pasted::Pin(pin)) => return Step::Finish(WizardPlan::ReceivePin { pin, output }),
+            Ok(Pasted::Pin { pin, .. }) => {
+                return Step::Finish(WizardPlan::ReceivePin { pin, output });
+            }
             #[cfg(feature = "tor")]
             Ok(Pasted::Onion(address)) => {
                 return Step::Continue(Screen::TorPassword {
@@ -446,7 +494,9 @@ fn tor_password_key(
     let mut edited = false;
     match key.code {
         KeyCode::Enter => {
-            if is_valid_pin(&password) {
+            // The transport's password is not a PIN Exchange PIN and selects
+            // no relay pool, so only the ordinary length is a password here.
+            if classify_pin(&password) == Some(PinKind::Standard) {
                 return Step::Finish(WizardPlan::ReceiveTor {
                     address,
                     password,
@@ -489,7 +539,10 @@ fn tor_password_key(
         error = None;
     }
     // Say so on the last keystroke rather than waiting for a submit to fail.
-    if error.is_none() && password.len() == PIN_LENGTH && !is_valid_pin(&password) {
+    if error.is_none()
+        && password.len() == PIN_LENGTH
+        && classify_pin(&password) != Some(PinKind::Standard)
+    {
         error = Some("Invalid password: check for typos".to_string());
     }
 
@@ -625,10 +678,15 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
                 // Naming what was recognized is the whole point of the screen:
                 // it is how the receiver sees which mode they are about to run
                 // without ever having been asked.
-                (None, Ok(Pasted::Pin(_))) => f.render_widget(
-                    Paragraph::new(
-                        "PIN detected. After you start, read the confirmation code to the sender.",
-                    )
+                (None, Ok(Pasted::Pin { kind, .. })) => f.render_widget(
+                    Paragraph::new(match kind {
+                        PinKind::Standard => {
+                            "PIN detected. After you start, read the confirmation code to the sender."
+                        }
+                        PinKind::Anonymous => {
+                            "Anonymous-signaling PIN detected — starting Tor first takes a few minutes."
+                        }
+                    })
                     .dim(),
                     extra,
                 ),
@@ -747,7 +805,19 @@ mod tests {
         ));
         assert!(matches!(
             send_plan(MODE_PIN, vec![PathBuf::from("a")]),
-            WizardPlan::SendPin(_)
+            WizardPlan::SendPin {
+                pin_kind: PinKind::Standard,
+                ..
+            }
+        ));
+        // The only thing the anonymous entry changes is the length of the PIN
+        // this transfer mints, which is what carries the mode to the receiver.
+        assert!(matches!(
+            send_plan(MODE_ANONYMOUS, vec![PathBuf::from("a")]),
+            WizardPlan::SendPin {
+                pin_kind: PinKind::Anonymous,
+                ..
+            }
         ));
     }
 
@@ -762,10 +832,51 @@ mod tests {
 
     #[test]
     fn a_pasted_pin_is_recognized_without_being_asked_which_mode_it_is() {
-        let pin = crate::crypto::pin::generate_pin().unwrap();
-        assert_eq!(classify(&pin), Ok(Pasted::Pin(pin.clone())));
+        let pin = crate::crypto::pin::generate_pin(PinKind::Standard).unwrap();
+        assert_eq!(
+            classify(&pin),
+            Ok(Pasted::Pin {
+                pin: pin.clone(),
+                kind: PinKind::Standard
+            })
+        );
         // Surrounding whitespace comes along with almost every copy.
-        assert_eq!(classify(&format!("  {pin}\n")), Ok(Pasted::Pin(pin)));
+        assert_eq!(
+            classify(&format!("  {pin}\n")),
+            Ok(Pasted::Pin {
+                pin,
+                kind: PinKind::Standard
+            })
+        );
+    }
+
+    /// The receiver is never asked whether the sender turned on anonymous
+    /// signaling: the PIN it was handed is longer, and that is the whole
+    /// announcement.
+    #[cfg(feature = "tor")]
+    #[test]
+    fn a_pasted_anonymous_pin_is_recognized_as_one() {
+        let pin = crate::crypto::pin::generate_pin(PinKind::Anonymous).unwrap();
+        assert_eq!(
+            classify(&pin),
+            Ok(Pasted::Pin {
+                pin: pin.clone(),
+                kind: PinKind::Anonymous
+            })
+        );
+    }
+
+    /// Without the Tor client there is no onion relay pool to look on, so a
+    /// perfectly valid anonymous PIN has to be refused — and not as a typo,
+    /// which it is not.
+    #[cfg(not(feature = "tor"))]
+    #[test]
+    fn an_anonymous_pin_is_refused_by_a_build_without_tor() {
+        let pin = crate::crypto::pin::generate_pin(PinKind::Anonymous).unwrap();
+        assert_eq!(
+            classify(&pin),
+            Err(Rejection::Malformed(ANONYMOUS_PIN_REJECTED))
+        );
     }
 
     #[cfg(feature = "tor")]
@@ -813,7 +924,7 @@ mod tests {
 
     #[test]
     fn a_recognized_pin_finishes_the_wizard() {
-        let pin = crate::crypto::pin::generate_pin().unwrap();
+        let pin = crate::crypto::pin::generate_pin(PinKind::Standard).unwrap();
         let Step::Finish(WizardPlan::ReceivePin { pin: entered, .. }) = receive_entry_key(
             PathBuf::from("."),
             format!(" {pin} "),
@@ -864,7 +975,7 @@ mod tests {
         assert!(password.is_empty());
         assert_eq!(cursor, 0);
 
-        let entered = crate::crypto::pin::generate_pin().unwrap();
+        let entered = crate::crypto::pin::generate_pin(PinKind::Standard).unwrap();
         let Step::Finish(WizardPlan::ReceiveTor {
             address, password, ..
         }) = tor_password_key(
@@ -940,7 +1051,7 @@ mod tests {
             cursor: 3,
             error: Some("stale".to_string()),
         };
-        let pin = crate::crypto::pin::generate_pin().unwrap();
+        let pin = crate::crypto::pin::generate_pin(PinKind::Standard).unwrap();
 
         let Step::Continue(Screen::ReceiveEntry {
             input,
@@ -962,7 +1073,7 @@ mod tests {
         // Regression: past PIN_LENGTH the typing guard failed and the keystroke
         // fell through to the shared line editor, which inserted it into the
         // field anyway — past the length cap and past the PIN filter.
-        let full = crate::crypto::pin::generate_pin().unwrap();
+        let full = crate::crypto::pin::generate_pin(PinKind::Standard).unwrap();
         assert_eq!(full.len(), PIN_LENGTH);
 
         for typed in ['x', '*'] {

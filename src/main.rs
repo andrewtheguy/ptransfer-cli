@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 #[cfg(feature = "tor")]
 use ptransfer_cli::tor;
+use ptransfer_cli::crypto::pin::PinKind;
 use ptransfer_cli::util::{OnConflict, is_interrupted};
 use ptransfer_cli::{archive, tui, webrtc};
 
@@ -118,13 +119,24 @@ enum TestCommands {
         /// Files and/or directories to send
         #[arg(required = true, num_args = 1..)]
         paths: Vec<PathBuf>,
+
+        /// Carry signaling to onion-service relays over Tor (experimental).
+        ///
+        /// Mints a 16-character PIN instead of a 12-character one; the
+        /// receiver reads the mode off that length and needs no flag of its
+        /// own. Hides both devices' IP addresses from the relays. The file
+        /// bytes still travel over the direct WebRTC data channel.
+        #[cfg(feature = "tor")]
+        #[arg(long)]
+        anonymous: bool,
     },
 
     /// Receive a file.
+    ///
+    /// The PIN is read from stdin — a prompt at a terminal, one line from a
+    /// pipe — never from the command line. Its length says which relay pool
+    /// the sender is on, so anonymous signaling needs no flag here.
     Receive {
-        /// PIN shown by the sender
-        code: String,
-
         /// Output directory (defaults to the current directory)
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -135,33 +147,36 @@ enum TestCommands {
     },
 }
 
-/// Read the transfer password from stdin.
+/// Read one line of secret from stdin, prompting with `label` at a terminal.
 ///
-/// It is not a command-line argument because an argument is public: every
-/// other process on the machine can read it out of the process list, and an
-/// interactive shell writes it to history. That would matter little for a
-/// secret with a short life, but the receiver holds this one across a Tor
-/// bootstrap — tens of seconds — and it is half of a credential pair that
-/// whoever grabs it can use to collect the file first.
-#[cfg(feature = "tor")]
-async fn read_tor_password() -> Result<String> {
+/// Nothing the receiving side is handed is a command-line argument, because an
+/// argument is public: every other process on the machine can read it out of
+/// the process list, and an interactive shell writes it to history. That would
+/// matter little for a secret with a short life, but the receiver holds one
+/// across a whole connection attempt — tens of seconds for PIN Exchange, and
+/// minutes when a Tor bootstrap is in front of it — and it is the credential
+/// whoever grabs it uses to collect the file first.
+///
+/// `noun` names the value in the two error messages, so a receiver that piped
+/// the wrong thing is told which input was empty.
+async fn read_secret(label: &'static str, noun: &'static str) -> Result<String> {
     use std::io::{BufRead, IsTerminal, Write};
 
-    tokio::task::spawn_blocking(|| {
+    tokio::task::spawn_blocking(move || {
         let stdin = std::io::stdin();
         if stdin.is_terminal() {
-            eprint!("Password: ");
+            eprint!("{label}: ");
             std::io::stderr().flush()?;
         }
         let mut input = String::new();
         if stdin.lock().read_line(&mut input)? == 0 {
-            anyhow::bail!("no password on stdin");
+            anyhow::bail!("no {noun} on stdin");
         }
-        let password = input.trim();
-        if password.is_empty() {
-            anyhow::bail!("no password entered");
+        let secret = input.trim();
+        if secret.is_empty() {
+            anyhow::bail!("no {noun} entered");
         }
-        Ok(password.to_string())
+        Ok(secret.to_string())
     })
     .await?
 }
@@ -211,24 +226,34 @@ async fn async_main() -> Result<()> {
             init_logging(&format!("{log_level},webrtc_ice=error"));
 
             match command {
-                TestCommands::Send { paths } => {
+                TestCommands::Send {
+                    paths,
+                    #[cfg(feature = "tor")]
+                    anonymous,
+                } => {
+                    #[cfg(feature = "tor")]
+                    let pin_kind = if anonymous {
+                        PinKind::Anonymous
+                    } else {
+                        PinKind::Standard
+                    };
+                    #[cfg(not(feature = "tor"))]
+                    let pin_kind = PinKind::Standard;
+
                     let source =
                         tokio::task::spawn_blocking(move || archive::prepare_send_source(&paths))
                             .await??;
-                    webrtc::send_file_nostr(&source).await
+                    webrtc::send_file_nostr(&source, pin_kind).await
                 }
 
-                TestCommands::Receive {
-                    code,
-                    output,
-                    overwrite,
-                } => {
+                TestCommands::Receive { output, overwrite } => {
                     let on_conflict = if overwrite {
                         OnConflict::Overwrite
                     } else {
                         OnConflict::Fail
                     };
-                    webrtc::receive_file_nostr(code.trim(), output, on_conflict).await
+                    let pin = read_secret("PIN", "PIN").await?;
+                    webrtc::receive_file_nostr(&pin, output, on_conflict).await
                 }
             }
         }
@@ -254,7 +279,7 @@ async fn async_main() -> Result<()> {
                     } else {
                         OnConflict::Fail
                     };
-                    let password = read_tor_password().await?;
+                    let password = read_secret("Password", "password").await?;
                     tor::transfer::receive(
                         address.trim(),
                         port,
@@ -302,7 +327,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["ptransfer", "test", "send", "a.txt", "b", "dir"]).unwrap();
         let Some(Commands::Test {
-            command: TestCommands::Send { paths },
+            command: TestCommands::Send { paths, .. },
             ..
         }) = cli.command
         else {
@@ -311,14 +336,42 @@ mod tests {
         assert_eq!(paths.len(), 3);
     }
 
+    /// The sender is the only side that chooses anonymous signaling; the
+    /// receiver is told by the PIN it is handed, so there is deliberately no
+    /// flag for it.
+    #[cfg(feature = "tor")]
+    #[test]
+    fn only_test_send_takes_anonymous() {
+        let cli =
+            Cli::try_parse_from(["ptransfer", "test", "send", "a.txt", "--anonymous"]).unwrap();
+        let Some(Commands::Test {
+            command: TestCommands::Send { anonymous, .. },
+            ..
+        }) = cli.command
+        else {
+            panic!("expected test send");
+        };
+        assert!(anonymous);
+
+        assert!(Cli::try_parse_from(["ptransfer", "test", "receive", "--anonymous"]).is_err());
+    }
+
     #[test]
     fn test_send_requires_a_path() {
         assert!(Cli::try_parse_from(["ptransfer", "test", "send"]).is_err());
     }
 
+    /// The PIN comes from stdin, so an argument that looks like one is rejected
+    /// rather than quietly published in the process list — the same rule the
+    /// Tor transport's password follows.
     #[test]
-    fn test_receive_requires_a_code() {
-        assert!(Cli::try_parse_from(["ptransfer", "test", "receive"]).is_err());
+    fn test_receive_never_takes_the_pin_as_an_argument() {
+        assert!(Cli::try_parse_from(["ptransfer", "test", "receive"]).is_ok());
+        assert!(Cli::try_parse_from(["ptransfer", "test", "receive", "PIN123"]).is_err());
+        assert!(
+            Cli::try_parse_from(["ptransfer", "test", "receive", "PIN123", "--overwrite"])
+                .is_err()
+        );
     }
 
     #[cfg(feature = "tor")]
@@ -411,24 +464,14 @@ mod tests {
 
     #[test]
     fn test_receive_parses_overwrite() {
-        let cli = Cli::try_parse_from([
-            "ptransfer",
-            "test",
-            "receive",
-            "PIN123",
-            "--overwrite",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["ptransfer", "test", "receive", "--overwrite"]).unwrap();
         let Some(Commands::Test {
-            command: TestCommands::Receive {
-                code, overwrite, ..
-            },
+            command: TestCommands::Receive { overwrite, .. },
             ..
         }) = cli.command
         else {
             panic!("expected test receive");
         };
-        assert_eq!(code, "PIN123");
         assert!(overwrite);
     }
 }

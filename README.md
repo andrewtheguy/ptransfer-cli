@@ -20,6 +20,12 @@ file/folder selection, output directory, and PIN entry.
   receiver then reads an 8-character confirmation code to the sender; nothing
   is sent until the sender enters a match. The web app's Code Exchange
   (hand-carried QR/clipboard codes) is web-only and is not implemented here.
+- Anonymous signaling (experimental, behind the `tor` feature) is the same PIN
+  Exchange with the relay sockets carried through Tor to a separate pool of
+  onion-service relays, so no relay sees either device's IP address. The sender
+  turns it on and the PIN it mints is 16 characters instead of 12; the receiver
+  reads the mode off that length and is not asked. File bytes still take the
+  direct WebRTC data channel, so this does not make a transfer anonymous.
 - A single file is deflated on the wire and restored by the receiver. Multiple
   files and folders are bundled into a single ZIP on the fly, exactly like the
   web app (`<folder>_<timestamp>.zip` for one folder, `files_<timestamp>.zip`
@@ -107,31 +113,41 @@ Transfers run inside the TUI with live status and progress.
 
 Only the sending side picks a mode. Its menu lists the web app's modes in the
 web app's order, so an option's position means the same thing in both, and adds
-the CLI's own Tor Onion Service as a third entry in a build with the `tor`
-feature. Picking Code Exchange says it is not implemented and stays on the menu;
-the other modes run a transfer.
+the CLI's own two Tor-backed entries — Tor Onion Service and PIN Exchange with
+anonymous signaling — after them in a build with the `tor` feature. Picking Code
+Exchange says it is not implemented and stays on the menu; the other modes run a
+transfer.
 
 The receiving side is never asked which mode to use. A PIN and an onion address
-are told apart by their own contents, so the single receive box reads the mode
-off what lands in it and names what it recognized — the same way the web app's
-receive screen works. A PIN starts the transfer; an onion address asks for the
-one-time password on the next screen, since that is a separate secret. Something
-of the right shape that fails its checksum is called out as a typo while it is
-still being typed.
+are told apart by their own contents, and a PIN's length says which relay pool
+its sender is on, so the single receive box reads the mode off what lands in it
+and names what it recognized — the same way the web app's receive screen works.
+A PIN starts the transfer; an onion address asks for the one-time password on
+the next screen, since that is a separate secret. Something of the right shape
+that fails its checksum is called out as a typo while it is still being typed.
 
 ### Non-Interactive Test Mode
 
-The `test` subcommand exists for testing only. Initial inputs come from
-arguments; confirmation codes are read from stdin and can be piped.
+The `test` subcommand exists for testing only. Paths and options come from
+arguments; every secret — the PIN, the Tor transport's password, the
+confirmation code — is read from stdin, prompted for at a terminal and piped in
+from a script, so that none of them appears in the process list.
 
 ```bash
 ptransfer test send /path/to/file more-files a-folder
-ptransfer test receive <PIN> --output /path/to/dir
+
+# The PIN is typed at the prompt, or piped
+ptransfer test receive --output /path/to/dir
+echo "$PIN" | ptransfer test receive --output /path/to/dir
+
+# Anonymous signaling (requires --features tor); the receiver needs no flag
+ptransfer test send --anonymous /path/to/file
 ```
 
-The sender prints a case-sensitive 12-character PIN on stdout, and prints a
-fresh one each time it rotates (every 2 minutes) until a receiver claims the
-transfer; enter the PIN currently shown exactly. The receiver then prints an
+The sender prints a case-sensitive 12-character PIN on stdout — 16 characters
+with `--anonymous` — and prints a fresh one each time it rotates (every 2
+minutes) until a receiver claims the transfer; enter the PIN currently shown
+exactly. The receiver then prints an
 8-character confirmation code which the sender must enter before the transfer
 continues. Multiple paths or a folder are sent as one ZIP. If the destination
 file already exists the receiver fails; pass `--overwrite` to replace it.
@@ -271,7 +287,7 @@ The normative wire contract is the sibling pTransfer checkout's
 [`docs/INTEROP_PROTOCOL.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/INTEROP_PROTOCOL.md).
 It covers PIN Exchange and the shared data-channel transfer layer — exactly what
 this CLI implements — and carries an interop protocol version independent of
-pTransfer's app version. This build implements version `2`, declared in
+pTransfer's app version. This build implements version `4`, declared in
 `package.metadata.ptransfer-protocol-version`.
 
 - Rendezvous event: Nostr kind `4243` (a regular kind, so relays retain it for a
@@ -321,6 +337,10 @@ pTransfer's app version. This build implements version `2`, declared in
 - No Code Exchange: hand-carried offer/answer codes are web-only.
 - The Tor transport carries at most 100 MiB per transfer and is not part of
   the interop protocol; it has a spec of its own that the web app shares.
+- Anonymous signaling is experimental and is not part of the interop protocol
+  either. Its relay pool is two community-listed onion relays that nothing
+  monitors, so expect it to fail more often than ordinary PIN Exchange, and
+  expect a cold Tor bootstrap on both sides before anything happens.
 - No custom relay/discovery mode.
 - Direct P2P only: no TURN relay fallback for the file bytes.
 

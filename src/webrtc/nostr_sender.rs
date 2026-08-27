@@ -26,14 +26,15 @@ use crate::crypto::kdf::{
     ConfirmationCodeBinding, HandshakeSealKeys, NostrSessionKeys, PakeRoot, generate_salt,
 };
 use crate::crypto::pin::{
-    CLAIM_VERIFY_LIMIT, PIN_ROTATION_MS, PIN_WAIT_TIMEOUT_MS, generate_pin, generate_transfer_id,
-    is_pin_bucket_active, now_ms, pin_bucket, pin_hint_for_bucket, pin_locator,
+    CLAIM_VERIFY_LIMIT, PIN_ROTATION_MS, PIN_WAIT_TIMEOUT_MS, PinKind, generate_pin,
+    generate_transfer_id, is_pin_bucket_active, now_ms, pin_bucket, pin_hint_for_bucket,
+    pin_locator,
 };
 use crate::crypto::spake2::{
     PAKE_SECRET_LEN, PakeIdentities, PakeRole, PakeRun, derive_pake_secret,
 };
 use crate::signaling::nostr::{
-    self, CandidatePayload, ClaimPayload, ConfirmPayload, HandshakeType, NostrClient,
+    CandidatePayload, ClaimPayload, ConfirmPayload, HandshakeType, NostrClient,
     RendezvousPayload, Signal, addressed_filter, addressed_filter_from_author,
     compute_rendezvous_transcript_hash, compute_transfer_metadata_hash, create_handshake_event,
     create_rendezvous_event, create_signal_event, generate_handshake_nonce, open_handshake_payload,
@@ -103,7 +104,13 @@ struct VerifiedClaim {
     seal_keys: HandshakeSealKeys,
 }
 
-pub async fn send_file_nostr(source: &SendSource) -> Result<()> {
+/// Send `source` over PIN Exchange.
+///
+/// `pin_kind` is the whole of the anonymous-signaling choice: it decides the
+/// length of the PIN this side mints *and* the relay pool that PIN is published
+/// on, and the receiver reads the mode back off the length it is handed. There
+/// is nothing else to agree.
+pub async fn send_file_nostr(source: &SendSource, pin_kind: PinKind) -> Result<()> {
     let file_size = source.estimated_size;
     let file_name = source.file_name.clone();
     let mime_type = source.mime_type.to_string();
@@ -140,13 +147,10 @@ pub async fn send_file_nostr(source: &SendSource) -> Result<()> {
 
     let step = Instant::now();
     ui::status("Connecting to Nostr relays...");
-    let client = NostrClient::connect(Keys::generate()).await?;
+    let client = NostrClient::connect(Keys::generate(), pin_kind).await?;
     let sender_pubkey = client.public_key();
     ui::status_timed(
-        &format!(
-            "Connected to Nostr relays ({})",
-            nostr::DEFAULT_RELAYS.len()
-        ),
+        &format!("Connected to Nostr relays ({})", client.relays().len()),
         step.elapsed(),
     );
 
@@ -157,6 +161,7 @@ pub async fn send_file_nostr(source: &SendSource) -> Result<()> {
         sender_pubkey_hex: client.public_key_hex(),
         file_name: &file_name,
         file_size,
+        pin_kind,
     };
 
     let claim = wait_for_verified_claim(&client, &rendezvous, &sender_pubkey).await?;
@@ -369,6 +374,10 @@ struct RendezvousContext<'a> {
     sender_pubkey_hex: String,
     file_name: &'a str,
     file_size: u64,
+    /// Which length every PIN this transfer mints is drawn at. Fixed for the
+    /// transfer's life: it names the relay pool the client is already on, so a
+    /// rotation cannot change it without stranding the receiver.
+    pin_kind: PinKind,
 }
 
 impl RendezvousContext<'_> {
@@ -391,7 +400,7 @@ impl RendezvousContext<'_> {
             sender_pubkey: self.sender_pubkey_hex.clone(),
             pake_message: STANDARD.encode(pake.message()),
             nonce: nonce.clone(),
-            relays: Some(nostr::default_relays_vec()),
+            relays: Some(self.client.relays().to_vec()),
         };
         let transcript_hash = compute_rendezvous_transcript_hash(&payload, self.salt)?;
         let event = create_rendezvous_event(self.client, &payload, self.salt, hint, bucket)?;
@@ -409,7 +418,7 @@ impl RendezvousContext<'_> {
     /// event, and display the PIN. Returns the generation the sender must
     /// retain to verify claims.
     async fn publish_fresh_pin(&self) -> Result<PinGeneration> {
-        let pin = generate_pin()?;
+        let pin = generate_pin(self.pin_kind)?;
         // No key stretching: with a balanced PAKE nothing published can be
         // ground against offline, so stretching would only add latency.
         let pake_secret = derive_pake_secret(&pin);

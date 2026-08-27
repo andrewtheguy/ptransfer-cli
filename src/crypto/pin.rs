@@ -1,9 +1,11 @@
 //! Rotating short PIN for pTransfer's PIN Exchange mode.
 //!
-//! The PIN is 12 case-sensitive characters (11 data + 1 checksum). The sender
-//! mints a fresh PIN every [`PIN_ROTATION_MS`] and honors PINs minted in the
-//! current or immediately previous wall-clock bucket, so any single PIN is
-//! valid for roughly 2–4 minutes.
+//! The PIN is case-sensitive, ends in a checksum character, and comes in two
+//! lengths: 12 for ordinary signaling and 16 when the sender turns on
+//! anonymous signaling. The length is the whole of that signal — see
+//! [`PinKind`]. The sender mints a fresh PIN every [`PIN_ROTATION_MS`] and
+//! honors PINs minted in the current or immediately previous wall-clock
+//! bucket, so any single PIN is valid for roughly 2–4 minutes.
 //!
 //! The PIN has exactly two jobs: its leading three-character locator derives
 //! the public rendezvous hint, and the whole PIN reduces to the SPAKE2 password
@@ -21,8 +23,25 @@ use sha2::Sha256;
 
 use super::chunk::fill_random;
 
-/// Total PIN length, including the trailing checksum character.
+/// Length of an ordinary PIN, including the trailing checksum character.
 pub const PIN_LENGTH: usize = 12;
+
+/// Length of the PIN minted when the sender turns on anonymous signaling
+/// (pTransfer's `docs/ANONYMOUS_SIGNALING.md`).
+///
+/// The length is the signal: the two modes reach disjoint relay pools, so the
+/// receiver has to know which one to connect to before it can look for
+/// anything, and the PIN is the only thing it is handed. Encoding the mode in a
+/// length rather than a prefix character keeps every other property of a PIN
+/// intact — same alphabet, same weighted checksum, same three-character
+/// locator — so nothing downstream has to special-case it.
+///
+/// The four extra characters are secret data, not locator, so the
+/// locator-keyed hint derivation is untouched and the online-guessing space
+/// grows from 55^8 to 55^12. That is a side effect of the length, not its
+/// purpose; the guessing bound that matters is still [`CLAIM_VERIFY_LIMIT`].
+pub const ANONYMOUS_PIN_LENGTH: usize = 16;
+
 const PIN_CHECKSUM_LENGTH: usize = 1;
 /// Leading characters used to derive the public rendezvous lookup hint. They
 /// are public by construction: a hint has at most `PIN_CHARSET.len() ** 3`
@@ -86,6 +105,35 @@ const PIN_HINT_HKDF_SALT: &str = "ptransfer:pin:v4";
 /// the locator alone.
 const PIN_HINT_LENGTH: usize = 8;
 
+/// Which signaling transport a PIN selects.
+///
+/// [`PinKind::Standard`] is the ordinary PIN Exchange PIN: clearnet `wss://`
+/// relays. [`PinKind::Anonymous`] is the one the sender's anonymous-signaling
+/// option mints: the same handshake, carried to a disjoint pool of
+/// onion-service relays through this crate's own Tor client.
+///
+/// The kind is carried by the PIN's length and nothing else, because the PIN is
+/// the only thing the receiver is handed and it has to pick a relay pool before
+/// it can look for a sender. See [`ANONYMOUS_PIN_LENGTH`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinKind {
+    Standard,
+    Anonymous,
+}
+
+impl PinKind {
+    /// Every kind, in the order [`classify_pin`] tries them.
+    pub const ALL: [PinKind; 2] = [PinKind::Standard, PinKind::Anonymous];
+
+    /// How long a PIN of this kind is, checksum character included.
+    pub const fn length(self) -> usize {
+        match self {
+            PinKind::Standard => PIN_LENGTH,
+            PinKind::Anonymous => ANONYMOUS_PIN_LENGTH,
+        }
+    }
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -112,13 +160,14 @@ fn compute_checksum(data: &[u8]) -> u8 {
     PIN_CHARSET[sum % PIN_CHARSET.len()]
 }
 
-/// Generate a random PIN: 11 data characters drawn with rejection sampling
-/// (no modulo bias) plus the checksum character.
-pub fn generate_pin() -> Result<String> {
-    let data_len = PIN_LENGTH - PIN_CHECKSUM_LENGTH;
+/// Generate a random PIN of `kind`: data characters drawn with rejection
+/// sampling (no modulo bias) plus the checksum character.
+pub fn generate_pin(kind: PinKind) -> Result<String> {
+    let pin_len = kind.length();
+    let data_len = pin_len - PIN_CHECKSUM_LENGTH;
     let charset_len = PIN_CHARSET.len();
     let max_multiple = (256 / charset_len) * charset_len;
-    let mut data = Vec::with_capacity(PIN_LENGTH);
+    let mut data = Vec::with_capacity(pin_len);
     let mut buf = vec![0u8; data_len * 2];
 
     while data.len() < data_len {
@@ -146,18 +195,23 @@ pub fn pin_char(c: char) -> Option<char> {
         .filter(|candidate| PIN_CHARSET.contains(&(*candidate as u8)))
 }
 
-/// Validate the exact case-sensitive PIN format and checksum.
-pub fn is_valid_pin(pin: &str) -> bool {
+/// Which kind of PIN this is, or `None` if it is not a valid PIN at all.
+///
+/// The length decides the kind and the checksum decides validity, so a
+/// mistyped character is rejected rather than silently reinterpreted as the
+/// other kind: the two lengths are four apart, which no single insertion,
+/// deletion, or substitution can bridge.
+pub fn classify_pin(pin: &str) -> Option<PinKind> {
     let bytes = pin.as_bytes();
-    if bytes.len() != PIN_LENGTH {
-        return false;
-    }
+    let kind = PinKind::ALL
+        .into_iter()
+        .find(|candidate| candidate.length() == bytes.len())?;
     if !bytes.iter().all(|byte| PIN_CHARSET.contains(byte)) {
-        return false;
+        return None;
     }
 
-    let data = &bytes[..PIN_LENGTH - PIN_CHECKSUM_LENGTH];
-    compute_checksum(data) == bytes[PIN_LENGTH - PIN_CHECKSUM_LENGTH]
+    let (data, checksum) = bytes.split_at(bytes.len() - PIN_CHECKSUM_LENGTH);
+    (compute_checksum(data) == checksum[0]).then_some(kind)
 }
 
 /// Return the PIN's public three-character locator segment.
@@ -235,12 +289,71 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// Shorthand for the fixed vectors below, which are all ordinary PINs.
+    fn is_standard_pin(pin: &str) -> bool {
+        classify_pin(pin) == Some(PinKind::Standard)
+    }
+
     #[test]
     fn generated_pin_validates() {
-        let pin = generate_pin().unwrap();
-        assert_eq!(pin.len(), PIN_LENGTH);
-        assert!(is_valid_pin(&pin));
-        assert!(pin.bytes().all(|b| PIN_CHARSET.contains(&b)));
+        for kind in PinKind::ALL {
+            let pin = generate_pin(kind).unwrap();
+            assert_eq!(pin.len(), kind.length());
+            assert_eq!(classify_pin(&pin), Some(kind));
+            assert!(pin.bytes().all(|b| PIN_CHARSET.contains(&b)));
+        }
+    }
+
+    /// The length is the entire announcement of the mode, so the two lengths
+    /// have to stay far enough apart that no single typo turns one into the
+    /// other — and the checksum has to cover everything else, or a receiver
+    /// would silently look on the wrong relay pool.
+    #[test]
+    fn the_length_decides_the_kind_and_the_checksum_decides_validity() {
+        assert_eq!(PinKind::Standard.length(), 12);
+        assert_eq!(PinKind::Anonymous.length(), 16);
+        assert!(PinKind::Anonymous.length() - PinKind::Standard.length() > 2);
+
+        let standard = generate_pin(PinKind::Standard).unwrap();
+        let anonymous = generate_pin(PinKind::Anonymous).unwrap();
+        assert_eq!(classify_pin(&standard), Some(PinKind::Standard));
+        assert_eq!(classify_pin(&anonymous), Some(PinKind::Anonymous));
+
+        // A length between the two is no kind at all, checksum or not: a
+        // dropped character has to fail rather than select a relay pool.
+        let mut truncated = anonymous.clone();
+        truncated.truncate(14);
+        let checksum = compute_checksum(truncated.as_bytes()) as char;
+        truncated.push(checksum);
+        assert_eq!(truncated.len(), 15);
+        assert_eq!(classify_pin(&truncated), None);
+
+        // A right-length PIN with one character wrong is rejected outright
+        // rather than read as the other kind.
+        let mut typo = anonymous.clone();
+        typo.replace_range(0..1, if typo.starts_with('A') { "B" } else { "A" });
+        assert_eq!(classify_pin(&typo), None);
+    }
+
+    /// The extra characters are secret data, not locator, so the published
+    /// hint derivation is the same function of the same three characters. That
+    /// is what lets everything downstream stay ignorant of the kind — and it
+    /// is why the length costs the published tag no entropy either way.
+    #[test]
+    fn an_anonymous_pin_derives_its_hint_exactly_like_a_standard_one() {
+        let anonymous = generate_pin(PinKind::Anonymous).unwrap();
+        let locator = pin_locator(&anonymous);
+        assert_eq!(locator.len(), PIN_LOCATOR_LENGTH);
+
+        // A standard PIN sharing only the locator lands on the same hint.
+        let mut standard = anonymous[..PIN_LOCATOR_LENGTH].to_string();
+        standard.push_str("zzzzzzzz");
+        standard.push(compute_checksum(standard.as_bytes()) as char);
+        assert_eq!(classify_pin(&standard), Some(PinKind::Standard));
+        assert_eq!(
+            pin_hint_for_bucket(pin_locator(&standard), 123),
+            pin_hint_for_bucket(locator, 123)
+        );
     }
 
     #[test]
@@ -260,16 +373,16 @@ mod tests {
     fn checksum_rejects_typo_and_transposition() {
         // Fixed vector: checksum of "ABCDEFGHJKL" is 'A',
         // verified against pTransfer's computeChecksum.
-        assert!(is_valid_pin("ABCDEFGHJKLA"));
-        assert!(!is_valid_pin("ABCDefGHJKLA")); // substitution
-        assert!(!is_valid_pin("BACDEFGHJKLA")); // transposition
-        assert!(!is_valid_pin("ABCDEFGHJKL")); // too short
+        assert!(is_standard_pin("ABCDEFGHJKLA"));
+        assert!(!is_standard_pin("ABCDefGHJKLA")); // substitution
+        assert!(!is_standard_pin("BACDEFGHJKLA")); // transposition
+        assert!(!is_standard_pin("ABCDEFGHJKL")); // too short
     }
 
     #[test]
     fn validation_is_case_sensitive() {
-        assert!(is_valid_pin("AbCDefGhjkmQ"));
-        assert!(!is_valid_pin("ABCDEFGHJKMQ"));
+        assert!(is_standard_pin("AbCDefGhjkmQ"));
+        assert!(!is_standard_pin("ABCDEFGHJKMQ"));
     }
 
     #[test]

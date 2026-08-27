@@ -104,10 +104,10 @@ pub async fn run(terminal: &mut DefaultTerminal, plan: WizardPlan) -> Result<()>
 
 async fn run_plan(plan: WizardPlan) -> Result<()> {
     match plan {
-        WizardPlan::SendPin(paths) => {
+        WizardPlan::SendPin { paths, pin_kind } => {
             let source =
                 tokio::task::spawn_blocking(move || archive::prepare_send_source(&paths)).await??;
-            webrtc::send_file_nostr(&source).await
+            webrtc::send_file_nostr(&source, pin_kind).await
         }
         WizardPlan::ReceivePin { pin, output } => {
             webrtc::receive_file_nostr(&pin, Some(output), OnConflict::Prompt).await
@@ -173,7 +173,7 @@ struct TorRendezvous {
 impl State {
     fn new(plan: &WizardPlan) -> Self {
         let title = match plan {
-            WizardPlan::SendPin(_) => "sending",
+            WizardPlan::SendPin { .. } => "sending",
             WizardPlan::ReceivePin { .. } => "receiving",
             #[cfg(feature = "tor")]
             WizardPlan::SendTor(_) => "sending over Tor",
@@ -532,7 +532,10 @@ mod tests {
 
     #[tokio::test]
     async fn confirmation_prompt_normalizes_paste_before_submitting() {
-        let mut state = State::new(&WizardPlan::SendPin(Vec::new()));
+        let mut state = State::new(&WizardPlan::SendPin {
+            paths: Vec::new(),
+            pin_kind: crate::crypto::pin::PinKind::Standard,
+        });
         let (reply, received) = oneshot::channel();
         state.apply(UiEvent::ConfirmationCodeInput { reply });
 

@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Instant;
 
 use crate::archive::{SendSource, prepare_send_source_with_cap};
-use crate::crypto::pin::{generate_pin, is_valid_pin};
+use crate::crypto::pin::{PinKind, classify_pin, generate_pin};
 use crate::transfer::{run_receiver, run_sender};
 use crate::ui;
 use crate::util::{OnConflict, format_bytes, resolve_destination};
@@ -131,7 +131,10 @@ pub async fn send(paths: Vec<PathBuf>, port: u16) -> Result<()> {
             format_bytes(source.estimated_size)
         ));
     }
-    let password = generate_pin()?;
+    // A PIN's alphabet and checksum, at the ordinary length. The transport's
+    // password is not a PIN Exchange PIN and never selects a relay pool, so it
+    // is minted — and below, accepted — at exactly one kind rather than either.
+    let password = generate_pin(PinKind::Standard)?;
 
     let tor = TorClient::bootstrap().await?;
     ui::status("Launching the onion service...");
@@ -338,7 +341,7 @@ pub async fn receive(
     // Validate both inputs before bootstrapping, which otherwise spends tens of
     // seconds fetching a directory only to reject them afterwards.
     let (host, port) = split_address(address, port)?;
-    if !is_valid_pin(password) {
+    if classify_pin(password) != Some(PinKind::Standard) {
         bail!("Invalid password: check for typos and try again");
     }
     // Exactly the string the sender binds its side of the handshake to.

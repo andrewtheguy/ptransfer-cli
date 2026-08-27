@@ -32,9 +32,17 @@ use sha2::{Digest, Sha256};
 
 use crate::crypto::aes;
 use crate::crypto::chunk::fill_random;
-use crate::crypto::pin::{PIN_ACTIVE_BUCKETS, PIN_ROTATION_MS};
+use crate::crypto::pin::{PIN_ACTIVE_BUCKETS, PIN_ROTATION_MS, PinKind};
 use crate::wire::TransferMetadata;
 
+/// Relays used for ordinary signaling. Both sides must hold the same list: a
+/// sender and a receiver find each other only on a shared relay.
+///
+/// Deliberately disjoint from [`anonymous::ANONYMOUS_SIGNALING_RELAYS`] — that
+/// is what makes the PIN's length settle the mode end to end without a flag in
+/// the protocol for either side to lie about.
+///
+/// [`anonymous::ANONYMOUS_SIGNALING_RELAYS`]: crate::signaling::anonymous::ANONYMOUS_SIGNALING_RELAYS
 pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
     "wss://nos.lol",
@@ -52,6 +60,22 @@ const EVENT_KIND_DATA_TRANSFER: u16 = 24243;
 /// generation. A NIP-40 `expiration` tag bounds how long that lasts.
 const EVENT_KIND_RENDEZVOUS: u16 = 4243;
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long anonymous signaling waits for the first onion relay socket.
+///
+/// A whole rendezvous — an HSDir descriptor fetch, an introduction circuit, and
+/// a rendezvous circuit — is minutes on a bad day and still the fastest path
+/// available, so it gets a budget of its own rather than being declared dead on
+/// the clearnet clock. Unlike the clearnet path this one is also a hard
+/// requirement: there is no silent fallback to a clearnet socket, so a pool
+/// that never opens has to be reported rather than left for a publish to
+/// discover.
+#[cfg(feature = "tor")]
+const ANONYMOUS_RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(180);
+/// How often the anonymous wait re-checks whether a relay has come up. Short
+/// enough not to add noticeably to a minutes-long rendezvous, long enough that
+/// the check itself costs nothing.
+#[cfg(feature = "tor")]
+const ANONYMOUS_RELAY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const PUBLISH_RETRIES: usize = 3;
 
@@ -265,20 +289,96 @@ pub struct ParsedSignalEvent {
 pub struct NostrClient {
     client: Client,
     keys: Keys,
+    /// The pool this client is connected to, in the order it was given. The
+    /// sender advertises it in the rendezvous payload, where it is also part of
+    /// the transcript both sides hash.
+    relays: Vec<String>,
+    /// The Tor client every relay socket of an anonymous session runs on. Held
+    /// only so it outlives them: dropping it tears down the circuits.
+    #[cfg(feature = "tor")]
+    _tor: Option<std::sync::Arc<crate::tor::TorClient>>,
 }
 
 impl NostrClient {
-    pub async fn connect(keys: Keys) -> Result<Self> {
-        let client = Client::new(keys.clone());
-        for relay in DEFAULT_RELAYS {
-            client
-                .add_relay(*relay)
-                .await
-                .with_context(|| format!("Failed to add relay {relay}"))?;
+    /// Connect to the relay pool this PIN's kind names.
+    ///
+    /// The two pools are disjoint and the PIN's length is the only thing that
+    /// picks between them, so there is nothing here for either side to agree in
+    /// advance — see [`crate::crypto::pin::PinKind`].
+    pub async fn connect(keys: Keys, kind: PinKind) -> Result<Self> {
+        match kind {
+            PinKind::Standard => Self::connect_clearnet(keys).await,
+            #[cfg(feature = "tor")]
+            PinKind::Anonymous => Self::connect_anonymous(keys).await,
+            #[cfg(not(feature = "tor"))]
+            PinKind::Anonymous => bail!(
+                "This PIN uses anonymous signaling, which needs the Tor client \
+                 this build was compiled without — rebuild with --features tor"
+            ),
         }
+    }
+
+    async fn connect_clearnet(keys: Keys) -> Result<Self> {
+        let client = Client::new(keys.clone());
+        let relays = add_relays(&client, DEFAULT_RELAYS).await?;
         client.connect().await;
+        // No hard failure if nothing is up yet: the clearnet pool is six
+        // relays deep and a publish retries, so a slow socket is not a reason
+        // to refuse a transfer that is about to work.
         client.wait_for_connection(RELAY_CONNECT_TIMEOUT).await;
-        Ok(Self { client, keys })
+        Ok(Self {
+            client,
+            keys,
+            relays,
+            #[cfg(feature = "tor")]
+            _tor: None,
+        })
+    }
+
+    /// Bootstrap Tor and connect to the onion-service relay pool.
+    ///
+    /// There is no automatic or silent fallback to a clearnet socket: if Tor
+    /// cannot be reached, or no onion relay answers, signaling fails. The two
+    /// are separate errors on purpose — one is the network between here and
+    /// Tor, the other is a pool that is community-maintained and monitored by
+    /// nobody.
+    #[cfg(feature = "tor")]
+    async fn connect_anonymous(keys: Keys) -> Result<Self> {
+        use crate::signaling::anonymous::{
+            ANONYMOUS_SIGNALING_RELAYS, OnionSignalingTransport, normalize_onion_relay_url,
+        };
+
+        crate::ui::status("Starting the Tor client for anonymous signaling...");
+        let tor = std::sync::Arc::new(crate::tor::TorClient::bootstrap().await.context(
+            "Anonymous signaling could not reach the Tor network",
+        )?);
+
+        let client = Client::builder()
+            .signer(keys.clone())
+            .websocket_transport(OnionSignalingTransport::new(std::sync::Arc::clone(&tor)))
+            .build();
+        // Every URL is put through the onion validator before it reaches a
+        // socket, so no relay list can pull an anonymous session onto one that
+        // would reveal this device's IP address.
+        for relay in ANONYMOUS_SIGNALING_RELAYS {
+            normalize_onion_relay_url(relay)
+                .with_context(|| format!("Unusable onion relay URL {relay}"))?;
+        }
+        let relays = add_relays(&client, ANONYMOUS_SIGNALING_RELAYS).await?;
+
+        client.connect().await;
+        wait_for_any_onion_relay(&client).await?;
+        Ok(Self {
+            client,
+            keys,
+            relays,
+            _tor: Some(tor),
+        })
+    }
+
+    /// The relay pool this client is connected to.
+    pub fn relays(&self) -> &[String] {
+        &self.relays
     }
 
     pub fn public_key(&self) -> PublicKey {
@@ -377,19 +477,56 @@ impl NostrClient {
     }
 }
 
+/// Add every relay in `pool` to `client`, returning the list as given.
+async fn add_relays(client: &Client, pool: &[&str]) -> Result<Vec<String>> {
+    let mut relays = Vec::with_capacity(pool.len());
+    for relay in pool {
+        client
+            .add_relay(*relay)
+            .await
+            .with_context(|| format!("Failed to add relay {relay}"))?;
+        relays.push((*relay).to_string());
+    }
+    Ok(relays)
+}
+
+/// Wait until one onion relay socket is open, or report that none is.
+///
+/// Deliberately "any relay", not "every relay": the pool's own wait joins all
+/// of them, so one relay that is simply down would hold a session that already
+/// has what it needs for the whole budget. A publish handed to a pool with
+/// nothing open fails naming no cause, which is the other half of why this
+/// waits for a real connection rather than giving the sockets a head start.
+#[cfg(feature = "tor")]
+async fn wait_for_any_onion_relay(client: &Client) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + ANONYMOUS_RELAY_CONNECT_TIMEOUT;
+    loop {
+        if client
+            .relays()
+            .await
+            .values()
+            .any(|relay| relay.status() == RelayStatus::Connected)
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "Tor is running, but no Nostr onion relay answered within {} seconds. \
+                 The anonymous-signaling pool is community-maintained and monitored by \
+                 nobody, so this is expected to happen from time to time.",
+                ANONYMOUS_RELAY_CONNECT_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(ANONYMOUS_RELAY_POLL_INTERVAL).await;
+    }
+}
+
 pub fn data_kind() -> Kind {
     Kind::from_u16(EVENT_KIND_DATA_TRANSFER)
 }
 
 pub fn rendezvous_kind() -> Kind {
     Kind::from_u16(EVENT_KIND_RENDEZVOUS)
-}
-
-pub fn default_relays_vec() -> Vec<String> {
-    DEFAULT_RELAYS
-        .iter()
-        .map(|relay| (*relay).to_string())
-        .collect()
 }
 
 /// Generate a random handshake nonce (16 bytes, base64). The sender mints one
@@ -681,6 +818,9 @@ mod tests {
             NostrClient {
                 client: Client::new(keys.clone()),
                 keys: keys.clone(),
+                relays: DEFAULT_RELAYS.iter().map(|r| (*r).to_string()).collect(),
+                #[cfg(feature = "tor")]
+                _tor: None,
             },
             keys,
         )
@@ -917,7 +1057,7 @@ mod tests {
             sender_pubkey: sender_hex.clone(),
             pake_message: STANDARD.encode(sender_pake.message()),
             nonce: generate_handshake_nonce().unwrap(),
-            relays: Some(default_relays_vec()),
+            relays: Some(sender_client.relays().to_vec()),
         };
         let sender_transcript = compute_rendezvous_transcript_hash(&rendezvous, &salt).unwrap();
         let rendezvous_event =
