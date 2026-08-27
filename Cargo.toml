@@ -20,6 +20,23 @@ path = "src/lib.rs"
 name = "ptransfer"
 path = "src/main.rs"
 
+[features]
+default = []
+# Experimental CLI-to-CLI transport over a Tor v3 onion service (proof of
+# concept). Off by default: it drags in the whole Arti dependency tree, which
+# roughly doubles build time for a code path the file transfer does not use yet.
+tor = [
+    "dep:arti-client",
+    "dep:tor-cell",
+    "dep:tor-config",
+    "dep:tor-hsservice",
+    "dep:tor-keymgr",
+    "dep:tor-proto",
+    "dep:tor-rtcompat",
+    "dep:safelog",
+    "dep:tempfile",
+]
+
 [dependencies]
 # Core
 tokio = { version = "1", features = ["full"] }
@@ -56,6 +73,35 @@ nostr-sdk = "0.44.1"
 rtc = "0.9.1"
 bytes = "1"
 if-addrs = "0.15"
+
+# Tor onion-service transport (feature "tor"). Arti 2.5.1 == crates 0.45.
+# arti-client's default features pull in native-tls; this crate already installs
+# an aws-lc-rs rustls provider process-wide, which is exactly what
+# tor-rtcompat's rustls backend picks up, so use that instead of adding OpenSSL.
+arti-client = { version = "0.45", optional = true, default-features = false, features = [
+    "tokio",
+    "rustls",
+    "compression",
+    "flowctl-cc",
+    "keymgr",
+    "onion-service-client",
+    "onion-service-service",
+    "ephemeral-keystore",
+    "vanguards",
+    # Arti's directory cache is SQLite. Bundle it so the released binary stays
+    # standalone instead of needing a system libsqlite3.
+    "static-sqlite",
+] }
+tor-cell = { version = "0.45", optional = true }
+tor-config = { version = "0.45", optional = true }
+tor-hsservice = { version = "0.45", optional = true }
+tor-keymgr = { version = "0.45", optional = true, features = ["ephemeral-keystore"] }
+tor-proto = { version = "0.45", optional = true, features = ["hs-service", "tokio"] }
+tor-rtcompat = { version = "0.45", optional = true, default-features = false, features = ["tokio", "rustls"] }
+# Printing the .onion address in full; Arti redacts it by default.
+safelog = { version = "0.9", optional = true }
+# Backing directory for Arti's state/cache; see src/tor/storage.rs.
+tempfile = { version = "3", optional = true }
 
 # CLI (arg parsing + logging)
 clap = { version = "4", features = ["derive"] }

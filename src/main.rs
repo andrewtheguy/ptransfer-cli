@@ -10,6 +10,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+#[cfg(feature = "tor")]
+use ptransfer_cli::tor;
 use ptransfer_cli::util::{OnConflict, is_interrupted};
 use ptransfer_cli::{archive, tui, webrtc};
 
@@ -32,6 +34,44 @@ enum Commands {
         /// Use verbose logging
         #[arg(short, long, global = true)]
         verbose: bool,
+    },
+
+    /// Tor onion-service transport (proof of concept, not the file transfer)
+    #[cfg(feature = "tor")]
+    Tor {
+        #[command(subcommand)]
+        command: TorCommands,
+
+        /// Use verbose logging
+        #[arg(short, long, global = true)]
+        verbose: bool,
+    },
+}
+
+/// Proof-of-concept echo over an ephemeral v3 onion service. `serve` prints the
+/// address it publishes; `connect` sends one line to it and prints the echo.
+#[cfg(feature = "tor")]
+#[derive(Subcommand)]
+enum TorCommands {
+    /// Publish an ephemeral onion address and echo back every line received.
+    Serve {
+        /// Onion virtual port to listen on
+        #[arg(short, long, default_value_t = tor::echo::DEFAULT_PORT)]
+        port: u16,
+    },
+
+    /// Send one line to an onion address and print what comes back.
+    Connect {
+        /// The `.onion` address printed by `ptransfer tor serve`
+        address: String,
+
+        /// Onion virtual port to connect to
+        #[arg(short, long, default_value_t = tor::echo::DEFAULT_PORT)]
+        port: u16,
+
+        /// Text to send
+        #[arg(short, long, default_value = "hello")]
+        message: String,
     },
 }
 
@@ -125,6 +165,28 @@ async fn async_main() -> Result<()> {
                 }
             }
         }
+
+        #[cfg(feature = "tor")]
+        Some(Commands::Tor { command, verbose }) => {
+            // Bootstrapping from an empty directory cache takes a while and
+            // says nothing on stdout, so keep info-level progress on by
+            // default here. RUST_LOG still overrides.
+            init_logging(if verbose { "debug" } else { "info" });
+
+            match command {
+                TorCommands::Serve { port } => tor::echo::serve(port).await,
+
+                TorCommands::Connect {
+                    address,
+                    port,
+                    message,
+                } => {
+                    let reply = tor::echo::connect(address.trim(), port, &message).await?;
+                    println!("{reply}");
+                    Ok(())
+                }
+            }
+        }
     }
 }
 
@@ -166,6 +228,51 @@ mod tests {
     #[test]
     fn test_receive_requires_a_code() {
         assert!(Cli::try_parse_from(["ptransfer", "test", "receive"]).is_err());
+    }
+
+    #[cfg(feature = "tor")]
+    #[test]
+    fn tor_serve_defaults_to_the_poc_port() {
+        let cli = Cli::try_parse_from(["ptransfer", "tor", "serve"]).unwrap();
+        let Some(Commands::Tor {
+            command: TorCommands::Serve { port },
+            ..
+        }) = cli.command
+        else {
+            panic!("expected tor serve");
+        };
+        assert_eq!(port, tor::echo::DEFAULT_PORT);
+    }
+
+    #[cfg(feature = "tor")]
+    #[test]
+    fn tor_connect_requires_an_address_and_defaults_the_message() {
+        assert!(Cli::try_parse_from(["ptransfer", "tor", "connect"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "ptransfer",
+            "tor",
+            "connect",
+            "abc.onion",
+            "--port",
+            "1234",
+        ])
+        .unwrap();
+        let Some(Commands::Tor {
+            command:
+                TorCommands::Connect {
+                    address,
+                    port,
+                    message,
+                },
+            ..
+        }) = cli.command
+        else {
+            panic!("expected tor connect");
+        };
+        assert_eq!(address, "abc.onion");
+        assert_eq!(port, 1234);
+        assert_eq!(message, "hello");
     }
 
     #[test]

@@ -121,6 +121,50 @@ transfer; enter the PIN currently shown exactly. The receiver then prints an
 continues. Multiple paths or a folder are sent as one ZIP. If the destination
 file already exists the receiver fails; pass `--overwrite` to replace it.
 
+### Tor Onion Service (Proof of Concept)
+
+Built behind the non-default `tor` cargo feature (`cargo build --features tor`).
+This is not the file transfer — it is a v1 proof of concept that a v3 onion
+service comes up from the CLI and carries bytes in both directions.
+
+Instance A publishes an ephemeral onion address and echoes back every line it
+receives:
+
+```bash
+ptransfer tor serve
+# zrmxlosp6cvmkhxwhx7267wkvqyztsrmloqw76eu4fhn2gsbg5zk4kad.onion:9735
+# ready
+```
+
+Instance B sends one line to that address and prints the echo:
+
+```bash
+ptransfer tor connect <address>.onion:9735 --message hello
+# hello
+```
+
+`serve` prints the `.onion` address as soon as the identity key exists, then
+`ready` once the descriptor is published and the service is actually reachable
+— wait for `ready` before connecting. `connect` takes the whole line `serve`
+prints; a port in the address wins over `--port`, which otherwise sets the
+onion virtual port on either side.
+
+Each process runs its own Arti client that reads no configuration file and
+never touches a system Tor or an existing `~/.local/share/arti`. The service
+identity key lives only in Arti's in-memory keystore, so every `serve` gets a
+new address and there is no key on disk to lose. Arti still requires filesystem
+paths for its directory cache and client state (fully in-memory state is
+[arti#1186](https://gitlab.torproject.org/tpo/core/arti/-/work_items/1186), not
+scheduled), so those go in a private directory under `/dev/shm` — a tmpfs, so in
+RAM — falling back to the platform temp directory off Linux. That tree is
+deleted on a graceful shutdown: `serve` unwinds on Ctrl-C or `SIGTERM`, and
+`connect` on returning. A process killed outright leaves it behind until the
+next reboot (or the platform's temp-directory cleanup off Linux).
+
+Because nothing is cached between runs, both commands bootstrap the Tor
+directory from scratch; expect several seconds before `serve` prints an address
+and up to a minute more before it prints `ready`.
+
 ## Protocol Compatibility
 
 The normative wire contract is the sibling pTransfer checkout's
@@ -180,7 +224,8 @@ pTransfer's app version. This build implements version `1`, declared in
 
 ## Development
 
-Run checks with all features:
+Run checks with all features (`--all-features` includes `tor`, which pulls in
+the Arti dependency tree and is slow to build the first time):
 
 ```bash
 cargo test --all-features
