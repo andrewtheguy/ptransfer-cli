@@ -1,7 +1,7 @@
 [package]
 name = "ptransfer-cli"
 # does not have to match pTransfer's npm version
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 publish = false
 
@@ -26,15 +26,30 @@ default = []
 # concept). Off by default: it drags in the whole Arti dependency tree, which
 # roughly doubles build time for a code path the file transfer does not use yet.
 tor = [
-    "dep:arti-client",
-    "dep:tor-cell",
-    "dep:tor-config",
-    "dep:tor-hsservice",
-    "dep:tor-keymgr",
-    "dep:tor-proto",
-    "dep:tor-rtcompat",
+    "dep:futures-channel",
+    "dep:postage",
+    "dep:rand",
     "dep:safelog",
-    "dep:tempfile",
+    "dep:tor-bytes",
+    "dep:tor-cell",
+    "dep:tor-chanmgr",
+    "dep:tor-checkable",
+    "dep:tor-circmgr",
+    "dep:tor-dirclient",
+    "dep:tor-dircommon",
+    "dep:tor-error",
+    "dep:tor-guardmgr",
+    "dep:tor-hsclient",
+    "dep:tor-hscrypto",
+    "dep:tor-linkspec",
+    "dep:tor-llcrypto",
+    "dep:tor-memquota",
+    "dep:tor-netdir",
+    "dep:tor-netdoc",
+    "dep:tor-persist",
+    "dep:tor-proto",
+    "dep:tor-protover",
+    "dep:tor-rtcompat",
 ]
 
 [dependencies]
@@ -75,33 +90,73 @@ bytes = "1"
 if-addrs = "0.15"
 
 # Tor onion-service transport (feature "tor"). Arti 2.5.1 == crates 0.45.
-# arti-client's default features pull in native-tls; this crate already installs
-# an aws-lc-rs rustls provider process-wide, which is exactly what
-# tor-rtcompat's rustls backend picks up, so use that instead of adding OpenSSL.
-arti-client = { version = "0.45", optional = true, default-features = false, features = [
-    "tokio",
-    "rustls",
-    "compression",
-    "flowctl-cc",
-    "keymgr",
-    "onion-service-client",
-    "onion-service-service",
-    "ephemeral-keystore",
+#
+# Deliberately *not* arti-client. `arti-client` reaches the network through
+# `tor-dirmgr` and `tor-hsservice`, and those two are the only pieces of Arti
+# that insist on a filesystem: `tor-dirmgr` opens a SQLite database plus a
+# `dir_blobs/` directory, and `tor-hsservice` wants a `tor_persist::StateDirectory`
+# whose `raw_subdir` hands out real files. Neither exposes a seam to swap that
+# out — `tor-dirmgr`'s `Store` is `pub(crate)`, and `StateDirectory` is a
+# concrete type — which is arti#1186, unscheduled upstream.
+#
+# So this crate assembles the client from the layers below those two, all of
+# which take their storage as a trait we can satisfy from memory:
+# `GuardMgr`/`VanguardMgr`/`CircMgr` take any `tor_persist::StateMgr` (see
+# src/tor/memstate.rs), and everything reads the directory through
+# `tor_netdir::NetDirProvider`, which src/tor/netdir.rs implements over a
+# `NetDir` held in an `Arc<RwLock<..>>`. Nothing here touches a path.
+#
+# Keeping tor-chanmgr matters for more than convenience: relay TLS is
+# self-signed by design and the relay is authenticated by the CERTS cell
+# instead, so writing our own link handshake would mean writing our own
+# "accept any certificate" verifier. This way that check stays Arti's.
+tor-chanmgr = { version = "0.45", optional = true }
+tor-circmgr = { version = "0.45", optional = true, features = [
+    "hs-client",
+    "hs-service",
     "vanguards",
-    # Arti's directory cache is SQLite. Bundle it so the released binary stays
-    # standalone instead of needing a system libsqlite3.
-    "static-sqlite",
+    "specific-relay",
+    "send-control-msg",
 ] }
-tor-cell = { version = "0.45", optional = true }
-tor-config = { version = "0.45", optional = true }
-tor-hsservice = { version = "0.45", optional = true }
-tor-keymgr = { version = "0.45", optional = true, features = ["ephemeral-keystore"] }
-tor-proto = { version = "0.45", optional = true, features = ["hs-service", "tokio"] }
+tor-guardmgr = { version = "0.45", optional = true, features = ["vanguards"] }
+tor-hsclient = { version = "0.45", optional = true }
+tor-proto = { version = "0.45", optional = true, features = [
+    "hs-client",
+    "hs-service",
+    "send-control-msg",
+    "tokio",
+] }
 tor-rtcompat = { version = "0.45", optional = true, default-features = false, features = ["tokio", "rustls"] }
+
+# Directory: fetched over the network into memory, never cached to disk.
+# tor-dircommon carries the built-in authority and fallback lists, so the trust
+# anchors are Arti's own rather than a copy of them in this repo.
+tor-dircommon = { version = "0.45", optional = true }
+tor-dirclient = { version = "0.45", optional = true, features = ["hs-service"] }
+tor-netdir = { version = "0.45", optional = true, features = ["hs-client", "hs-service"] }
+tor-netdoc = { version = "0.45", optional = true, features = ["hs-client", "hs-service"] }
+# Consensus and certificate timeliness/signature checking; see src/tor/netdir.rs.
+tor-checkable = { version = "0.45", optional = true }
+
+tor-bytes = { version = "0.45", optional = true }
+tor-cell = { version = "0.45", optional = true, features = ["hs"] }
+# `ope` is the order-preserving encryption a service uses to make descriptor
+# revision counters that do not leak this machine's clock skew.
+tor-hscrypto = { version = "0.45", optional = true, features = ["ope"] }
+tor-linkspec = { version = "0.45", optional = true, features = ["decode", "verbatim"] }
+tor-llcrypto = { version = "0.45", optional = true }
+tor-memquota = { version = "0.45", optional = true }
+tor-protover = { version = "0.45", optional = true }
+tor-persist = { version = "0.45", optional = true }
+tor-error = { version = "0.45", optional = true }
+# Channels between the circuit reactors and the onion service's own tasks.
+futures-channel = { version = "0.3", optional = true }
+# Onion-service key generation (identity, per-introduction-point session keys).
+rand = { version = "0.10", optional = true }
+# Watch channels for the directory-change events `NetDirProvider` publishes.
+postage = { version = "0.5", optional = true }
 # Printing the .onion address in full; Arti redacts it by default.
 safelog = { version = "0.9", optional = true }
-# Backing directory for Arti's state/cache; see src/tor/storage.rs.
-tempfile = { version = "3", optional = true }
 
 # CLI (arg parsing + logging)
 clap = { version = "4", features = ["derive"] }
@@ -110,7 +165,7 @@ env_logger = "0.11"
 # TUI wizard
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
-futures-util = { version = "0.3", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

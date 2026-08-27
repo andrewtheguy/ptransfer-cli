@@ -197,20 +197,34 @@ wins. Either side of a transfer may be this CLI or a browser tab.
 This section describes only what is specific to the CLI's realization of it.
 
 **Modules.** `src/tor/service.rs` publishes the ephemeral onion service and
-`client.rs` connects to one, both over Arti; `wire.rs` is the framed
-`TorMessenger`; `handshake.rs` is the spec's handshake; `transfer.rs` is the
-accept loop and the caps; `storage.rs` is the throwaway Arti state; `echo.rs` is
-the `tor serve`/`tor connect` proof of concept.
+`client.rs` assembles the Tor client that connects to one; `config.rs` is the
+settings those managers read; `memstate.rs` and `netdir.rs` are the in-memory
+state store and network directory; `wire.rs` is the framed `TorMessenger`;
+`handshake.rs` is the spec's handshake; `transfer.rs` is the accept loop and
+the caps; `echo.rs` is the `tor serve`/`tor connect` proof of concept.
 
 **One transfer layer, two transports.** `run_sender`/`run_receiver` are generic
 over a `Messenger`, so above the framing the Tor path runs the *same* code as
 PIN Exchange rather than a parallel implementation. `TorMessenger` restores the
 discrete binary/text messages the choreography needs from a byte stream.
 
-**Arti state is throwaway.** Every run gets a fresh state and cache directory
-that is removed on exit, so a transfer never touches a system Tor or an
-existing `~/.local/share/arti` and leaves nothing behind. The cost is that
-nothing is cached between runs and every command bootstraps from cold.
+**Tor state never leaves memory.** There is no state directory, no cache and no
+keystore: the network directory, the guard and vanguard state and the onion
+service's identity key are values in the process. A transfer cannot touch a
+system Tor or an existing `~/.local/share/arti`, and a process killed outright
+leaves nothing behind. The cost is that every command bootstraps from cold.
+
+This is why the client is assembled from Arti's managers rather than taken
+whole from `arti-client`: `tor-dirmgr` (SQLite plus a blob directory) and
+`tor-hsservice` (`tor_persist::StateDirectory`) are the two crates that require
+a filesystem and expose no seam to replace it — arti#1186, unscheduled
+upstream. Everything below them takes its storage as a trait, so `netdir.rs`
+implements `NetDirProvider`, `memstate.rs` implements `StateMgr`, and
+`service.rs` implements the onion service on `tor-proto`. `tor-chanmgr`,
+`tor-guardmgr`, `tor-circmgr` and `tor-hsclient` are used unchanged, which
+matters for more than convenience: relay authentication — self-signed TLS bound
+to an identity by the CERTS cell — stays Arti's rather than becoming a
+certificate verifier written here.
 
 **The password comes from stdin, never argv.** On the receiving side it is
 prompted for at a terminal and piped in from a script, because an argument
