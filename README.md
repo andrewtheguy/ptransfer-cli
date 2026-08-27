@@ -163,10 +163,12 @@ otherwise sets the onion virtual port on either side. Multiple paths or a folder
 are sent as one ZIP, exactly as in PIN Exchange. If the destination file already
 exists the receiver fails; pass `--overwrite` to replace it.
 
-The transport carries at most **1 MiB** per transfer — a Tor circuit is slow
-enough that anything larger wants resume support, which this does not have. The
-other end may be another CLI or a pTransfer browser tab; both speak the same
-handshake.
+The transport carries at most **100 MiB** per transfer. Anything over 1 MiB
+prints a note and sends it anyway: throughput over Tor depends on the circuit
+you get — the same file can arrive in moments or crawl — and this transport
+cannot resume, so a transfer that drops starts over. Whether that trade is
+worth it is your call, not the tool's. The other end may be another CLI or a
+pTransfer browser tab; both speak the same handshake.
 
 These `tor` subcommands are the non-interactive form. The wizard covers the same
 transfer under **Tor Onion Service** in its mode menu.
@@ -274,8 +276,8 @@ pTransfer's app version. This build implements version `2`, declared in
 - No resume support.
 - No QR support.
 - No Code Exchange: hand-carried offer/answer codes are web-only.
-- The Tor transport carries at most 1 MiB per transfer and is not part of the
-  interop protocol; it has a spec of its own that the web app shares.
+- The Tor transport carries at most 100 MiB per transfer and is not part of
+  the interop protocol; it has a spec of its own that the web app shares.
 - No custom relay/discovery mode.
 - Direct P2P only: no TURN relay fallback for the file bytes.
 
