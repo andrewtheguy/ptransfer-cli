@@ -165,7 +165,12 @@ it in (`printf '%s\n' "$PASSWORD" | ptransfer tor receive <address>`).
 
 `send` prints the address and password as soon as they exist, then `ready` once
 the descriptor is published and the service is actually reachable — wait for
-`ready` before connecting. The printed address leaves the default virtual
+`ready` before connecting. Those three lines are all that goes to stdout, so
+redirecting it still yields just them; both ends narrate the rest on stderr —
+Tor's own bootstrap percentage, the descriptor going up, the connection and the
+handshake, each with how long it took, then byte progress. A Tor transfer spends
+a minute or two before anything moves, and that time is accounted for rather
+than silent. The printed address leaves the default virtual
 port (9735) implicit, since neither side offers it as a choice; `--port` sets
 another one, which then shows up in the address, and a port in the address wins
 over `--port` on the receiving side. Multiple paths or a folder

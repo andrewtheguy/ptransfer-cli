@@ -74,11 +74,22 @@ impl OnionListener {
     pub async fn wait_until_published(&mut self) -> Result<()> {
         // A watch stream, so the current state arrives first.
         let mut events = self.service.status_events();
+        // The status fires on every internal change, most of which leave the
+        // high-level state alone: reporting each one buries the two or three
+        // transitions that actually mean something.
+        let mut reported: Option<State> = None;
         while let Some(status) = events.next().await {
-            match status.state() {
-                State::Running => return Ok(()),
-                state => log::info!("onion service state: {state:?}"),
+            let state = status.state();
+            if state == State::Running {
+                return Ok(());
             }
+            if reported.replace(state) == Some(state) {
+                continue;
+            }
+            // The only thing that moves during a publish that can take a
+            // minute. Silence here reads as a hung process.
+            log::info!("onion service state: {state:?}");
+            crate::ui::status_update(&format!("Onion service: {state:?}"));
         }
         bail!("the onion service stopped reporting status")
     }
