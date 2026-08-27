@@ -233,19 +233,23 @@ pub async fn connect(address: &str, port: u16, message: &str) -> Result<String> 
         .read_line(&mut reply)
         .await
     {
+        // Nothing read at all: the service hung up before echoing. An empty
+        // echo is not this case — it arrives as the one byte `\n`.
+        Ok(0) => bail!("the service closed the stream without echoing anything"),
         Ok(_) => {}
-        Err(e) if is_disconnect(&e) => log::debug!("service disconnected: {e}"),
+        // A partial line is discarded by `read_line`, so this is the same
+        // truncation as above, just reported as an END cell instead of an EOF.
+        Err(e) if is_disconnect(&e) => {
+            log::debug!("service disconnected: {e}");
+            bail!("the service closed the stream without echoing a full line");
+        }
         Err(e) => return Err(e).context("failed to read the echo"),
     }
 
     // Sends an END with reason DONE rather than letting the drop look abrupt.
     let _ = writer.shutdown().await;
 
-    let reply = reply.trim_end_matches('\n').to_owned();
-    if reply.is_empty() {
-        bail!("the service closed the stream without echoing anything");
-    }
-    Ok(reply)
+    Ok(reply.trim_end_matches('\n').to_owned())
 }
 
 #[cfg(test)]
