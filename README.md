@@ -299,5 +299,3 @@ checkout in the sibling `ptransfer` folder. Set `PTRANSFER_WEB_ROOT`,
 the CLI with all features, starts the web development server when needed, and
 leaves byte-verified transfer artifacts in the temporary directory printed at
 the end.
-
-Do not run `cargo fmt` for this repo.
