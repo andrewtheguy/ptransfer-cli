@@ -20,7 +20,8 @@ ptransfer test send ./file.bin ./photos
 ## Receive From pTransfer
 
 Start a send in pTransfer with **PIN Exchange**, then run `ptransfer`, choose
-**Receive**, pick the output directory, and enter the PIN.
+**Receive**, pick the output directory, and paste the PIN. There is no mode to
+choose on this side — the PIN itself says which one it is.
 
 Test mode (fails if the destination exists; add `--overwrite` to replace):
 
@@ -50,9 +51,11 @@ needs, and no relay or signaling server is involved at all. The other end may be
 another CLI or a pTransfer browser tab, at most 100 MiB per transfer — and
 slow enough that far less than that is the sensible size.
 
-In the wizard, choose **Send** or **Receive** and then **Tor Onion Service**.
-The sending side shows the address and password to hand over; the receiving side
-asks for both after the output directory.
+In the wizard, the sending side chooses **Send** and then **Tor Onion Service**,
+and gets the address and password to hand over. The receiving side chooses
+**Receive**, picks the output directory and pastes the address into the same box
+a PIN would go into; being an onion address is what selects this mode, and the
+password is asked for on the screen after it.
 
 Test mode:
 
