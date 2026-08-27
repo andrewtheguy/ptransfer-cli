@@ -27,6 +27,27 @@ pub enum WireEncoding {
     Identity,
 }
 
+/// What the receiver is about to be handed: the payload's name, its input
+/// size, and how its bytes travel.
+///
+/// Delivered inside the sender's authenticated handshake payload — never in
+/// the clear before the peers have a shared key — on both transports: the
+/// sealed confirm of PIN Exchange, and the sealed confirm of the Tor onion
+/// handshake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferMetadata {
+    /// Always `"file"`.
+    pub content_type: String,
+    pub file_name: String,
+    /// Input size of the payload: a progress hint, never the wire length.
+    pub file_size: u64,
+    /// How the payload travels; `deflate-raw` payloads are inflated by the
+    /// receiver after decryption.
+    pub content_encoding: WireEncoding,
+    pub mime_type: String,
+}
+
 /// Grow the scratch buffer in 128 KiB steps: one wire chunk of highly
 /// compressible input can inflate to far more than its own length, so a single
 /// `push` may need several passes.

@@ -41,3 +41,24 @@ Test mode:
 ptransfer test send ./file.bin
 ptransfer test receive <PIN>
 ```
+
+## CLI to CLI Over Tor
+
+Needs a build with the `tor` feature. The sender publishes a throwaway onion
+service; the address and the printed password are the only things the receiver
+needs, and no relay or signaling server is involved at all. CLI to CLI only, at
+most 1 MiB per transfer.
+
+In the wizard, choose **Send** or **Receive** and then **Tor Onion Service**.
+The sending side shows the address and password to hand over; the receiving side
+asks for both after the output directory.
+
+Test mode:
+
+```bash
+# sender: prints the address and password, then `ready`
+ptransfer tor send ./file.bin
+
+# receiver: wait for `ready`, then use both printed values
+ptransfer tor receive <address> <password> --output ./downloads
+```

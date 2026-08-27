@@ -34,7 +34,7 @@ use crate::crypto::spake2::{
 };
 use crate::signaling::nostr::{
     self, CandidatePayload, ClaimPayload, ConfirmPayload, HandshakeType, NostrClient,
-    RendezvousPayload, Signal, TransferMetadata, addressed_filter, addressed_filter_from_author,
+    RendezvousPayload, Signal, addressed_filter, addressed_filter_from_author,
     compute_rendezvous_transcript_hash, compute_transfer_metadata_hash, create_handshake_event,
     create_rendezvous_event, create_signal_event, generate_handshake_nonce, open_handshake_payload,
     parse_handshake_event, parse_signal_event, seal_handshake_payload,
@@ -44,6 +44,7 @@ use crate::ui;
 use crate::util::format_bytes;
 use crate::webrtc::common::{DcMessenger, WebRtcPeer, open_and_detach};
 use crate::webrtc::{add_ice_candidate_safely, advertise_max_message_size, candidate_strings};
+use crate::wire::TransferMetadata;
 
 /// Total time the sender keeps rotating/waiting before giving up
 /// ([`PIN_WAIT_TIMEOUT_MS`]).
@@ -327,7 +328,7 @@ pub async fn send_file_nostr(source: &SendSource) -> Result<()> {
     ui::status(&format!("Connected via {}", info.connection_type));
 
     let mut messenger = DcMessenger::new(raw);
-    let result = run_sender(&mut messenger, &session_keys.content, source).await;
+    let result = run_sender(&mut messenger, &session_keys.content, source, MAX_MESSAGE_SIZE).await;
 
     let _ = peer.close().await;
     client.disconnect().await;

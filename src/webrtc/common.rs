@@ -24,6 +24,8 @@ use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
+use crate::transfer::{Messenger, TransferMessage};
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const DATAGRAM_BUFFER_SIZE: usize = 65_536;
 const BUFFERED_AMOUNT_LOW: u32 = 512 * 1024;
@@ -74,7 +76,7 @@ enum PeerCommand {
 struct ChannelParts {
     id: RTCDataChannelId,
     label: String,
-    message_rx: mpsc::UnboundedReceiver<DcMessage>,
+    message_rx: mpsc::UnboundedReceiver<TransferMessage>,
     opened_rx: watch::Receiver<bool>,
     closed: Arc<AtomicBool>,
     send_allowed: Arc<AtomicBool>,
@@ -82,7 +84,7 @@ struct ChannelParts {
 }
 
 struct WorkerChannel {
-    message_tx: mpsc::UnboundedSender<DcMessage>,
+    message_tx: mpsc::UnboundedSender<TransferMessage>,
     opened_tx: watch::Sender<bool>,
     closed: Arc<AtomicBool>,
     send_allowed: Arc<AtomicBool>,
@@ -476,7 +478,7 @@ async fn run_peer(
             if let RTCMessage::DataChannelMessage(id, message) = message
                 && let Some(channel) = channels.get(&id)
             {
-                let _ = channel.message_tx.send(DcMessage {
+                let _ = channel.message_tx.send(TransferMessage {
                     is_string: message.is_string,
                     data: message.data.freeze(),
                 });
@@ -877,7 +879,7 @@ pub struct RtcDataChannel {
     #[allow(dead_code)]
     label: String,
     command_tx: mpsc::Sender<PeerCommand>,
-    message_rx: mpsc::UnboundedReceiver<DcMessage>,
+    message_rx: mpsc::UnboundedReceiver<TransferMessage>,
     opened_rx: watch::Receiver<bool>,
     closed: Arc<AtomicBool>,
     send_allowed: Arc<AtomicBool>,
@@ -923,34 +925,28 @@ impl RtcDataChannel {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct DcMessage {
-    pub is_string: bool,
-    pub data: Bytes,
-}
-
 /// Message-oriented transfer adapter over an `rtc` data channel.
 pub struct DcMessenger {
     channel: RtcDataChannel,
 }
 
-impl DcMessenger {
-    pub fn new(channel: RtcDataChannel) -> Self {
-        Self { channel }
-    }
-
-    pub async fn recv(&mut self) -> Option<DcMessage> {
+impl Messenger for DcMessenger {
+    async fn recv(&mut self) -> Option<TransferMessage> {
         self.channel.message_rx.recv().await
     }
 
-    pub async fn send_binary(&self, data: Bytes) -> Result<()> {
+    async fn send_binary(&mut self, data: Bytes) -> Result<()> {
         self.channel.send(data, false).await
     }
 
-    pub async fn send_text(&self, text: impl Into<String>) -> Result<()> {
-        self.channel
-            .send(Bytes::from(text.into().into_bytes()), true)
-            .await
+    async fn send_text(&mut self, text: String) -> Result<()> {
+        self.channel.send(Bytes::from(text.into_bytes()), true).await
+    }
+}
+
+impl DcMessenger {
+    pub fn new(channel: RtcDataChannel) -> Self {
+        Self { channel }
     }
 
     /// Whether the channel negotiated ordered delivery.
