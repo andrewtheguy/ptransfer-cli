@@ -180,76 +180,48 @@ rather than route file bytes through a relay.
 
 ## Tor Onion Transport
 
-Behind the non-default `tor` cargo feature, and deliberately outside the interop
-protocol: nothing here is specified by `INTEROP_PROTOCOL.md`, and the web app
-does not speak it. v1 is CLI to CLI, capped at 1 MiB per transfer.
+Behind the non-default `tor` cargo feature. The wire contract is the web app's
+[`docs/TOR_TRANSPORT.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/TOR_TRANSPORT.md),
+which specifies the onion address binding, the password, the SPAKE2 handshake
+frames, the key schedule, the stream framing, and the bounds — deliberately
+outside `INTEROP_PROTOCOL.md` and carrying its own `TOR_HANDSHAKE_VERSION`
+(`1`). This build implements that version; where the two disagree, the spec
+wins. Either side of a transfer may be this CLI or a browser tab.
 
-The sender publishes an ephemeral v3 onion service and mints a one-time
-password with the same generator PIN Exchange uses. Those two strings are the
-whole rendezvous: no relay, no lookup hint, no third-party identity, and no
-event to correlate. Unlike a PIN, the password's *entire* 12 characters are
-secret — there is no public locator segment, because there is nothing public to
-look anything up in.
+This section describes only what is specific to the CLI's realization of it.
 
-**Framing.** A Tor stream is a byte stream, so
-`[1-byte kind][4-byte big-endian length][payload]` frames restore the discrete
-binary/text messages the choreography needs, with the length capped at one
-encrypted chunk. Above that framing the transfer is the *same* code as PIN
-Exchange — `run_sender`/`run_receiver` are generic over a `Messenger`, and both
-transports implement it.
+**Modules.** `src/tor/service.rs` publishes the ephemeral onion service and
+`client.rs` connects to one, both over Arti; `wire.rs` is the framed
+`TorMessenger`; `handshake.rs` is the spec's handshake; `transfer.rs` is the
+accept loop and the caps; `storage.rs` is the throwaway Arti state; `echo.rs` is
+the `tor serve`/`tor connect` proof of concept.
 
-**Handshake.** Both peers run SPAKE2 (RFC 9382, P-256) over the stream:
+**One transfer layer, two transports.** `run_sender`/`run_receiver` are generic
+over a `Messenger`, so above the framing the Tor path runs the *same* code as
+PIN Exchange rather than a parallel implementation. `TorMessenger` restores the
+discrete binary/text messages the choreography needs from a byte stream.
 
-```text
-receiver -> sender   hello    { version, pakeMessage: pB }
-sender   -> receiver offer    { version, pakeMessage: pA, salt }
-receiver -> sender   claim    { sealed }
-sender   -> receiver confirm  { sealed(metadata) }
-receiver -> sender   ready | cancel
-```
+**Arti state is throwaway.** Every run gets a fresh state and cache directory
+that is removed on exit, so a transfer never touches a system Tor or an
+existing `~/.local/share/arti` and leaves nothing behind. The cost is that
+nothing is cached between runs and every command bootstraps from cold.
 
-The `<host>.onion:<port>` address stands in as the transfer identity in the
-SPAKE2 transcript, with fixed role labels for the two ends. Opening either seal
-*is* the key confirmation: a wrong password produces two different roots and the
-claim simply fails to open, so the sender hangs up without answering. Binding
-the address is what stops a handshake proxied through to a *different* onion
-service — both ends would derive different roots. Keys derive under
-`ptransfer:tor-session:v1:{claim,confirm,content}`, so no key is ever shared
-with the PIN Exchange path even off an identical root.
+**The password comes from stdin, never argv.** On the receiving side it is
+prompted for at a terminal and piped in from a script, because an argument
+would publish half the credential pair to every process on the machine for the
+length of a Tor bootstrap.
 
-There is no confirmation code for a human to compare. A PIN is short enough that
-a live guess can race the intended receiver, which is what that code catches;
-the address and password are only ever handed over as a pair, so there is no
-race to catch. The sender still counts failed connections and stops after 20.
+**Waiting for the peer's close.** The spec makes whoever sends the last frame
+wait for the peer to close, and Arti is why it matters here: it hands bytes to
+the circuit from background tasks, so a process that writes and exits takes
+that frame with it. The close is therefore the delivery receipt for the
+receiver's `ACK`, and its absence is reported — but not as a failure, since by
+then the file is written and verified and only the sender's knowledge of that
+is in doubt.
 
-**What each layer contributes.** Tor authenticates the *service* to the client
-(the address is its public key) and encrypts the stream end to end. The password
-adds the other direction: proof the connecting peer is the intended receiver
-rather than anyone who came across the address. File bytes then travel under the
-same AES-256-GCM chunk format as every other transfer, encrypted a second time
-inside the Tor stream.
-
-**Bounds.** Anyone who has the address can open the port, so an accepted
-connection is not yet a receiver and never gets to hold the service against the
-real one. Each connection has 5 minutes for its whole turn; a stall is counted
-as a failed connection like any other and the sender goes back to waiting. The
-shutdown signal and the 30-minute overall deadline wrap the accept loop
-*including* connections in progress, so neither is blocked by a peer that opens
-the port and says nothing. On the receiver's side the password comes from stdin
-rather than argv, which would otherwise publish half the credential pair to
-every process on the machine for the length of a Tor bootstrap.
-
-Whoever sends the last frame waits for the peer to close before exiting: Arti
-hands bytes to the circuit from background tasks, so a process that writes and
-exits takes that frame with it. The close is therefore the delivery receipt for
-the receiver's `ACK`, and its absence is reported — but not as a failure, since
-by then the file is written and verified and only the sender's knowledge of
-that is in doubt.
-
-**Limits.** The 1 MiB cap is enforced on the *input* when the selection is
-prepared, and the wire ceiling carries a small margin over it — deflate grows
-incompressible input slightly and a ZIP adds per-entry headers, neither of which
-is known until the bytes are produced.
+**Input caps.** The spec's 1 MiB bound is enforced on the input when the
+selection is prepared (`prepare_send_source_with_cap`), and the wire ceiling
+carries the spec's margin over it.
 
 ## Wire Encoding
 
@@ -336,4 +308,5 @@ enforces the limit against actual output and seals the final length in `DONE`.
 
 The CLI intentionally has no legacy signaling protocol, no resume path, no QR
 support, no Code Exchange, no relay discovery, and no custom fallback mode. The
-Tor transport is CLI to CLI only; CLI-to-web over Tor is phase 2.
+Tor transport interoperates with the web app in both directions and is capped at
+1 MiB per transfer, with no resume.

@@ -163,23 +163,22 @@ otherwise sets the onion virtual port on either side. Multiple paths or a folder
 are sent as one ZIP, exactly as in PIN Exchange. If the destination file already
 exists the receiver fails; pass `--overwrite` to replace it.
 
-v1 is CLI to CLI and carries at most **1 MiB** per transfer — a Tor circuit is
-slow enough that anything larger wants resume support, which this does not have.
-CLI-to-web is phase 2.
+The transport carries at most **1 MiB** per transfer — a Tor circuit is slow
+enough that anything larger wants resume support, which this does not have. The
+other end may be another CLI or a pTransfer browser tab; both speak the same
+handshake.
 
 These `tor` subcommands are the non-interactive form. The wizard covers the same
 transfer under **Tor Onion Service** in its mode menu.
 
 The password authenticates both ends through the same SPAKE2 exchange PIN
-Exchange uses, with the relay-shaped parts removed: no rendezvous to look up, no
-third-party identities, and no confirmation code for a human to compare. The
-`.onion` address is bound into the SPAKE2 transcript, so a handshake proxied
-through to a *different* onion service derives a different key and every seal
-under it fails. Tor already authenticates the service to the client and encrypts
-the stream; the password adds what that cannot — proof the *connecting* peer is
-the intended receiver rather than anyone who came across the address. File bytes
-then travel under the same encrypted chunk format as every other transfer, so
-they are encrypted a second time inside the Tor stream.
+Exchange uses, with the relay-shaped parts removed, and the `.onion` address is
+bound into the transcript so a handshake proxied through to a different service
+fails. The handshake, the key schedule, the framing, and the bounds are
+specified in the web app's
+[`docs/TOR_TRANSPORT.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/TOR_TRANSPORT.md),
+which both implementations follow; `docs/ARCHITECTURE.md` covers what is
+specific to this one.
 
 #### Echo Proof of Concept
 
@@ -275,8 +274,8 @@ pTransfer's app version. This build implements version `2`, declared in
 - No resume support.
 - No QR support.
 - No Code Exchange: hand-carried offer/answer codes are web-only.
-- The Tor transport carries at most 1 MiB per transfer, is CLI to CLI only, and
-  is not part of the interop protocol.
+- The Tor transport carries at most 1 MiB per transfer and is not part of the
+  interop protocol; it has a spec of its own that the web app shares.
 - No custom relay/discovery mode.
 - Direct P2P only: no TURN relay fallback for the file bytes.
 
