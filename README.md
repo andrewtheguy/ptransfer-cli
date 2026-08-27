@@ -221,7 +221,7 @@ The normative wire contract is the sibling pTransfer checkout's
 [`docs/INTEROP_PROTOCOL.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/INTEROP_PROTOCOL.md).
 It covers PIN Exchange and the shared data-channel transfer layer — exactly what
 this CLI implements — and carries an interop protocol version independent of
-pTransfer's app version. This build implements version `1`, declared in
+pTransfer's app version. This build implements version `2`, declared in
 `package.metadata.ptransfer-protocol-version`.
 
 - Rendezvous event: Nostr kind `4243` (a regular kind, so relays retain it for a

@@ -5,7 +5,7 @@
 The normative wire contract is the web app's `docs/INTEROP_PROTOCOL.md`, which
 specifies PIN Exchange and the shared data-channel transfer layer and carries an
 interop protocol version independent of pTransfer's app version. This build
-implements version `1` (`package.metadata.ptransfer-protocol-version`). This
+implements version `2` (`package.metadata.ptransfer-protocol-version`). This
 document describes how the CLI realizes that contract; where the two disagree,
 the spec wins.
 
