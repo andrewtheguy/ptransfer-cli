@@ -1,7 +1,7 @@
 [package]
 name = "ptransfer-cli"
 # does not have to match pTransfer's npm version
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 publish = false
 
@@ -10,7 +10,7 @@ publish = false
 # in the pTransfer web app's src/lib/protocol.ts, specified by its
 # docs/INTEROP_PROTOCOL.md. Deliberately not pTransfer's npm version — that moves
 # for web-only changes (Code Exchange, the relay fallback) this CLI does not implement.
-ptransfer-protocol-version = "2"
+ptransfer-protocol-version = "4"
 
 [lib]
 name = "ptransfer_cli"
@@ -22,10 +22,13 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Experimental CLI-to-CLI transport over a Tor v3 onion service (proof of
-# concept). Off by default: it drags in the whole Arti dependency tree, which
-# roughly doubles build time for a code path the file transfer does not use yet.
+# Everything that needs a Tor client, both experimental: the onion-service
+# transport (src/tor) and anonymous signaling, which carries the PIN Exchange
+# handshake to onion-service Nostr relays (src/signaling/anonymous.rs). One
+# feature rather than two, because they are the same client. Off by default: it
+# drags in the whole Arti dependency tree, which roughly doubles build time.
 tor = [
+    "dep:async-wsocket",
     "dep:futures-channel",
     "dep:postage",
     "dep:rand",
@@ -50,6 +53,7 @@ tor = [
     "dep:tor-proto",
     "dep:tor-protover",
     "dep:tor-rtcompat",
+    "dep:tokio-tungstenite",
 ]
 
 [dependencies]
@@ -83,6 +87,22 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Nostr signaling
 nostr-sdk = "0.44.1"
+
+# Anonymous signaling (feature "tor"): the PIN Exchange handshake carried to
+# onion-service Nostr relays over the Tor client this crate already assembles.
+#
+# `nostr-sdk` exposes the WebSocket transport as a trait, so the only thing
+# missing is a socket. `tokio-tungstenite` supplies the client handshake, which
+# is the one piece that has to run *inside* a stream opened elsewhere — its
+# `connect` and TLS features are off for exactly that reason: an onion circuit
+# is already authenticated by the key the address commits to, and nothing here
+# ever dials a host itself. `async-wsocket` is only where the message type in
+# the trait's signature lives (nostr-sdk re-exports the trait but not the type)
+# along with its tungstenite conversions; none of its own connectors are used.
+tokio-tungstenite = { version = "0.26", default-features = false, features = [
+    "handshake",
+], optional = true }
+async-wsocket = { version = "0.13", default-features = false, optional = true }
 
 # WebRTC transport
 rtc = "0.9.1"
@@ -165,7 +185,7 @@ env_logger = "0.11"
 # TUI wizard
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 
 [dev-dependencies]
 tempfile = "3"

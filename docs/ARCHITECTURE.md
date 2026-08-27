@@ -5,7 +5,7 @@
 The normative wire contract is the web app's `docs/INTEROP_PROTOCOL.md`, which
 specifies PIN Exchange and the shared data-channel transfer layer and carries an
 interop protocol version independent of pTransfer's app version. This build
-implements version `2` (`package.metadata.ptransfer-protocol-version`). This
+implements version `4` (`package.metadata.ptransfer-protocol-version`). This
 document describes how the CLI realizes that contract; where the two disagree,
 the spec wins.
 
@@ -17,10 +17,20 @@ number means the same thing in both interfaces; selecting it reports that it is
 not implemented and goes no further.
 
 That menu belongs to the sending side alone. The receiving side is handed one
-value and the modes are distinguishable by it — a 12-character PIN, or a v3
-onion address with a valid checksum — so the wizard classifies what was pasted
-rather than asking, as the web app's receive screen does. Only the Tor mode then
-needs a second input, its one-time password.
+value and the modes are distinguishable by it — a 12- or 16-character PIN, or a
+v3 onion address with a valid checksum — so the wizard classifies what was
+pasted rather than asking, as the web app's receive screen does. Only the Tor
+mode then needs a second input, its one-time password.
+
+**No secret is ever a command-line argument.** The `test` subcommand takes
+paths and options on the command line and everything secret — the PIN, the Tor
+transport's password, the confirmation code — on stdin, prompted for at a
+terminal and piped in from a script. An argument is public: every other process
+on the machine can read it out of the process list and an interactive shell
+writes it to history, and the receiving side holds its secret for the whole
+connection attempt — tens of seconds for PIN Exchange, minutes when a Tor
+bootstrap is in front of it — which is exactly long enough for whoever grabs it
+to collect the file first.
 
 ## PIN Exchange
 
@@ -35,7 +45,9 @@ position-weighted checksum) from a 55-character alphabet of letters and digits
 that excludes ambiguous `0`, `1`, `I`, `O`, `i`, `l`, and `o`. There are no
 symbols. Entry preserves exact case and filters unsupported characters. Its
 leading three characters are a public locator segment used only for relay
-lookup, so effective strength is 55⁸ ≈ 46.3 bits.
+lookup, so effective strength is 55⁸ ≈ 46.3 bits. Anonymous signaling mints the
+same PIN at 16 characters instead (see below); everything in this section holds
+for both, with 55¹² in place of 55⁸.
 
 - `hint:<bucket>` — 8-hex-character event lookup tag, derived by HKDF-SHA256
   (salt `ptransfer:pin:v4`) directly from the public locator and scoped to the
@@ -184,6 +196,55 @@ Default relays match pTransfer. Transport is direct-only: STUN servers
 assist NAT traversal, but no TURN relay is configured, so a transfer fails
 rather than route file bytes through a relay.
 
+## Anonymous Signaling
+
+Behind the same non-default `tor` cargo feature, and experimental. The
+normative specification is the web app's
+[`docs/ANONYMOUS_SIGNALING.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/ANONYMOUS_SIGNALING.md):
+the PIN's length carrying the mode, the relay pool, the URL policy and the
+privacy boundary are defined there, once, for both implementations. Like the
+Tor transport it sits outside `INTEROP_PROTOCOL.md`, which is why an
+implementation of that document alone must refuse a PIN of any other length
+rather than guess. Either side of a transfer may be this CLI or a browser tab.
+
+This section describes only what is specific to the CLI's realization of it.
+
+**Only the relay sockets are new.** Every event, subscription, signature,
+SPAKE2 exchange and sealed payload above the socket is the code the clearnet
+path runs, so `src/signaling/anonymous.rs` adds only a `WebSocketTransport` —
+the seam `nostr-sdk`'s relay pool already exposes — whose sockets are WebSocket
+handshakes run inside onion streams opened by the Tor client in
+`src/tor/client.rs`. Frames are `tokio-tungstenite`'s, capped at 1 MiB per
+message; a binary frame is a protocol error rather than a silent drop.
+
+**Where the mode is read.** `PinKind` and `classify_pin` in `src/crypto/pin.rs`
+turn the PIN's length into the pool `NostrClient::connect` dials; nothing else
+in the CLI decides it and there is no receive-side flag. `test send
+--anonymous` mints the longer PIN, and so does the wizard's `a` toggle on the
+PIN Exchange row — an option of that mode rather than a mode beside it, which
+is where the web app keeps it too. A build without the `tor` feature still
+recognizes such a PIN and says what is missing, rather than rejecting it as
+malformed. The Tor transfer mode's one-time password selects no relay pool, so
+it is checked against the ordinary length alone.
+
+**Where the URL policy is enforced.** `normalize_onion_relay_url` is applied to
+every pool entry before a socket is opened, and it parses the address as an
+Arti `HsId` rather than pattern-matching for `.onion` — Arti routes a non-onion
+host through an exit node, so this check is what stands between a bad pool
+entry and a socket that sees the device's IP address.
+
+**Timeouts and failure reporting.** A relay socket gets 180 seconds rather than
+3: it is a whole rendezvous — an HSDir descriptor fetch, an introduction circuit
+and a rendezvous circuit — and every socket pays for its own, which is why the
+pool is kept small. The wait is for *any* relay to connect, and unlike the
+clearnet path it is a hard requirement: there is no silent fallback to a
+clearnet socket, so a pool that never opens is reported instead of being left
+for a publish to discover. Failing to reach Tor at all and failing to reach a
+relay through it are separate errors, because they are separate problems.
+Publishes go to the relays that have a socket open, so one relay that is still
+connecting cannot hold every event for its `OK` timeout after another relay has
+already accepted it.
+
 ## Tor Onion Transport
 
 Behind the non-default `tor` cargo feature. The wire contract is the web app's
@@ -226,10 +287,10 @@ matters for more than convenience: relay authentication — self-signed TLS boun
 to an identity by the CERTS cell — stays Arti's rather than becoming a
 certificate verifier written here.
 
-**The password comes from stdin, never argv.** On the receiving side it is
-prompted for at a terminal and piped in from a script, because an argument
-would publish half the credential pair to every process on the machine for the
-length of a Tor bootstrap.
+**The password comes from stdin, never argv**, like every other secret this CLI
+reads (above). The address is the half of the pair that may be an argument: it
+is not a secret on its own, and a receiver still cannot authenticate without the
+password.
 
 **Waiting for the peer's close.** The spec makes whoever sends the last frame
 wait for the peer to close, and Arti is why it matters here: it hands bytes to
@@ -331,4 +392,6 @@ enforces the limit against actual output and seals the final length in `DONE`.
 The CLI intentionally has no legacy signaling protocol, no resume path, no QR
 support, no Code Exchange, no relay discovery, and no custom fallback mode. The
 Tor transport interoperates with the web app in both directions and is capped at
-100 MiB per transfer, with no resume.
+100 MiB per transfer, with no resume. Anonymous signaling interoperates in both
+directions too and is experimental on both sides: it changes which relays carry
+the handshake and nothing else, so it inherits every limit above.

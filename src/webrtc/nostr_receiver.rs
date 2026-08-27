@@ -25,8 +25,8 @@ use crate::crypto::aes;
 use crate::crypto::chunk::MAX_MESSAGE_SIZE;
 use crate::crypto::kdf::{ConfirmationCodeBinding, HandshakeSealKeys, NostrSessionKeys, PakeRoot};
 use crate::crypto::pin::{
-    MAX_CLAIM_ATTEMPTS, MAX_CLAIM_CANDIDATES, PIN_HINT_LOOKBACK_BUCKETS, is_rendezvous_fresh,
-    is_valid_pin, now_ms, pin_bucket, pin_hint_for_bucket, pin_locator,
+    MAX_CLAIM_ATTEMPTS, MAX_CLAIM_CANDIDATES, PIN_HINT_LOOKBACK_BUCKETS, classify_pin,
+    is_rendezvous_fresh, now_ms, pin_bucket, pin_hint_for_bucket, pin_locator,
 };
 use crate::crypto::spake2::{
     PakeIdentities, PakeRole, PakeRun, derive_pake_secret, is_valid_pake_message,
@@ -97,9 +97,12 @@ pub async fn receive_file_nostr(
     output_dir: Option<PathBuf>,
     on_conflict: OnConflict,
 ) -> Result<()> {
-    if !is_valid_pin(pin) {
+    // The PIN's length is also which relay pool the sender is waiting on, so
+    // this one call settles both whether the PIN is usable and where to look.
+    // There is nothing to ask the receiver about it.
+    let Some(pin_kind) = classify_pin(pin) else {
         bail!("Invalid PIN: check for typos and try again");
-    }
+    };
     let locator = pin_locator(pin).to_string();
 
     // Nothing here waits on a key stretch — with the PAKE there is none. The
@@ -115,7 +118,7 @@ pub async fn receive_file_nostr(
 
     let step = Instant::now();
     ui::status("Connecting to Nostr relays...");
-    let client = NostrClient::connect(Keys::generate()).await?;
+    let client = NostrClient::connect(Keys::generate(), pin_kind).await?;
     ui::status_timed("Connected to Nostr relays", step.elapsed());
 
     ui::status("Searching for sender...");

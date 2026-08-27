@@ -608,10 +608,10 @@ async function cliToCli(): Promise<void> {
   );
   console.log(`[e2e] sender PIN: ${pin}`);
 
-  const receiver = runCli(
-    ['test', 'receive', pin, '--output', outputDir],
-    'CLI receiver',
-  );
+  const receiver = runCli(['test', 'receive', '--output', outputDir], 'CLI receiver');
+  // The PIN is never an argument: it would be readable in the process list for
+  // as long as the receiver runs.
+  receiver.child.stdin.write(`${pin}\n`);
   const confirmationCode = await waitForStdoutLine(
     receiver,
     (line) => CONFIRMATION_CODE.test(line),
@@ -712,10 +712,8 @@ async function webToCli(): Promise<void> {
     }
     console.log(`[e2e] web sender PIN: ${pin}`);
 
-    const receiver = runCli(
-      ['test', 'receive', pin, '--output', outputDir],
-      'CLI receiver',
-    );
+    const receiver = runCli(['test', 'receive', '--output', outputDir], 'CLI receiver');
+    receiver.child.stdin.write(`${pin}\n`);
     const confirmationCode = await waitForStdoutLine(
       receiver,
       (line) => CONFIRMATION_CODE.test(line),

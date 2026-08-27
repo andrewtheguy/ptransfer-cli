@@ -17,7 +17,11 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Stylize;
 use ratatui::widgets::Paragraph;
 
-use crate::crypto::pin::{PIN_LENGTH, is_valid_pin, pin_char};
+use crate::crypto::pin::{PinKind, classify_pin, pin_char};
+// Only the Tor transport's password field is fixed to one length; a PIN
+// Exchange PIN has two, and `PinKind` is what names them.
+#[cfg(feature = "tor")]
+use crate::crypto::pin::PIN_LENGTH;
 
 use super::dir_picker::{DirPicker, DirPickerStep};
 use super::file_browser::{Browser, BrowserStep};
@@ -26,7 +30,12 @@ use super::widgets;
 
 /// The resolved outcome of the wizard: what to transfer and how.
 pub enum WizardPlan {
-    SendPin(Vec<PathBuf>),
+    SendPin {
+        paths: Vec<PathBuf>,
+        /// Which length the PINs this transfer mints are drawn at, and so
+        /// which relay pool they are published on.
+        pin_kind: PinKind,
+    },
     ReceivePin {
         pin: String,
         output: PathBuf,
@@ -45,6 +54,12 @@ pub enum WizardPlan {
 /// app's order, so an option's number means the same thing in both interfaces.
 /// The Tor transport is the CLI's own third mode, and only exists in a build
 /// with the `tor` feature.
+///
+/// Anonymous signaling is deliberately not a fourth entry. It is not a mode:
+/// it changes which relays PIN Exchange signals over and nothing else, and the
+/// web app has it as an advanced option of the PIN Exchange choice rather than
+/// beside it. It is the same here — a toggle on the [`MODE_PIN`] row, off
+/// until asked for.
 ///
 /// There is no matching menu on the receiving side: what the sender hands over
 /// says which mode it is, so [`classify`] reads the mode off it.
@@ -74,6 +89,26 @@ const MODE_PIN: usize = 0;
 #[cfg(feature = "tor")]
 const MODE_TOR: usize = 2;
 
+/// The key that turns anonymous signaling on and off on the [`MODE_PIN`] row.
+#[cfg(feature = "tor")]
+const ANONYMOUS_KEY: char = 'a';
+
+/// What the toggle under the menu says, given its state.
+#[cfg(feature = "tor")]
+fn anonymous_toggle_line(on: bool) -> &'static str {
+    if on {
+        "[x] Anonymous signaling (experimental)   a to turn off"
+    } else {
+        "[ ] Anonymous signaling (experimental)   a to turn on"
+    }
+}
+
+/// What the toggle does, said the same way whichever state it is in: this is
+/// the line someone reads to decide, so it cannot only appear once they have.
+#[cfg(feature = "tor")]
+const ANONYMOUS_TOGGLE_HINT: &str =
+    "Signaling over Tor, so relays never see an IP. Slow to start; longer PIN.";
+
 const CODE_EXCHANGE_UNAVAILABLE: &str =
     "Code Exchange is not implemented in the CLI yet — use PIN Exchange.";
 
@@ -90,6 +125,13 @@ const ONION_REJECTED: &str = "Not a valid onion address — check for typos";
 #[cfg(not(feature = "tor"))]
 const ONION_REJECTED: &str = "This build has no Tor support — rebuild it with --features tor";
 
+/// What to say about a perfectly good anonymous-signaling PIN this build has
+/// no Tor client to act on. It is not a typo, so it must not be reported as
+/// one.
+#[cfg(not(feature = "tor"))]
+const ANONYMOUS_PIN_REJECTED: &str =
+    "That PIN needs anonymous signaling — rebuild this with --features tor";
+
 enum Screen {
     MainMenu {
         selected: usize,
@@ -100,12 +142,19 @@ enum Screen {
         selected: usize,
         /// Set when the highlighted mode cannot be started, cleared on move.
         notice: Option<String>,
+        /// Whether PIN Exchange will signal over the onion relay pool. Only a
+        /// `tor` build can turn it on — there is no client to reach that pool
+        /// with otherwise — so it is false throughout a build without one.
+        anonymous: bool,
     },
     /// The browser is shared by every send mode, so it carries the mode it was
     /// entered from: that decides which plan the wizard finishes with, and
     /// which row Esc returns to on the mode menu.
     FileBrowser {
         mode: usize,
+        /// Carried for the same reason as `mode`: it is part of the answer the
+        /// mode menu gave, and Esc has to return to the menu still holding it.
+        anonymous: bool,
         browser: Browser,
     },
     /// Receiving picks a directory first, because the mode is not known until
@@ -144,7 +193,10 @@ enum Screen {
 /// afterwards, because its password is a separate secret.
 #[derive(Debug, PartialEq, Eq)]
 enum Pasted {
-    Pin(String),
+    /// A PIN, with the mode its length announced: an anonymous one is
+    /// published on a relay pool of onion services, and the receiver is told
+    /// which by the PIN rather than asked.
+    Pin { pin: String, kind: PinKind },
     /// A valid v3 onion address, in whichever of its two spellings was pasted;
     /// the transfer re-splits it into the `<host>:<port>` its handshake binds.
     #[cfg(feature = "tor")]
@@ -190,7 +242,8 @@ impl Rejection {
 /// [`classify`] alone cannot express. The alphabet is ASCII, so a byte length
 /// is a character count here.
 fn looks_like_pin(text: &str) -> bool {
-    text.len() == PIN_LENGTH && text.chars().all(|c| pin_char(c).is_some())
+    PinKind::ALL.iter().any(|kind| kind.length() == text.len())
+        && text.chars().all(|c| pin_char(c).is_some())
 }
 
 /// Whether the text has an onion address's shape, checksum aside.
@@ -214,8 +267,18 @@ fn classify(text: &str) -> Result<Pasted, Rejection> {
         return Err(Rejection::Empty);
     }
 
-    if is_valid_pin(text) {
-        return Ok(Pasted::Pin(text.to_string()));
+    if let Some(kind) = classify_pin(text) {
+        // An anonymous PIN reaches a pool of onion services and nothing else,
+        // so a build without the Tor client cannot act on one however valid it
+        // is.
+        #[cfg(not(feature = "tor"))]
+        if kind == PinKind::Anonymous {
+            return Err(Rejection::Malformed(ANONYMOUS_PIN_REJECTED));
+        }
+        return Ok(Pasted::Pin {
+            pin: text.to_string(),
+            kind,
+        });
     }
 
     // Checked in full, checksum included: Arti resolves anything that is not a
@@ -275,11 +338,21 @@ pub async fn run_wizard(terminal: &mut DefaultTerminal) -> Result<Option<WizardP
 fn handle_key(screen: Screen, key: KeyEvent) -> Step {
     match screen {
         Screen::MainMenu { selected } => main_menu_key(selected, key),
-        Screen::ModeMenu { selected, .. } => mode_menu_key(selected, key),
-        Screen::FileBrowser { mode, mut browser } => match browser.handle_key(key) {
-            BrowserStep::Stay => Step::Continue(Screen::FileBrowser { mode, browser }),
-            BrowserStep::Back => Step::Continue(mode_menu_at(mode)),
-            BrowserStep::Confirm => Step::Finish(send_plan(mode, browser.selection())),
+        Screen::ModeMenu {
+            selected, anonymous, ..
+        } => mode_menu_key(selected, anonymous, key),
+        Screen::FileBrowser {
+            mode,
+            anonymous,
+            mut browser,
+        } => match browser.handle_key(key) {
+            BrowserStep::Stay => Step::Continue(Screen::FileBrowser {
+                mode,
+                anonymous,
+                browser,
+            }),
+            BrowserStep::Back => Step::Continue(mode_menu_at(mode, anonymous)),
+            BrowserStep::Confirm => Step::Finish(send_plan(mode, anonymous, browser.selection())),
         },
         Screen::OutputDir { mut picker } => match picker.handle_key(key) {
             DirPickerStep::Stay => Step::Continue(Screen::OutputDir { picker }),
@@ -309,11 +382,21 @@ fn handle_key(screen: Screen, key: KeyEvent) -> Step {
 }
 
 /// The plan a confirmed send selection produces in `mode`.
-fn send_plan(mode: usize, paths: Vec<PathBuf>) -> WizardPlan {
+///
+/// `anonymous` only ever reaches PIN Exchange: it is the length its PINs are
+/// minted at, which is the whole of what the option changes.
+fn send_plan(mode: usize, anonymous: bool, paths: Vec<PathBuf>) -> WizardPlan {
     match mode {
         #[cfg(feature = "tor")]
         MODE_TOR => WizardPlan::SendTor(paths),
-        _ => WizardPlan::SendPin(paths),
+        _ => WizardPlan::SendPin {
+            paths,
+            pin_kind: if anonymous {
+                PinKind::Anonymous
+            } else {
+                PinKind::Standard
+            },
+        },
     }
 }
 
@@ -344,22 +427,29 @@ fn main_menu_key(selected: usize, key: KeyEvent) -> Step {
     }
 }
 
-/// The send mode menu, with the first mode highlighted.
+/// The send mode menu, with the first mode highlighted and the option off.
 fn mode_menu() -> Screen {
-    mode_menu_at(MODE_PIN)
+    mode_menu_at(MODE_PIN, false)
 }
 
-/// The send mode menu with `selected` highlighted — what going back from the
-/// file browser returns to.
-fn mode_menu_at(selected: usize) -> Screen {
+/// The send mode menu as it was left — what going back from the file browser
+/// returns to.
+fn mode_menu_at(selected: usize, anonymous: bool) -> Screen {
     Screen::ModeMenu {
         selected,
         notice: None,
+        anonymous,
     }
 }
 
-fn mode_menu_key(selected: usize, key: KeyEvent) -> Step {
-    let stay = |notice: Option<String>| Step::Continue(Screen::ModeMenu { selected, notice });
+fn mode_menu_key(selected: usize, anonymous: bool, key: KeyEvent) -> Step {
+    let stay = |notice: Option<String>| {
+        Step::Continue(Screen::ModeMenu {
+            selected,
+            notice,
+            anonymous,
+        })
+    };
 
     // Code Exchange is a placeholder that keeps the CLI's mode numbering
     // aligned with the web app's; every other mode runs a transfer.
@@ -368,11 +458,19 @@ fn mode_menu_key(selected: usize, key: KeyEvent) -> Step {
     #[cfg(feature = "tor")]
     let implemented = selected == MODE_PIN || selected == MODE_TOR;
 
+    // The option belongs to PIN Exchange, so the key does nothing on any other
+    // row rather than setting something that row would ignore.
+    #[cfg(feature = "tor")]
+    if key.code == KeyCode::Char(ANONYMOUS_KEY) && selected == MODE_PIN {
+        return Step::Continue(mode_menu_at(selected, !anonymous));
+    }
+
     match key.code {
         KeyCode::Enter if !implemented => stay(Some(CODE_EXCHANGE_UNAVAILABLE.to_string())),
         KeyCode::Enter => match Browser::new() {
             Ok(browser) => Step::Continue(Screen::FileBrowser {
                 mode: selected,
+                anonymous,
                 browser,
             }),
             Err(_) => stay(None),
@@ -381,6 +479,7 @@ fn mode_menu_key(selected: usize, key: KeyEvent) -> Step {
         _ => Step::Continue(Screen::ModeMenu {
             selected: menu_move(selected, MODES.len(), &key),
             notice: None,
+            anonymous,
         }),
     }
 }
@@ -400,7 +499,9 @@ fn receive_entry_key(
     let mut edited = false;
     match key.code {
         KeyCode::Enter => match classify(&input) {
-            Ok(Pasted::Pin(pin)) => return Step::Finish(WizardPlan::ReceivePin { pin, output }),
+            Ok(Pasted::Pin { pin, .. }) => {
+                return Step::Finish(WizardPlan::ReceivePin { pin, output });
+            }
             #[cfg(feature = "tor")]
             Ok(Pasted::Onion(address)) => {
                 return Step::Continue(Screen::TorPassword {
@@ -446,7 +547,9 @@ fn tor_password_key(
     let mut edited = false;
     match key.code {
         KeyCode::Enter => {
-            if is_valid_pin(&password) {
+            // The transport's password is not a PIN Exchange PIN and selects
+            // no relay pool, so only the ordinary length is a password here.
+            if classify_pin(&password) == Some(PinKind::Standard) {
                 return Step::Finish(WizardPlan::ReceiveTor {
                     address,
                     password,
@@ -489,7 +592,10 @@ fn tor_password_key(
         error = None;
     }
     // Say so on the last keystroke rather than waiting for a submit to fail.
-    if error.is_none() && password.len() == PIN_LENGTH && !is_valid_pin(&password) {
+    if error.is_none()
+        && password.len() == PIN_LENGTH
+        && classify_pin(&password) != Some(PinKind::Standard)
+    {
         error = Some("Invalid password: check for typos".to_string());
     }
 
@@ -572,9 +678,15 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
             widgets::key_hints(f, inner, "↑/↓ move · Enter select · q quit");
         }
 
-        Screen::ModeMenu { selected, notice } => {
+        Screen::ModeMenu {
+            selected,
+            notice,
+            anonymous,
+        } => {
             let inner = widgets::screen_frame(f, "send");
-            let area = widgets::centered(inner, 60, 7);
+            // Three rows under the menu: the highlighted mode's hint, then the
+            // option that belongs to PIN Exchange and what it does.
+            let area = widgets::centered(inner, 76, MODES.len() as u16 + 5);
             let [title, _, list, extra] = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Length(1),
@@ -584,10 +696,23 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
             .areas(area);
             f.render_widget(Paragraph::new("How do you want to connect?"), title);
             widgets::menu(f, list, &MODES, *selected);
+            let [hint, option, option_hint] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .areas(extra);
             match notice {
-                Some(notice) => widgets::error_line(f, extra, notice),
-                None => f.render_widget(Paragraph::new(MODE_HINTS[*selected]).dim(), extra),
+                Some(notice) => widgets::error_line(f, hint, notice),
+                None => f.render_widget(Paragraph::new(MODE_HINTS[*selected]).dim(), hint),
             }
+            #[cfg(feature = "tor")]
+            if *selected == MODE_PIN {
+                f.render_widget(Paragraph::new(anonymous_toggle_line(*anonymous)), option);
+                f.render_widget(Paragraph::new(ANONYMOUS_TOGGLE_HINT).dim(), option_hint);
+            }
+            #[cfg(not(feature = "tor"))]
+            let _ = (anonymous, option, option_hint);
             widgets::key_hints(f, inner, "↑/↓ move · Enter select · Esc back");
         }
 
@@ -625,10 +750,15 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
                 // Naming what was recognized is the whole point of the screen:
                 // it is how the receiver sees which mode they are about to run
                 // without ever having been asked.
-                (None, Ok(Pasted::Pin(_))) => f.render_widget(
-                    Paragraph::new(
-                        "PIN detected. After you start, read the confirmation code to the sender.",
-                    )
+                (None, Ok(Pasted::Pin { kind, .. })) => f.render_widget(
+                    Paragraph::new(match kind {
+                        PinKind::Standard => {
+                            "PIN detected. After you start, read the confirmation code to the sender."
+                        }
+                        PinKind::Anonymous => {
+                            "Anonymous-signaling PIN detected — starting Tor first takes a few minutes."
+                        }
+                    })
                     .dim(),
                     extra,
                 ),
@@ -697,9 +827,12 @@ mod tests {
 
     #[test]
     fn code_exchange_reports_that_it_is_not_implemented() {
-        let step = mode_menu_key(1, press(KeyCode::Enter));
+        let step = mode_menu_key(1, false, press(KeyCode::Enter));
 
-        let Step::Continue(Screen::ModeMenu { selected, notice }) = step else {
+        let Step::Continue(Screen::ModeMenu {
+            selected, notice, ..
+        }) = step
+        else {
             panic!("Code Exchange should stay on the mode menu");
         };
         assert_eq!(selected, 1);
@@ -708,9 +841,12 @@ mod tests {
 
     #[test]
     fn moving_off_a_notice_clears_it() {
-        let step = mode_menu_key(1, press(KeyCode::Up));
+        let step = mode_menu_key(1, false, press(KeyCode::Up));
 
-        let Step::Continue(Screen::ModeMenu { selected, notice }) = step else {
+        let Step::Continue(Screen::ModeMenu {
+            selected, notice, ..
+        }) = step
+        else {
             panic!("expected the mode menu");
         };
         assert_eq!(selected, 0);
@@ -720,7 +856,8 @@ mod tests {
     #[test]
     fn escaping_the_mode_menu_reselects_send() {
         // The mode menu is the sending side's alone, so Esc lands back on Send.
-        let Step::Continue(Screen::MainMenu { selected }) = mode_menu_key(0, press(KeyCode::Esc))
+        let Step::Continue(Screen::MainMenu { selected }) =
+            mode_menu_key(0, false, press(KeyCode::Esc))
         else {
             panic!("Esc should return to the main menu");
         };
@@ -730,7 +867,7 @@ mod tests {
     #[cfg(feature = "tor")]
     #[test]
     fn the_tor_mode_starts_a_selection_rather_than_a_notice() {
-        let step = mode_menu_key(MODE_TOR, press(KeyCode::Enter));
+        let step = mode_menu_key(MODE_TOR, false, press(KeyCode::Enter));
         let Step::Continue(Screen::FileBrowser { mode, .. }) = step else {
             panic!("Tor should open the file browser");
         };
@@ -742,12 +879,81 @@ mod tests {
     #[test]
     fn the_selected_mode_decides_the_send_plan() {
         assert!(matches!(
-            send_plan(MODE_TOR, vec![PathBuf::from("a")]),
+            send_plan(MODE_TOR, false, vec![PathBuf::from("a")]),
             WizardPlan::SendTor(_)
         ));
         assert!(matches!(
-            send_plan(MODE_PIN, vec![PathBuf::from("a")]),
-            WizardPlan::SendPin(_)
+            send_plan(MODE_PIN, false, vec![PathBuf::from("a")]),
+            WizardPlan::SendPin {
+                pin_kind: PinKind::Standard,
+                ..
+            }
+        ));
+        // The only thing the option changes is the length of the PINs this
+        // transfer mints, which is what carries the mode to the receiver.
+        assert!(matches!(
+            send_plan(MODE_PIN, true, vec![PathBuf::from("a")]),
+            WizardPlan::SendPin {
+                pin_kind: PinKind::Anonymous,
+                ..
+            }
+        ));
+    }
+
+    /// The option is PIN Exchange's, the way the web app has it under that
+    /// mode's advanced options rather than as a mode of its own.
+    #[cfg(feature = "tor")]
+    #[test]
+    fn the_anonymous_toggle_belongs_to_pin_exchange_alone() {
+        let toggle = press(KeyCode::Char(ANONYMOUS_KEY));
+
+        let Step::Continue(Screen::ModeMenu {
+            selected, anonymous, ..
+        }) = mode_menu_key(MODE_PIN, false, toggle)
+        else {
+            panic!("the toggle should stay on the mode menu");
+        };
+        assert_eq!(selected, MODE_PIN);
+        assert!(anonymous, "a should turn the option on");
+
+        // And back off again: it is a toggle, not a one-way switch.
+        let Step::Continue(Screen::ModeMenu { anonymous, .. }) =
+            mode_menu_key(MODE_PIN, true, toggle)
+        else {
+            panic!("the toggle should stay on the mode menu");
+        };
+        assert!(!anonymous);
+
+        // On the Tor row the key is not a toggle, so it falls through to the
+        // menu's ordinary handling and changes nothing.
+        let Step::Continue(Screen::ModeMenu {
+            selected, anonymous, ..
+        }) = mode_menu_key(MODE_TOR, false, toggle)
+        else {
+            panic!("expected the mode menu");
+        };
+        assert_eq!(selected, MODE_TOR);
+        assert!(!anonymous);
+    }
+
+    /// Turning it on and then picking files has to reach the plan: the browser
+    /// sits between the two and carries the answer across.
+    #[cfg(feature = "tor")]
+    #[test]
+    fn the_toggle_survives_the_file_browser() {
+        let Step::Continue(Screen::FileBrowser { mode, anonymous, .. }) =
+            mode_menu_key(MODE_PIN, true, press(KeyCode::Enter))
+        else {
+            panic!("PIN Exchange should open the file browser");
+        };
+        assert_eq!(mode, MODE_PIN);
+        assert!(anonymous);
+        assert!(matches!(
+            send_plan(mode, anonymous, vec![PathBuf::from("a")]),
+            WizardPlan::SendPin {
+                pin_kind: PinKind::Anonymous,
+                ..
+            }
         ));
     }
 
@@ -762,10 +968,51 @@ mod tests {
 
     #[test]
     fn a_pasted_pin_is_recognized_without_being_asked_which_mode_it_is() {
-        let pin = crate::crypto::pin::generate_pin().unwrap();
-        assert_eq!(classify(&pin), Ok(Pasted::Pin(pin.clone())));
+        let pin = crate::crypto::pin::generate_pin(PinKind::Standard).unwrap();
+        assert_eq!(
+            classify(&pin),
+            Ok(Pasted::Pin {
+                pin: pin.clone(),
+                kind: PinKind::Standard
+            })
+        );
         // Surrounding whitespace comes along with almost every copy.
-        assert_eq!(classify(&format!("  {pin}\n")), Ok(Pasted::Pin(pin)));
+        assert_eq!(
+            classify(&format!("  {pin}\n")),
+            Ok(Pasted::Pin {
+                pin,
+                kind: PinKind::Standard
+            })
+        );
+    }
+
+    /// The receiver is never asked whether the sender turned on anonymous
+    /// signaling: the PIN it was handed is longer, and that is the whole
+    /// announcement.
+    #[cfg(feature = "tor")]
+    #[test]
+    fn a_pasted_anonymous_pin_is_recognized_as_one() {
+        let pin = crate::crypto::pin::generate_pin(PinKind::Anonymous).unwrap();
+        assert_eq!(
+            classify(&pin),
+            Ok(Pasted::Pin {
+                pin: pin.clone(),
+                kind: PinKind::Anonymous
+            })
+        );
+    }
+
+    /// Without the Tor client there is no onion relay pool to look on, so a
+    /// perfectly valid anonymous PIN has to be refused — and not as a typo,
+    /// which it is not.
+    #[cfg(not(feature = "tor"))]
+    #[test]
+    fn an_anonymous_pin_is_refused_by_a_build_without_tor() {
+        let pin = crate::crypto::pin::generate_pin(PinKind::Anonymous).unwrap();
+        assert_eq!(
+            classify(&pin),
+            Err(Rejection::Malformed(ANONYMOUS_PIN_REJECTED))
+        );
     }
 
     #[cfg(feature = "tor")]
@@ -813,7 +1060,7 @@ mod tests {
 
     #[test]
     fn a_recognized_pin_finishes_the_wizard() {
-        let pin = crate::crypto::pin::generate_pin().unwrap();
+        let pin = crate::crypto::pin::generate_pin(PinKind::Standard).unwrap();
         let Step::Finish(WizardPlan::ReceivePin { pin: entered, .. }) = receive_entry_key(
             PathBuf::from("."),
             format!(" {pin} "),
@@ -864,7 +1111,7 @@ mod tests {
         assert!(password.is_empty());
         assert_eq!(cursor, 0);
 
-        let entered = crate::crypto::pin::generate_pin().unwrap();
+        let entered = crate::crypto::pin::generate_pin(PinKind::Standard).unwrap();
         let Step::Finish(WizardPlan::ReceiveTor {
             address, password, ..
         }) = tor_password_key(
@@ -940,7 +1187,7 @@ mod tests {
             cursor: 3,
             error: Some("stale".to_string()),
         };
-        let pin = crate::crypto::pin::generate_pin().unwrap();
+        let pin = crate::crypto::pin::generate_pin(PinKind::Standard).unwrap();
 
         let Step::Continue(Screen::ReceiveEntry {
             input,
@@ -962,7 +1209,7 @@ mod tests {
         // Regression: past PIN_LENGTH the typing guard failed and the keystroke
         // fell through to the shared line editor, which inserted it into the
         // field anyway — past the length cap and past the PIN filter.
-        let full = crate::crypto::pin::generate_pin().unwrap();
+        let full = crate::crypto::pin::generate_pin(PinKind::Standard).unwrap();
         assert_eq!(full.len(), PIN_LENGTH);
 
         for typed in ['x', '*'] {
