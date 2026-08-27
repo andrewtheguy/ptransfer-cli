@@ -65,6 +65,23 @@ pub fn split_address(address: &str, default_port: u16) -> Result<(String, u16)> 
     Ok((host.display_unredacted().to_string(), port))
 }
 
+/// The address as a person is handed it: `<host>.onion`, with the default port
+/// left implicit.
+///
+/// The port is not a choice either side offers, so spelling out 9735 only gives
+/// the other side more to retype. A non-default port is spelled out, because
+/// [`split_address`] resolves a missing one to the default and would otherwise
+/// send the receiver to the wrong port. What the handshake binds is the
+/// canonical `<host>.onion:<port>`, always carrying its port — that string is
+/// built separately and is never what gets displayed.
+pub fn display_address(host: &str, port: u16) -> String {
+    if port == DEFAULT_PORT {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// Whether an I/O error just means the peer went away.
 ///
 /// A Tor stream never ends with a plain EOF. The far side sends an END cell,
@@ -116,6 +133,28 @@ mod tests {
 
     /// A real address printed by the serving side, so the checksum is genuine.
     const ONION: &str = "zrmxlosp6cvmkhxwhx7267wkvqyztsrmloqw76eu4fhn2gsbg5zk4kad.onion";
+
+    /// The spec hands over `<host>.onion` and resolves a missing port to the
+    /// default, so the two spellings have to round-trip to the same binding.
+    #[test]
+    fn the_handed_over_address_leaves_the_default_port_implicit() {
+        assert_eq!(display_address(ONION, DEFAULT_PORT), ONION);
+        assert_eq!(
+            split_address(&display_address(ONION, DEFAULT_PORT), DEFAULT_PORT).unwrap(),
+            (ONION.to_owned(), DEFAULT_PORT)
+        );
+    }
+
+    /// A port nobody could guess has to be spelled out, or the receiver
+    /// resolves the missing one to 9735 and dials the wrong port.
+    #[test]
+    fn the_handed_over_address_spells_out_a_non_default_port() {
+        assert_eq!(display_address(ONION, 1234), format!("{ONION}:1234"));
+        assert_eq!(
+            split_address(&display_address(ONION, 1234), DEFAULT_PORT).unwrap(),
+            (ONION.to_owned(), 1234)
+        );
+    }
 
     #[test]
     fn a_bare_address_uses_the_default_port() {

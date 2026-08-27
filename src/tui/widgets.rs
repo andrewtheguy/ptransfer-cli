@@ -8,10 +8,17 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 /// The outer frame every screen draws inside; returns the inner area.
+///
+/// A title rule only, deliberately: a full box would put a vertical border in
+/// column 0 of every row, and terminal mouse selection is column-based, so
+/// dragging over the PIN, the onion address or the password — the strings this
+/// whole tool exists to hand to the other side — drags the border glyph in
+/// with them. Nothing is drawn to the left of the text, so a selection copies
+/// only the text.
 pub fn screen_frame(f: &mut Frame, title: &str) -> Rect {
     let area = f.area();
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP)
         .title(format!(" pTransfer — {title} "));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -194,6 +201,26 @@ mod tests {
         let mut cursor = 0;
         assert!(!edit_line(&mut value, &mut cursor, &press(KeyCode::Char('\u{1}'))));
         assert!(value.is_empty());
+    }
+
+    /// Terminal selection is column-based, so anything drawn to the left of a
+    /// line is copied along with it. Nothing may sit in column 0 but the
+    /// screen's own text, or copying the PIN also copies the frame.
+    #[test]
+    fn the_frame_leaves_the_first_column_to_the_screen() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 4)).unwrap();
+        terminal
+            .draw(|f| {
+                let inner = screen_frame(f, "send");
+                f.render_widget(Paragraph::new("A4BCD9ZT"), inner);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 1..4 {
+            assert_ne!(buffer[(0, y)].symbol(), "│", "row {y} starts with a border");
+        }
+        assert_eq!(buffer[(0, 1)].symbol(), "A");
     }
 
     #[test]
