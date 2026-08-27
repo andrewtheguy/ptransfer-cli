@@ -74,7 +74,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TorMessenger<S> {
         let _ = self.stream.shutdown().await;
     }
 
-    /// Block until the peer closes its end.
+    /// Block until the peer closes its end, which is the receipt for the last
+    /// frame sent.
     ///
     /// Whoever sends the *last* message of a conversation has to call this
     /// before exiting. Arti hands bytes to the circuit from background tasks,
@@ -83,30 +84,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TorMessenger<S> {
     /// closed connection where its `ACK` should have been. The peer closes as
     /// soon as it has acted on that frame, so its close is the delivery
     /// receipt.
-    pub async fn wait_for_close(&mut self) {
+    ///
+    /// Only an actual close is that receipt, so anything else — a read error,
+    /// or a peer that goes quiet past [`LINGER_TIMEOUT`] — is an error here.
+    /// It says the last frame may not have arrived, which is not the same
+    /// thing as the local work having failed: the caller decides what that is
+    /// worth.
+    pub async fn wait_for_close(&mut self) -> Result<()> {
         let mut scratch = [0u8; 64];
         let closed = async {
             loop {
                 match self.stream.read(&mut scratch).await {
-                    Ok(0) => return,
+                    Ok(0) => return Ok(()),
                     // Nothing should follow the last frame; drain and keep
                     // waiting rather than guess at what it meant.
                     Ok(_) => {}
-                    Err(error) if is_disconnect(&error) => return,
+                    Err(error) if is_disconnect(&error) => return Ok(()),
                     Err(error) => {
-                        log::debug!("waiting for the peer to close: {error}");
-                        return;
+                        return Err(error).context("failed to wait for the peer to close");
                     }
                 }
             }
         };
 
-        if tokio::time::timeout(LINGER_TIMEOUT, closed).await.is_err() {
-            log::debug!(
-                "the peer did not close the stream within {}s",
-                LINGER_TIMEOUT.as_secs()
-            );
-        }
+        tokio::time::timeout(LINGER_TIMEOUT, closed)
+            .await
+            .with_context(|| {
+                format!(
+                    "the peer did not close the stream within {}s",
+                    LINGER_TIMEOUT.as_secs()
+                )
+            })?
     }
 
     async fn send_frame(&mut self, kind: u8, payload: &[u8]) -> Result<()> {
@@ -299,13 +307,22 @@ mod tests {
         let (mut a, mut b) = pair();
         a.send_text("ACK".to_string()).await.unwrap();
 
-        let waiting = tokio::spawn(async move {
-            a.wait_for_close().await;
-        });
+        let waiting = tokio::spawn(async move { a.wait_for_close().await });
         assert_eq!(b.recv().await.unwrap().data.as_ref(), b"ACK");
         drop(b);
 
-        waiting.await.unwrap();
+        // The close is the receipt for `ACK`, so it is the success case.
+        waiting.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_a_close_fails_when_the_peer_never_hangs_up() {
+        // A peer holding the stream open past the linger timeout never
+        // acknowledged the last frame, and saying otherwise would report a
+        // delivery that may not have happened.
+        let (mut a, _b) = pair();
+        a.send_text("ACK".to_string()).await.unwrap();
+        assert!(a.wait_for_close().await.is_err());
     }
 
     #[tokio::test]

@@ -59,6 +59,8 @@ Test mode:
 # sender: prints the address and password, then `ready`
 ptransfer tor send ./file.bin
 
-# receiver: wait for `ready`, then use both printed values
-ptransfer tor receive <address> <password> --output ./downloads
+# receiver: wait for `ready`, then use both printed values. The password is
+# read from stdin — prompted at a terminal, piped in from a script — so that it
+# never appears in the process list.
+ptransfer tor receive <address> --output ./downloads
 ```

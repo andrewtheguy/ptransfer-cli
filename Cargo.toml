@@ -114,6 +114,8 @@ futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+# `start_paused` runtimes, so a test can cross a timeout without waiting it out.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 strip = true

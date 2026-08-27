@@ -147,8 +147,14 @@ ptransfer tor send ./file.bin
 Hand both lines to the receiver, who runs:
 
 ```bash
-ptransfer tor receive <address> <password> --output ./downloads
+ptransfer tor receive <address> --output ./downloads
+# Password: <the password the sender printed>
 ```
+
+The password is read from stdin, never taken as an argument — an argument would
+be readable by every other process on the machine for as long as the receiver
+spends bootstrapping Tor. At a terminal it is prompted for; from a script, pipe
+it in (`printf '%s\n' "$PASSWORD" | ptransfer tor receive <address>`).
 
 `send` prints the address and password as soon as they exist, then `ready` once
 the descriptor is published and the service is actually reachable — wait for
@@ -271,9 +277,6 @@ pTransfer's app version. This build implements version `2`, declared in
 - No Code Exchange: hand-carried offer/answer codes are web-only.
 - The Tor transport carries at most 1 MiB per transfer, is CLI to CLI only, and
   is not part of the interop protocol.
-- `ptransfer tor receive` takes the password as a command-line argument, so it
-  is visible to other users on the same machine through the process list. The
-  wizard asks for it interactively instead.
 - No custom relay/discovery mode.
 - Direct P2P only: no TURN relay fallback for the file bytes.
 

@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::archive::{SendSource, prepare_send_source_with_cap};
@@ -48,10 +48,20 @@ const MAX_WIRE_BYTES: u64 = MAX_TRANSFER_BYTES + 64 * 1024;
 /// later, so the name is fixed.
 const NICKNAME: &str = "ptransfer-transfer";
 
-/// How long the sender keeps the service up waiting for a receiver. A resource
-/// backstop, not a security control: the password is single-use by convention
-/// and the address dies with the process either way.
+/// How long the sender keeps the service up, from publish to a delivered file.
+/// A resource backstop, not a security control: the password is single-use by
+/// convention and the address dies with the process either way.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// How long one accepted connection may take before the sender drops it and
+/// goes back to waiting.
+///
+/// Anyone who has the address can open the port, so an accepted connection is
+/// not yet a receiver, and it must not be able to hold the service against the
+/// real one. The bound covers a whole turn — the handshake, a human at the
+/// receiver's overwrite prompt, and a megabyte crawling down a Tor circuit —
+/// so it is generous; the point is only that it exists.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// How many connections may fail to authenticate before the sender gives up.
 ///
@@ -86,6 +96,7 @@ pub async fn send(paths: Vec<PathBuf>, port: u16) -> Result<()> {
 }
 
 /// How one accepted connection ended, once its peer authenticated.
+#[derive(Debug)]
 enum ServedConnection {
     /// The file was delivered.
     Sent,
@@ -105,7 +116,38 @@ fn describe(source: &SendSource) -> TransferMetadata {
 }
 
 /// Wait for a receiver that can authenticate, then send it the file.
+///
+/// The shutdown signal and the deadline wrap the whole wait rather than just
+/// the gaps between connections: a peer that opens the port and then says
+/// nothing is exactly when this command most needs to still be interruptible.
 async fn serve_one_transfer(
+    listener: OnionListener,
+    port: u16,
+    onion: &str,
+    password: &str,
+    source: &SendSource,
+) -> Result<()> {
+    ui::status("Waiting for a receiver...");
+
+    tokio::select! {
+        // A signal is how this command is meant to be stopped, so unwind
+        // normally: the throwaway Tor storage is only removed by its
+        // destructor, which a signal-killed process never runs.
+        result = shutdown_signal() => {
+            result.context("failed to listen for a shutdown signal")?;
+            log::info!("shutting down and removing the Tor client state");
+            Ok(())
+        }
+        _ = tokio::time::sleep(WAIT_TIMEOUT) => bail!(
+            "No transfer finished within {} minutes. Start a new transfer.",
+            WAIT_TIMEOUT.as_secs() / 60
+        ),
+        result = serve_until_sent(listener, port, onion, password, source) => result,
+    }
+}
+
+/// Accept connections until one of them takes the file.
+async fn serve_until_sent(
     mut listener: OnionListener,
     port: u16,
     onion: &str,
@@ -113,30 +155,11 @@ async fn serve_one_transfer(
     source: &SendSource,
 ) -> Result<()> {
     let metadata = describe(source);
-    ui::status("Waiting for a receiver...");
-
     let mut failures = 0u32;
-    let deadline = tokio::time::sleep(WAIT_TIMEOUT);
-    tokio::pin!(deadline);
 
     loop {
-        let stream = tokio::select! {
-            // A signal is how this command is meant to be stopped, so unwind
-            // normally: the throwaway Tor storage is only removed by its
-            // destructor, which a signal-killed process never runs.
-            result = shutdown_signal() => {
-                result.context("failed to listen for a shutdown signal")?;
-                log::info!("shutting down and removing the Tor client state");
-                return Ok(());
-            }
-            _ = &mut deadline => bail!(
-                "No receiver connected within {} minutes. Start a new transfer.",
-                WAIT_TIMEOUT.as_secs() / 60
-            ),
-            accepted = listener.accept(port) => match accepted? {
-                Some(stream) => stream,
-                None => bail!("the onion service stopped accepting connections"),
-            },
+        let Some(stream) = listener.accept(port).await? else {
+            bail!("the onion service stopped accepting connections");
         };
 
         ui::status("A receiver connected; authenticating...");
@@ -171,9 +194,34 @@ async fn serve_one_transfer(
     }
 }
 
-/// The sender's side of one accepted connection: authenticate the peer, then
-/// hand it the file.
+/// The sender's side of one accepted connection, bounded by
+/// [`CONNECTION_TIMEOUT`].
+///
+/// The bound is the whole point of this wrapper: a stalled turn is reported as
+/// a failed connection, which is what it is, and the caller goes back to
+/// waiting for the receiver it is actually expecting.
 async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    messenger: &mut TorMessenger<S>,
+    password: &str,
+    onion: &str,
+    metadata: &TransferMetadata,
+    source: &SendSource,
+) -> Result<ServedConnection> {
+    tokio::time::timeout(
+        CONNECTION_TIMEOUT,
+        authenticate_and_send(messenger, password, onion, metadata, source),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "the peer went quiet for {}s",
+            CONNECTION_TIMEOUT.as_secs()
+        )
+    })?
+}
+
+/// Authenticate the peer, then hand it the file.
+async fn authenticate_and_send<S: AsyncRead + AsyncWrite + Unpin + Send>(
     messenger: &mut TorMessenger<S>,
     password: &str,
     onion: &str,
@@ -256,7 +304,7 @@ async fn receive_over<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     let Some(dest) = resolve_destination(output, &metadata.file_name, on_conflict).await? else {
         send_cancel(messenger).await?;
-        messenger.wait_for_close().await;
+        report_receipt(messenger.wait_for_close().await, "cancellation");
         return Ok(None);
     };
 
@@ -272,8 +320,25 @@ async fn receive_over<S: AsyncRead + AsyncWrite + Unpin + Send>(
     .await?;
     // `ACK` is the last frame of the conversation, and this process is about to
     // exit — stay until the sender has it.
-    messenger.wait_for_close().await;
+    report_receipt(messenger.wait_for_close().await, "confirmation");
     Ok(Some(dest))
+}
+
+/// Report whether the sender acknowledged the last frame.
+///
+/// This is deliberately not propagated. By the time the receiver waits for a
+/// receipt its own work is finished and verified — the file is on disk, or the
+/// transfer was declined — and the only thing in doubt is whether the sender
+/// heard about it. Failing here would tell a script the transfer failed when
+/// it did not, and hiding it would leave a sender stuck at the far end with
+/// nothing on this side saying so, so it is said out loud instead.
+fn report_receipt(result: Result<()>, what: &str) {
+    if let Err(error) = result {
+        log::warn!("the sender did not acknowledge the {what}: {error:#}");
+        ui::status(&format!(
+            "Warning: the sender never acknowledged the {what}, so it may still be waiting."
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +418,35 @@ mod tests {
         assert!(sent.is_err());
         assert!(received.is_err());
         assert!(!dest.exists(), "nothing may be written for a failed handshake");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_says_nothing_is_dropped_rather_than_waited_on() {
+        // Anyone with the address can open the port. Holding it open without
+        // speaking used to stop the sender forever: nothing counted it as a
+        // failure, and no second receiver could get in behind it.
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("held.txt");
+        std::fs::write(&input, b"held").unwrap();
+        let source = prepare_send_source(&[input]).unwrap();
+        let metadata = describe(&source);
+
+        // `_peer` is the silent connection: held open, never written to.
+        let (service, _peer) = tokio::io::duplex(1024);
+        let mut messenger = TorMessenger::new(service);
+        let error = serve_connection(
+            &mut messenger,
+            "ABCDEFGHJKLA",
+            ONION,
+            &metadata,
+            &source,
+        )
+        .await
+        .expect_err("a silent peer must not hold the sender");
+        assert!(
+            error.to_string().contains("went quiet"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[tokio::test]

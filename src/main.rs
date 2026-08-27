@@ -69,12 +69,12 @@ enum TorCommands {
     },
 
     /// Receive a file from an onion address, using the sender's password.
+    ///
+    /// The password is read from stdin — a prompt at a terminal, one line from
+    /// a pipe — never from the command line.
     Receive {
         /// The `.onion` address printed by `ptransfer tor send`
         address: String,
-
-        /// The password printed by `ptransfer tor send`
-        password: String,
 
         /// Onion virtual port to connect to
         #[arg(short, long, default_value_t = tor::DEFAULT_PORT)]
@@ -133,6 +133,37 @@ enum TestCommands {
         #[arg(long)]
         overwrite: bool,
     },
+}
+
+/// Read the transfer password from stdin.
+///
+/// It is not a command-line argument because an argument is public: every
+/// other process on the machine can read it out of the process list, and an
+/// interactive shell writes it to history. That would matter little for a
+/// secret with a short life, but the receiver holds this one across a Tor
+/// bootstrap — tens of seconds — and it is half of a credential pair that
+/// whoever grabs it can use to collect the file first.
+#[cfg(feature = "tor")]
+async fn read_tor_password() -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    tokio::task::spawn_blocking(|| {
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            eprint!("Password: ");
+            std::io::stderr().flush()?;
+        }
+        let mut input = String::new();
+        if stdin.lock().read_line(&mut input)? == 0 {
+            anyhow::bail!("no password on stdin");
+        }
+        let password = input.trim();
+        if password.is_empty() {
+            anyhow::bail!("no password entered");
+        }
+        Ok(password.to_string())
+    })
+    .await?
 }
 
 fn main() {
@@ -214,7 +245,6 @@ async fn async_main() -> Result<()> {
 
                 TorCommands::Receive {
                     address,
-                    password,
                     port,
                     output,
                     overwrite,
@@ -224,10 +254,11 @@ async fn async_main() -> Result<()> {
                     } else {
                         OnConflict::Fail
                     };
+                    let password = read_tor_password().await?;
                     tor::transfer::receive(
                         address.trim(),
                         port,
-                        password.trim(),
+                        &password,
                         output,
                         on_conflict,
                     )
@@ -322,26 +353,21 @@ mod tests {
 
     #[cfg(feature = "tor")]
     #[test]
-    fn tor_receive_requires_an_address_and_a_password() {
+    fn tor_receive_takes_an_address_and_never_a_password() {
         assert!(Cli::try_parse_from(["ptransfer", "tor", "receive"]).is_err());
-        assert!(Cli::try_parse_from(["ptransfer", "tor", "receive", "abc.onion"]).is_err());
+        // The password comes from stdin, so an argument that looks like one is
+        // rejected rather than quietly published in the process list.
+        assert!(
+            Cli::try_parse_from(["ptransfer", "tor", "receive", "abc.onion", "PIN123"]).is_err()
+        );
 
-        let cli = Cli::try_parse_from([
-            "ptransfer",
-            "tor",
-            "receive",
-            "abc.onion",
-            "PIN123",
-            "--overwrite",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["ptransfer", "tor", "receive", "abc.onion", "--overwrite"])
+                .unwrap();
         let Some(Commands::Tor {
             command:
                 TorCommands::Receive {
-                    address,
-                    password,
-                    overwrite,
-                    ..
+                    address, overwrite, ..
                 },
             ..
         }) = cli.command
@@ -349,7 +375,6 @@ mod tests {
             panic!("expected tor receive");
         };
         assert_eq!(address, "abc.onion");
-        assert_eq!(password, "PIN123");
         assert!(overwrite);
     }
 

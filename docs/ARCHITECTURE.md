@@ -229,6 +229,23 @@ rather than anyone who came across the address. File bytes then travel under the
 same AES-256-GCM chunk format as every other transfer, encrypted a second time
 inside the Tor stream.
 
+**Bounds.** Anyone who has the address can open the port, so an accepted
+connection is not yet a receiver and never gets to hold the service against the
+real one. Each connection has 5 minutes for its whole turn; a stall is counted
+as a failed connection like any other and the sender goes back to waiting. The
+shutdown signal and the 30-minute overall deadline wrap the accept loop
+*including* connections in progress, so neither is blocked by a peer that opens
+the port and says nothing. On the receiver's side the password comes from stdin
+rather than argv, which would otherwise publish half the credential pair to
+every process on the machine for the length of a Tor bootstrap.
+
+Whoever sends the last frame waits for the peer to close before exiting: Arti
+hands bytes to the circuit from background tasks, so a process that writes and
+exits takes that frame with it. The close is therefore the delivery receipt for
+the receiver's `ACK`, and its absence is reported — but not as a failure, since
+by then the file is written and verified and only the sender's knowledge of
+that is in doubt.
+
 **Limits.** The 1 MiB cap is enforced on the *input* when the selection is
 prepared, and the wire ceiling carries a small margin over it — deflate grows
 incompressible input slightly and a ZIP adds per-entry headers, neither of which
