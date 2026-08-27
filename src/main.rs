@@ -36,7 +36,7 @@ enum Commands {
         verbose: bool,
     },
 
-    /// Tor onion-service transport
+    /// Tor onion-service transport (experimental)
     #[cfg(feature = "tor")]
     Tor {
         #[command(subcommand)]

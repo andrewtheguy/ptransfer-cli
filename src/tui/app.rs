@@ -43,7 +43,11 @@ pub enum WizardPlan {
 #[cfg(not(feature = "tor"))]
 const MODES: [&str; 2] = ["PIN Exchange", "Code Exchange"];
 #[cfg(feature = "tor")]
-const MODES: [&str; 3] = ["PIN Exchange", "Code Exchange", "Tor Onion Service"];
+const MODES: [&str; 3] = [
+    "PIN Exchange",
+    "Code Exchange",
+    "Tor Onion Service (experimental)",
+];
 
 /// One line of explanation per entry in [`MODES`].
 #[cfg(not(feature = "tor"))]
