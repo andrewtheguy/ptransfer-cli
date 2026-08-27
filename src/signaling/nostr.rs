@@ -389,6 +389,36 @@ impl NostrClient {
         self.keys.public_key().to_hex()
     }
 
+    /// The relays a publish is addressed to: the ones with a socket open right
+    /// now, or the whole pool if none has.
+    ///
+    /// `Client::send_event` addresses every relay in the pool and waits for
+    /// each one's `OK`. A relay that is still connecting has not failed yet, so
+    /// it is handed the event, answers nothing, and the publish sits out its
+    /// ten-second `OK` timeout — even though another relay accepted the event
+    /// immediately. On the two-relay onion pool that is the normal case rather
+    /// than the exception, since a connection there is a whole Tor rendezvous,
+    /// and the cost would land on every rendezvous, claim, confirmation and
+    /// WebRTC signal.
+    ///
+    /// Falling back to the whole pool when nothing is connected keeps the one
+    /// thing queueing was good for: a socket a moment away from opening still
+    /// gets the event, which is what lets the clearnet path publish when its
+    /// three-second wait has produced nothing yet.
+    async fn publish_targets(&self) -> Vec<RelayUrl> {
+        let relays = self.client.relays().await;
+        let connected: Vec<RelayUrl> = relays
+            .iter()
+            .filter(|(_, relay)| relay.status() == RelayStatus::Connected)
+            .map(|(url, _)| url.clone())
+            .collect();
+        if connected.is_empty() {
+            relays.into_keys().collect()
+        } else {
+            connected
+        }
+    }
+
     pub async fn publish(&self, event: &Event) -> Result<()> {
         let mut last_failure = String::from("no relay accepted the event");
         for attempt in 0..PUBLISH_RETRIES {
@@ -398,9 +428,11 @@ impl NostrClient {
                 attempt + 1,
                 PUBLISH_RETRIES
             );
+            // Recomputed per attempt: a relay that finished connecting during
+            // the backoff joins the next one.
             let output = self
                 .client
-                .send_event(event)
+                .send_event_to(self.publish_targets().await, event)
                 .await
                 .context("Failed to publish Nostr event")?;
 
