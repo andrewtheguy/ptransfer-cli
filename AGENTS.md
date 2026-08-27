@@ -1,4 +1,4 @@
-- no backward compatibility at all or any legacy code path since it is still pre-release software.
+- no backward compatibility at all or any legacy code path.
 - keep package.metadata.ptransfer-protocol-version in Cargo.toml equal to INTEROP_PROTOCOL_VERSION in the sibling ptransfer web app's src/lib/protocol.ts, whose docs/INTEROP_PROTOCOL.md is the normative spec; it is not an npm version and only moves when that spec changes.
 - run commands with --all-features by default to ensure all code paths are covered.
 - run cargo clippy --all-features to lint all code paths after rust code changes.
