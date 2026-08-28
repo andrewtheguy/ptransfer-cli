@@ -50,11 +50,10 @@ enum Commands {
     },
 }
 
-/// File transfer over an ephemeral v3 onion service, plus the echo proof of
-/// concept the transport was built against.
+/// File transfer over an ephemeral v3 onion service.
 ///
 /// `send` publishes an address and a one-time password; `receive` needs
-/// nothing but those two strings. `serve`/`connect` are the echo POC.
+/// nothing but those two strings.
 #[cfg(feature = "tor")]
 #[derive(Subcommand)]
 enum TorCommands {
@@ -89,27 +88,6 @@ enum TorCommands {
         /// Replace the destination file if it already exists (default: fail)
         #[arg(long)]
         overwrite: bool,
-    },
-
-    /// Publish an ephemeral onion address and echo back every line received.
-    Serve {
-        /// Onion virtual port to listen on
-        #[arg(short, long, default_value_t = tor::DEFAULT_PORT)]
-        port: u16,
-    },
-
-    /// Send one line to an onion address and print what comes back.
-    Connect {
-        /// The `.onion` address printed by `ptransfer tor serve`
-        address: String,
-
-        /// Onion virtual port to connect to
-        #[arg(short, long, default_value_t = tor::DEFAULT_PORT)]
-        port: u16,
-
-        /// Text to send
-        #[arg(short, long, default_value = "hello")]
-        message: String,
     },
 }
 
@@ -290,18 +268,6 @@ async fn async_main() -> Result<()> {
                     )
                     .await
                 }
-
-                TorCommands::Serve { port } => tor::echo::serve(port).await,
-
-                TorCommands::Connect {
-                    address,
-                    port,
-                    message,
-                } => {
-                    let reply = tor::echo::connect(address.trim(), port, &message).await?;
-                    println!("{reply}");
-                    Ok(())
-                }
             }
         }
     }
@@ -377,20 +343,6 @@ mod tests {
 
     #[cfg(feature = "tor")]
     #[test]
-    fn tor_serve_defaults_to_the_onion_port() {
-        let cli = Cli::try_parse_from(["ptransfer", "tor", "serve"]).unwrap();
-        let Some(Commands::Tor {
-            command: TorCommands::Serve { port },
-            ..
-        }) = cli.command
-        else {
-            panic!("expected tor serve");
-        };
-        assert_eq!(port, tor::DEFAULT_PORT);
-    }
-
-    #[cfg(feature = "tor")]
-    #[test]
     fn tor_send_takes_multiple_paths() {
         let cli =
             Cli::try_parse_from(["ptransfer", "tor", "send", "a.txt", "b", "dir"]).unwrap();
@@ -415,13 +367,23 @@ mod tests {
             Cli::try_parse_from(["ptransfer", "tor", "receive", "abc.onion", "PIN123"]).is_err()
         );
 
-        let cli =
-            Cli::try_parse_from(["ptransfer", "tor", "receive", "abc.onion", "--overwrite"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "ptransfer",
+            "tor",
+            "receive",
+            "abc.onion",
+            "--port",
+            "1234",
+            "--overwrite",
+        ])
+        .unwrap();
         let Some(Commands::Tor {
             command:
                 TorCommands::Receive {
-                    address, overwrite, ..
+                    address,
+                    port,
+                    overwrite,
+                    ..
                 },
             ..
         }) = cli.command
@@ -429,38 +391,8 @@ mod tests {
             panic!("expected tor receive");
         };
         assert_eq!(address, "abc.onion");
-        assert!(overwrite);
-    }
-
-    #[cfg(feature = "tor")]
-    #[test]
-    fn tor_connect_requires_an_address_and_defaults_the_message() {
-        assert!(Cli::try_parse_from(["ptransfer", "tor", "connect"]).is_err());
-
-        let cli = Cli::try_parse_from([
-            "ptransfer",
-            "tor",
-            "connect",
-            "abc.onion",
-            "--port",
-            "1234",
-        ])
-        .unwrap();
-        let Some(Commands::Tor {
-            command:
-                TorCommands::Connect {
-                    address,
-                    port,
-                    message,
-                },
-            ..
-        }) = cli.command
-        else {
-            panic!("expected tor connect");
-        };
-        assert_eq!(address, "abc.onion");
         assert_eq!(port, 1234);
-        assert_eq!(message, "hello");
+        assert!(overwrite);
     }
 
     #[test]

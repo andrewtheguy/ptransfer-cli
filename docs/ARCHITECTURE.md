@@ -264,7 +264,7 @@ This section describes only what is specific to the CLI's realization of it.
 settings those managers read; `memstate.rs` and `netdir.rs` are the in-memory
 state store and network directory; `wire.rs` is the framed `TorMessenger`;
 `handshake.rs` is the spec's handshake; `transfer.rs` is the accept loop and
-the caps; `echo.rs` is the `tor serve`/`tor connect` proof of concept.
+the caps.
 
 **One transfer layer, two transports.** `run_sender`/`run_receiver` are generic
 over a `Messenger`, so above the framing the Tor path runs the *same* code as
@@ -361,9 +361,8 @@ its data-channel parameters from a plain `Default` and an omitted
 still arrives, but SCTP delivers each one as soon as it reassembles, so one
 retransmit is enough for a later chunk to overtake an earlier one and for the
 peer to reject the out-of-order index mid-transfer. Loopback never reorders, so
-`tests/cli_to_cli_transfer.rs` asserts the negotiated ordering directly (the
-answering end decodes it from the offerer's DCEP) rather than hoping a transfer
-notices.
+`tests/webrtc.rs` asserts the negotiated ordering directly (the answering end
+decodes it from the offerer's DCEP) rather than hoping a transfer notices.
 
 ```text
 ACK

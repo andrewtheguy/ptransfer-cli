@@ -451,6 +451,26 @@ mod tests {
 
     const ONION: &str = "zrmxlosp6cvmkhxwhx7267wkvqyztsrmloqw76eu4fhn2gsbg5zk4kad.onion:9735";
 
+    /// Deterministic bytes that `deflate-raw` cannot shrink.
+    ///
+    /// Wire chunking is what the round trips below are for, and chunks are
+    /// measured on the compressed stream: a counting pattern of this length
+    /// deflates to under two kilobytes and arrives as a single chunk, which
+    /// exercises none of it. Incompressible input keeps the wire payload the
+    /// size of the input, which is several 128 KiB chunks.
+    fn incompressible(len: usize) -> Vec<u8> {
+        // xorshift64*, from a fixed seed: the same bytes on every run.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        (0..len)
+            .map(|_| {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                (state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 32) as u8
+            })
+            .collect()
+    }
+
     /// Run both sides against each other over an in-memory duplex: everything
     /// the real commands do once Arti has produced a stream.
     async fn transfer(
@@ -497,11 +517,92 @@ mod tests {
         (sent.await.unwrap(), received, dest, dir)
     }
 
+    /// The same round trip over a real onion service, which the duplex above
+    /// deliberately does not reach: the sender publishes an address and waits
+    /// in its accept loop, the receiver builds a rendezvous circuit to it, and
+    /// the file arrives having crossed introduction and rendezvous points.
+    ///
+    /// Ignored by default, like the checks in `tests/tor_network.rs` — this
+    /// one talks to the real Tor network:
+    ///
+    /// ```sh
+    /// cargo test --all-features -- --ignored --nocapture
+    /// ```
+    ///
+    /// One client plays both roles, which is not how the CLI is used but costs
+    /// one directory bootstrap instead of two. Both sides run the production
+    /// paths: `serve_until_sent` is the accept loop `tor send` ends in, and
+    /// `receive_over` is all of `tor receive` after the connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "talks to the real Tor network"]
+    async fn a_file_round_trips_over_a_real_onion_service() {
+        // The same provider the binary installs. Ignore the error: another
+        // test in this process may have got there first.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let port = crate::tor::DEFAULT_PORT;
+        // Several 128 KiB chunks on the wire, so chunking and reassembly are
+        // exercised over the circuit rather than only in memory.
+        let payload = incompressible(400_000);
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("over-tor.bin");
+        std::fs::write(&input, &payload).unwrap();
+        let output = dir.path().join("out");
+        std::fs::create_dir(&output).unwrap();
+
+        let source = prepare_send_source(&[input]).unwrap();
+        let password = generate_pin(PinKind::Standard).unwrap();
+
+        let tor = TorClient::bootstrap()
+            .await
+            .expect("failed to bootstrap a Tor client");
+
+        let mut listener = OnionListener::launch(&tor, NICKNAME).expect("failed to launch");
+        let host = listener.onion().to_owned();
+        // The canonical spelling both sides bind their handshake to, built
+        // exactly as `send` and `receive` build it.
+        let onion = format!("{host}:{port}");
+        println!("publishing {onion}");
+        listener
+            .wait_until_published()
+            .await
+            .expect("the service never published its descriptor");
+        println!("descriptor is up");
+
+        let sender = {
+            let (onion, password) = (onion.clone(), password.clone());
+            tokio::spawn(async move {
+                serve_until_sent(listener, port, &onion, &password, &source).await
+            })
+        };
+
+        let stream = tor
+            .connect(&host, port)
+            .await
+            .expect("failed to connect to our own onion service");
+        let mut messenger = TorMessenger::new(stream);
+        let received = receive_over(
+            &mut messenger,
+            &password,
+            &onion,
+            Some(output.clone()),
+            OnConflict::Fail,
+        )
+        .await;
+        messenger.shutdown().await;
+
+        sender.await.unwrap().expect("the sender failed");
+        let dest = received.expect("the receiver failed");
+        assert_eq!(dest.as_deref(), Some(output.join("over-tor.bin").as_path()));
+        assert_eq!(std::fs::read(dest.unwrap()).unwrap(), payload);
+    }
+
     #[tokio::test]
     async fn a_file_round_trips_over_the_framed_stream() {
-        // Big enough to span several 128 KiB chunks, and compressible, so the
-        // deflate-raw wire encoding is exercised in both directions.
-        let payload: Vec<u8> = (0..400_000u32).map(|i| (i % 251) as u8).collect();
+        // Big enough to span several 128 KiB chunks on the wire, so chunking
+        // and reassembly are exercised in both directions.
+        let payload = incompressible(400_000);
         let (sent, received, dest, _dir) =
             transfer("ABCDEFGHJKLA", "ABCDEFGHJKLA", &payload, "big.bin").await;
 
@@ -578,7 +679,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("slow.bin");
         // Several chunks, so there are hand-offs to advance the clock between.
-        let payload: Vec<u8> = (0..400_000u32).map(|i| (i % 251) as u8).collect();
+        let payload = incompressible(400_000);
         std::fs::write(&input, &payload).unwrap();
         let output = dir.path().join("out");
         std::fs::create_dir(&output).unwrap();

@@ -1,13 +1,8 @@
 //! CLI-to-CLI transport over a Tor v3 onion service.
 //!
-//! Enabled by the `tor` cargo feature. Two things run over it:
-//!
-//! - [`echo`], the proof of concept the transport was built against: one
-//!   instance publishes an ephemeral onion address and echoes lines, the other
-//!   connects and gets its line back.
-//! - [`transfer`], the file transfer: the sender publishes an address and a
-//!   one-time password, and the receiver needs nothing else to connect,
-//!   authenticate, and pull the file.
+//! Enabled by the `tor` cargo feature. What runs over it is [`transfer`], the
+//! file transfer: the sender publishes an address and a one-time password, and
+//! the receiver needs nothing else to connect, authenticate, and pull the file.
 //!
 //! The Tor client is deliberately not wired to the machine's Tor setup. It
 //! reads no configuration file and shares nothing with a system Tor or an
@@ -19,7 +14,6 @@
 
 pub mod client;
 pub mod config;
-pub mod echo;
 pub mod handshake;
 pub mod memstate;
 pub mod netdir;

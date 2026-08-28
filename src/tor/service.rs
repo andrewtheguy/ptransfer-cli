@@ -1,8 +1,7 @@
 //! Publishing an ephemeral v3 onion service and accepting streams on it.
 //!
-//! Shared by the echo proof of concept and the file transfer: both publish a
-//! throwaway address, wait for the descriptor to go up, and then answer
-//! incoming streams on one virtual port.
+//! The file transfer publishes a throwaway address here, waits for the
+//! descriptor to go up, and then answers incoming streams on one virtual port.
 //!
 //! This is the second half of what `arti-client` would have provided.
 //! `tor-hsservice` cannot be used here because it keeps its state through
