@@ -222,28 +222,6 @@ specified in the web app's
 which both implementations follow; `docs/ARCHITECTURE.md` covers what is
 specific to this one.
 
-#### Echo Proof of Concept
-
-The transport was built against a bare echo, which is still there. Instance A
-publishes an ephemeral onion address and echoes back every line it receives:
-
-```bash
-ptransfer tor serve
-# zrmxlosp6cvmkhxwhx7267wkvqyztsrmloqw76eu4fhn2gsbg5zk4kad.onion
-# ready
-```
-
-Instance B sends one line to that address and prints the echo:
-
-```bash
-ptransfer tor connect <address> --message hello
-# hello
-```
-
-`serve` prints the `.onion` address as soon as the identity key exists, then
-`ready` once the descriptor is published, exactly like `send`. `connect` takes
-the whole line `serve` prints.
-
 #### How the Tor Client Is Set Up
 
 Each process runs its own Tor client that reads no configuration file and never

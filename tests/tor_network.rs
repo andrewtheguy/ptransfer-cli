@@ -1,4 +1,4 @@
-//! Live-network checks for the Tor transport and for anonymous signaling.
+//! Live-network checks for the Tor client and for anonymous signaling.
 //!
 //! Ignored by default: these talk to the real Tor network, take tens of
 //! seconds, and fail on a machine with no route to it. Run them deliberately:
@@ -17,9 +17,7 @@ use ptransfer_cli::signaling::nostr::{
     NostrClient, RendezvousPayload, create_rendezvous_event, generate_handshake_nonce,
     parse_rendezvous_event, rendezvous_filter,
 };
-use ptransfer_cli::tor::service::OnionListener;
-use ptransfer_cli::tor::{DEFAULT_PORT, TorClient};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use ptransfer_cli::tor::TorClient;
 use tor_netdir::{NetDirProvider as _, Timeliness};
 
 /// Install the same crypto provider the binary installs.
@@ -59,70 +57,6 @@ async fn the_client_bootstraps_a_directory_from_the_live_network() {
     let lifetime = netdir.lifetime();
     let now = std::time::SystemTime::now();
     assert!(lifetime.valid_after() <= now && now <= lifetime.valid_until());
-}
-
-/// The onion service end to end: publish an address, then reach it and get
-/// bytes back over the rendezvous circuit.
-///
-/// One client plays both roles. That is not how the CLI is used, but it
-/// exercises everything the service side has to get right — introduction
-/// points, descriptor signing and upload, the INTRODUCE2/RENDEZVOUS1
-/// handshake — without paying for a second directory bootstrap.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "talks to the real Tor network"]
-async fn a_published_service_answers_a_client() {
-    install_crypto_provider();
-
-    let tor = TorClient::bootstrap()
-        .await
-        .expect("failed to bootstrap a Tor client");
-
-    let mut listener = OnionListener::launch(&tor, "ptransfer-test").expect("failed to launch");
-    let address = listener.onion().to_owned();
-    println!("published as {address}");
-    listener
-        .wait_until_published()
-        .await
-        .expect("the service never published its descriptor");
-    println!("descriptor is up");
-
-    // Echo one line back, then let the connection go.
-    let service = tokio::spawn(async move {
-        let stream = listener
-            .accept(DEFAULT_PORT)
-            .await
-            .expect("failed to accept")
-            .expect("the service stopped accepting");
-        let (reader, mut writer) = stream.split();
-        let mut line = String::new();
-        BufReader::new(reader)
-            .read_line(&mut line)
-            .await
-            .expect("failed to read the client's line");
-        writer
-            .write_all(line.as_bytes())
-            .await
-            .expect("failed to echo");
-        writer.flush().await.expect("failed to flush");
-        let _ = writer.shutdown().await;
-    });
-
-    let stream = tor
-        .connect(&address, DEFAULT_PORT)
-        .await
-        .expect("failed to connect to our own onion service");
-    let (reader, mut writer) = stream.split();
-    writer.write_all(b"hello\n").await.expect("failed to send");
-    writer.flush().await.expect("failed to flush");
-
-    let mut echoed = String::new();
-    BufReader::new(reader)
-        .read_line(&mut echoed)
-        .await
-        .expect("failed to read the echo");
-    assert_eq!(echoed, "hello\n");
-
-    service.await.expect("the service task panicked");
 }
 
 /// Anonymous signaling end to end against the real pool: bootstrap Tor, open a

@@ -264,7 +264,7 @@ This section describes only what is specific to the CLI's realization of it.
 settings those managers read; `memstate.rs` and `netdir.rs` are the in-memory
 state store and network directory; `wire.rs` is the framed `TorMessenger`;
 `handshake.rs` is the spec's handshake; `transfer.rs` is the accept loop and
-the caps; `echo.rs` is the `tor serve`/`tor connect` proof of concept.
+the caps.
 
 **One transfer layer, two transports.** `run_sender`/`run_receiver` are generic
 over a `Messenger`, so above the framing the Tor path runs the *same* code as
