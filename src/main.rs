@@ -1,7 +1,7 @@
 //! ptransfer-cli: the pTransfer command-line client for peer-to-peer file transfer.
 //!
 //! Running with no arguments launches the full-screen TUI wizard. It covers PIN
-//! Exchange and, with the `tor` feature, Tor onion transfers; Code Exchange is
+//! Exchange and Tor onion transfers; Code Exchange is
 //! shown in the mode list but is not implemented. The `test` subcommand exposes
 //! PIN Exchange as a non-interactive plain-text mode for testing. QR support is
 //! intentionally not part of this CLI.
@@ -11,7 +11,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-#[cfg(feature = "tor")]
 use ptransfer_cli::tor;
 use ptransfer_cli::crypto::pin::PinKind;
 use ptransfer_cli::util::{OnConflict, is_interrupted};
@@ -39,7 +38,6 @@ enum Commands {
     },
 
     /// Tor onion-service transport (experimental)
-    #[cfg(feature = "tor")]
     Tor {
         #[command(subcommand)]
         command: TorCommands,
@@ -54,7 +52,6 @@ enum Commands {
 ///
 /// `send` publishes an address and a one-time password; `receive` needs
 /// nothing but those two strings.
-#[cfg(feature = "tor")]
 #[derive(Subcommand)]
 enum TorCommands {
     /// Publish an onion address and a password, then send to whoever
@@ -105,7 +102,6 @@ enum TestCommands {
         /// receiver reads the mode off that length and needs no flag of its
         /// own. Hides both devices' IP addresses from the Nostr relays. The file
         /// bytes still travel over the direct WebRTC data channel.
-        #[cfg(feature = "tor")]
         #[arg(long)]
         anonymous: bool,
     },
@@ -207,17 +203,13 @@ async fn async_main() -> Result<()> {
             match command {
                 TestCommands::Send {
                     paths,
-                    #[cfg(feature = "tor")]
                     anonymous,
                 } => {
-                    #[cfg(feature = "tor")]
                     let pin_kind = if anonymous {
                         PinKind::Anonymous
                     } else {
                         PinKind::Standard
                     };
-                    #[cfg(not(feature = "tor"))]
-                    let pin_kind = PinKind::Standard;
 
                     let source =
                         tokio::task::spawn_blocking(move || archive::prepare_send_source(&paths))
@@ -237,7 +229,6 @@ async fn async_main() -> Result<()> {
             }
         }
 
-        #[cfg(feature = "tor")]
         Some(Commands::Tor { command, verbose }) => {
             // Bootstrapping from an empty directory cache takes a while and
             // says nothing on stdout, so keep info-level progress on by
@@ -306,7 +297,6 @@ mod tests {
     /// The sender is the only side that chooses anonymous signaling; the
     /// receiver is told by the PIN it is handed, so there is deliberately no
     /// flag for it.
-    #[cfg(feature = "tor")]
     #[test]
     fn only_test_send_takes_anonymous() {
         let cli =
@@ -341,7 +331,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tor")]
     #[test]
     fn tor_send_takes_multiple_paths() {
         let cli =
@@ -357,7 +346,6 @@ mod tests {
         assert_eq!(port, tor::DEFAULT_PORT);
     }
 
-    #[cfg(feature = "tor")]
     #[test]
     fn tor_receive_takes_an_address_and_never_a_password() {
         assert!(Cli::try_parse_from(["ptransfer", "tor", "receive"]).is_err());

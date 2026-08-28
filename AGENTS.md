@@ -1,8 +1,7 @@
 - no backward compatibility at all or any legacy code path.
 - no change logs on documentations since git already tracks all changes
 - keep package.metadata.ptransfer-protocol-version in Cargo.toml equal to INTEROP_PROTOCOL_VERSION in the sibling ptransfer web app's src/lib/protocol.ts, whose docs/INTEROP_PROTOCOL.md is the normative spec; it is not an npm version and only moves when that spec changes.
-- run commands with --all-features by default to ensure all code paths are covered.
-- run cargo clippy --all-features to lint all code paths after rust code changes.
+- run cargo clippy to lint after rust code changes.
 - no cargo fmt
 - document common ptransfer specs not specific to cli only on the ptransfer project's documentation instead of here
 - the live interoperability tests are not in this repo: they live in the sibling ptransfer checkout and are run from there with its bun scripts, `bun run test:live:webrtc` for PIN Exchange over a data channel and `bun run test:live:tor` for the onion transport. Both drive this checkout, so run them after a change to anything the two implementations share

@@ -200,8 +200,7 @@ rather than route file bytes through a relay.
 
 ## Anonymous Signaling
 
-Behind the same non-default `tor` cargo feature, and experimental. The
-normative specification is the web app's
+Experimental. The normative specification is the web app's
 [`docs/ANONYMOUS_SIGNALING.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/ANONYMOUS_SIGNALING.md):
 the PIN's length carrying the mode, the relay pool, the URL policy and the
 privacy boundary are defined there, once, for both implementations. Like the
@@ -224,10 +223,8 @@ turn the PIN's length into the pool `NostrClient::connect` dials; nothing else
 in the CLI decides it and there is no receive-side flag. `test send
 --anonymous` mints the longer PIN, and so does the wizard's `a` toggle on the
 PIN Exchange row — an option of that mode rather than a mode beside it, which
-is where the web app keeps it too. A build without the `tor` feature still
-recognizes such a PIN and says what is missing, rather than rejecting it as
-malformed. The Tor transfer mode's one-time password selects no relay pool, so
-it is checked against the ordinary length alone.
+is where the web app keeps it too. The Tor transfer mode's one-time password
+selects no relay pool, so it is checked against the ordinary length alone.
 
 **Where the URL policy is enforced.** `normalize_onion_relay_url` is applied to
 every pool entry before a socket is opened, and it parses the address as an
@@ -249,7 +246,7 @@ already accepted it.
 
 ## Tor Onion Transport
 
-Behind the non-default `tor` cargo feature. The wire contract is the web app's
+The wire contract is the web app's
 [`docs/TOR_TRANSPORT.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/TOR_TRANSPORT.md),
 which specifies the onion address binding, the password, the SPAKE2 handshake
 frames, the key schedule, the stream framing, and the bounds — deliberately

@@ -526,7 +526,7 @@ mod tests {
     /// one talks to the real Tor network:
     ///
     /// ```sh
-    /// cargo test --all-features -- --ignored --nocapture
+    /// cargo test -- --ignored --nocapture
     /// ```
     ///
     /// One client plays both roles, which is not how the CLI is used but costs

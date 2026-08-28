@@ -59,7 +59,6 @@ pub enum UiEvent {
     HidePin,
     /// The Tor sender's onion address and password, which the receiver needs
     /// both of.
-    #[cfg(feature = "tor")]
     ShowTorAddress {
         file_name: String,
         size: u64,
@@ -67,7 +66,6 @@ pub enum UiEvent {
         password: String,
     },
     /// The onion descriptor is published, so the address is now reachable.
-    #[cfg(feature = "tor")]
     TorPublished,
     /// Receiver-side code the user must read to the sender.
     ShowConfirmationCode(String),
@@ -216,7 +214,6 @@ pub fn show_pin(file_name: &str, file_size: u64, pin: &str) {
 /// Present the Tor sender's address and password. Both are needed to receive,
 /// and neither is a secret the sender keeps — they are meant to be handed over
 /// together.
-#[cfg(feature = "tor")]
 pub fn show_tor_address(file_name: &str, file_size: u64, address: &str, password: &str) {
     if let Some(tx) = sink() {
         let _ = tx.send(UiEvent::ShowTorAddress {
@@ -237,7 +234,6 @@ pub fn show_tor_address(file_name: &str, file_size: u64, address: &str, password
 }
 
 /// Report that the onion descriptor is published and the address is reachable.
-#[cfg(feature = "tor")]
 pub fn tor_published() {
     if let Some(tx) = sink() {
         let _ = tx.send(UiEvent::TorPublished);

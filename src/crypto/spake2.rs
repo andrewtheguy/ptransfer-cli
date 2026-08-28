@@ -156,7 +156,6 @@ impl<'a> PakeIdentities<'a> {
     /// Binding the address is what stops a relay that proxies the handshake
     /// through to a *different* onion service from sharing a root with either
     /// side.
-    #[cfg(feature = "tor")]
     pub fn tor(onion: &'a str) -> Self {
         Self {
             transfer_id: onion,

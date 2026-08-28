@@ -10,7 +10,6 @@
 pub mod archive;
 pub mod crypto;
 pub mod signaling;
-#[cfg(feature = "tor")]
 pub mod tor;
 pub mod transfer;
 pub mod tui;
