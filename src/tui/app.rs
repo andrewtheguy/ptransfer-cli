@@ -20,7 +20,6 @@ use ratatui::widgets::Paragraph;
 use crate::crypto::pin::{PinKind, classify_pin, pin_char};
 // Only the Tor transport's password field is fixed to one length; a PIN
 // Exchange PIN has two, and `PinKind` is what names them.
-#[cfg(feature = "tor")]
 use crate::crypto::pin::PIN_LENGTH;
 
 use super::dir_picker::{DirPicker, DirPickerStep};
@@ -40,9 +39,7 @@ pub enum WizardPlan {
         pin: String,
         output: PathBuf,
     },
-    #[cfg(feature = "tor")]
     SendTor(Vec<PathBuf>),
-    #[cfg(feature = "tor")]
     ReceiveTor {
         address: String,
         password: String,
@@ -52,8 +49,7 @@ pub enum WizardPlan {
 
 /// The transfer modes the sending side chooses between, in the pTransfer web
 /// app's order, so an option's number means the same thing in both interfaces.
-/// The Tor transport is the CLI's own third mode, and only exists in a build
-/// with the `tor` feature.
+/// The Tor transport is the CLI's own third mode.
 ///
 /// Anonymous signaling is deliberately not a fourth entry. It is not a mode:
 /// it changes which relays PIN Exchange signals over and nothing else, and the
@@ -63,9 +59,6 @@ pub enum WizardPlan {
 ///
 /// There is no matching menu on the receiving side: what the sender hands over
 /// says which mode it is, so [`classify`] reads the mode off it.
-#[cfg(not(feature = "tor"))]
-const MODES: [&str; 2] = ["PIN Exchange", "Code Exchange"];
-#[cfg(feature = "tor")]
 const MODES: [&str; 3] = [
     "PIN Exchange",
     "Code Exchange",
@@ -73,12 +66,6 @@ const MODES: [&str; 3] = [
 ];
 
 /// One line of explanation per entry in [`MODES`].
-#[cfg(not(feature = "tor"))]
-const MODE_HINTS: [&str; 2] = [
-    "A short PIN over relays, then a direct WebRTC transfer.",
-    "Hand-carried connection codes. Not implemented in the CLI yet.",
-];
-#[cfg(feature = "tor")]
 const MODE_HINTS: [&str; 3] = [
     "A short PIN over relays, then a direct WebRTC transfer.",
     "Hand-carried connection codes. Not implemented in the CLI yet.",
@@ -86,15 +73,12 @@ const MODE_HINTS: [&str; 3] = [
 ];
 
 const MODE_PIN: usize = 0;
-#[cfg(feature = "tor")]
 const MODE_TOR: usize = 2;
 
 /// The key that turns anonymous signaling on and off on the [`MODE_PIN`] row.
-#[cfg(feature = "tor")]
 const ANONYMOUS_KEY: char = 'a';
 
 /// What the toggle under the menu says, given its state.
-#[cfg(feature = "tor")]
 fn anonymous_toggle_line(on: bool) -> &'static str {
     if on {
         "[x] Anonymous signaling (experimental)   a to turn off"
@@ -105,7 +89,6 @@ fn anonymous_toggle_line(on: bool) -> &'static str {
 
 /// What the toggle does, said the same way whichever state it is in: this is
 /// the line someone reads to decide, so it cannot only appear once they have.
-#[cfg(feature = "tor")]
 const ANONYMOUS_TOGGLE_HINT: &str =
     "Signaling over Tor, so relays never see an IP. Slow to start; longer PIN.";
 
@@ -113,24 +96,10 @@ const CODE_EXCHANGE_UNAVAILABLE: &str =
     "Code Exchange is not implemented in the CLI yet — use PIN Exchange.";
 
 /// What the receive box accepts, in the wording every message naming it uses.
-/// Feature-gated so a build without Tor never offers something it cannot do.
-#[cfg(feature = "tor")]
 const ACCEPTED: &str = "a PIN or an onion address";
-#[cfg(not(feature = "tor"))]
-const ACCEPTED: &str = "a PIN";
 
 /// What to say about text shaped like an onion address that is not one.
-#[cfg(feature = "tor")]
 const ONION_REJECTED: &str = "Not a valid onion address — check for typos";
-#[cfg(not(feature = "tor"))]
-const ONION_REJECTED: &str = "This build has no Tor support — rebuild it with --features tor";
-
-/// What to say about a perfectly good anonymous-signaling PIN this build has
-/// no Tor client to act on. It is not a typo, so it must not be reported as
-/// one.
-#[cfg(not(feature = "tor"))]
-const ANONYMOUS_PIN_REJECTED: &str =
-    "That PIN needs anonymous signaling — rebuild this with --features tor";
 
 enum Screen {
     MainMenu {
@@ -142,9 +111,7 @@ enum Screen {
         selected: usize,
         /// Set when the highlighted mode cannot be started, cleared on move.
         notice: Option<String>,
-        /// Whether PIN Exchange will signal over the onion relay pool. Only a
-        /// `tor` build can turn it on — there is no client to reach that pool
-        /// with otherwise — so it is false throughout a build without one.
+        /// Whether PIN Exchange will signal over the onion relay pool.
         anonymous: bool,
     },
     /// The browser is shared by every send mode, so it carries the mode it was
@@ -174,7 +141,6 @@ enum Screen {
     /// The second half of a Tor receive. The password is asked for only once
     /// the address is recognized, because it is a separate secret and the
     /// address alone already says which mode this is.
-    #[cfg(feature = "tor")]
     TorPassword {
         output: PathBuf,
         /// The address that led here, kept so Esc goes back to it intact.
@@ -199,7 +165,6 @@ enum Pasted {
     Pin { pin: String, kind: PinKind },
     /// A valid v3 onion address, in whichever of its two spellings was pasted;
     /// the transfer re-splits it into the `<host>:<port>` its handshake binds.
-    #[cfg(feature = "tor")]
     Onion(String),
 }
 
@@ -268,13 +233,6 @@ fn classify(text: &str) -> Result<Pasted, Rejection> {
     }
 
     if let Some(kind) = classify_pin(text) {
-        // An anonymous PIN reaches a pool of onion services and nothing else,
-        // so a build without the Tor client cannot act on one however valid it
-        // is.
-        #[cfg(not(feature = "tor"))]
-        if kind == PinKind::Anonymous {
-            return Err(Rejection::Malformed(ANONYMOUS_PIN_REJECTED));
-        }
         return Ok(Pasted::Pin {
             pin: text.to_string(),
             kind,
@@ -284,7 +242,6 @@ fn classify(text: &str) -> Result<Pasted, Rejection> {
     // Checked in full, checksum included: Arti resolves anything that is not a
     // v3 onion address through an exit node and off the onion network, so a
     // typo that survived to here would reach the plain internet.
-    #[cfg(feature = "tor")]
     if crate::tor::split_address(text, crate::tor::DEFAULT_PORT).is_ok() {
         return Ok(Pasted::Onion(text.to_string()));
     }
@@ -370,7 +327,6 @@ fn handle_key(screen: Screen, key: KeyEvent) -> Step {
             cursor,
             error,
         } => receive_entry_key(output, input, cursor, error, key),
-        #[cfg(feature = "tor")]
         Screen::TorPassword {
             output,
             address,
@@ -387,7 +343,6 @@ fn handle_key(screen: Screen, key: KeyEvent) -> Step {
 /// minted at, which is the whole of what the option changes.
 fn send_plan(mode: usize, anonymous: bool, paths: Vec<PathBuf>) -> WizardPlan {
     match mode {
-        #[cfg(feature = "tor")]
         MODE_TOR => WizardPlan::SendTor(paths),
         _ => WizardPlan::SendPin {
             paths,
@@ -453,14 +408,10 @@ fn mode_menu_key(selected: usize, anonymous: bool, key: KeyEvent) -> Step {
 
     // Code Exchange is a placeholder that keeps the CLI's mode numbering
     // aligned with the web app's; every other mode runs a transfer.
-    #[cfg(not(feature = "tor"))]
-    let implemented = selected == MODE_PIN;
-    #[cfg(feature = "tor")]
     let implemented = selected == MODE_PIN || selected == MODE_TOR;
 
     // The option belongs to PIN Exchange, so the key does nothing on any other
     // row rather than setting something that row would ignore.
-    #[cfg(feature = "tor")]
     if key.code == KeyCode::Char(ANONYMOUS_KEY) && selected == MODE_PIN {
         return Step::Continue(mode_menu_at(selected, !anonymous));
     }
@@ -502,7 +453,6 @@ fn receive_entry_key(
             Ok(Pasted::Pin { pin, .. }) => {
                 return Step::Finish(WizardPlan::ReceivePin { pin, output });
             }
-            #[cfg(feature = "tor")]
             Ok(Pasted::Onion(address)) => {
                 return Step::Continue(Screen::TorPassword {
                     output,
@@ -535,7 +485,6 @@ fn receive_entry_key(
 }
 
 /// The password half of a Tor receive.
-#[cfg(feature = "tor")]
 fn tor_password_key(
     output: PathBuf,
     address: String,
@@ -623,7 +572,6 @@ fn handle_paste(screen: Screen, pasted: &str) -> Step {
                 error: None,
             })
         }
-        #[cfg(feature = "tor")]
         Screen::TorPassword {
             output, address, ..
         } => {
@@ -641,7 +589,6 @@ fn handle_paste(screen: Screen, pasted: &str) -> Step {
 }
 
 /// Reduce pasted text to a PIN, reporting whether anything was dropped.
-#[cfg(feature = "tor")]
 fn filter_pin_paste(pasted: &str) -> (String, bool) {
     let mut input = String::with_capacity(PIN_LENGTH);
     let mut invalid = false;
@@ -706,13 +653,10 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
                 Some(notice) => widgets::error_line(f, hint, notice),
                 None => f.render_widget(Paragraph::new(MODE_HINTS[*selected]).dim(), hint),
             }
-            #[cfg(feature = "tor")]
             if *selected == MODE_PIN {
                 f.render_widget(Paragraph::new(anonymous_toggle_line(*anonymous)), option);
                 f.render_widget(Paragraph::new(ANONYMOUS_TOGGLE_HINT).dim(), option_hint);
             }
-            #[cfg(not(feature = "tor"))]
-            let _ = (anonymous, option, option_hint);
             widgets::key_hints(f, inner, "↑/↓ move · Enter select · Esc back");
         }
 
@@ -762,7 +706,6 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
                     .dim(),
                     extra,
                 ),
-                #[cfg(feature = "tor")]
                 (None, Ok(Pasted::Onion(_))) => f.render_widget(
                     Paragraph::new("Onion address detected — the password comes next.").dim(),
                     extra,
@@ -775,7 +718,6 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
             widgets::key_hints(f, inner, "Enter confirm · ←/→ move · Esc back");
         }
 
-        #[cfg(feature = "tor")]
         Screen::TorPassword {
             address,
             password,
@@ -822,7 +764,6 @@ mod tests {
         KeyEvent::from(code)
     }
 
-    #[cfg(feature = "tor")]
     const ONION: &str = "zrmxlosp6cvmkhxwhx7267wkvqyztsrmloqw76eu4fhn2gsbg5zk4kad.onion";
 
     #[test]
@@ -864,7 +805,6 @@ mod tests {
         assert_eq!(selected, 0);
     }
 
-    #[cfg(feature = "tor")]
     #[test]
     fn the_tor_mode_starts_a_selection_rather_than_a_notice() {
         let step = mode_menu_key(MODE_TOR, false, press(KeyCode::Enter));
@@ -875,7 +815,6 @@ mod tests {
         assert_eq!(mode, MODE_TOR);
     }
 
-    #[cfg(feature = "tor")]
     #[test]
     fn the_selected_mode_decides_the_send_plan() {
         assert!(matches!(
@@ -902,7 +841,6 @@ mod tests {
 
     /// The option is PIN Exchange's, the way the web app has it under that
     /// mode's advanced options rather than as a mode of its own.
-    #[cfg(feature = "tor")]
     #[test]
     fn the_anonymous_toggle_belongs_to_pin_exchange_alone() {
         let toggle = press(KeyCode::Char(ANONYMOUS_KEY));
@@ -938,7 +876,6 @@ mod tests {
 
     /// Turning it on and then picking files has to reach the plan: the browser
     /// sits between the two and carries the answer across.
-    #[cfg(feature = "tor")]
     #[test]
     fn the_toggle_survives_the_file_browser() {
         let Step::Continue(Screen::FileBrowser { mode, anonymous, .. }) =
@@ -989,7 +926,6 @@ mod tests {
     /// The receiver is never asked whether the sender turned on anonymous
     /// signaling: the PIN it was handed is longer, and that is the whole
     /// announcement.
-    #[cfg(feature = "tor")]
     #[test]
     fn a_pasted_anonymous_pin_is_recognized_as_one() {
         let pin = crate::crypto::pin::generate_pin(PinKind::Anonymous).unwrap();
@@ -1002,20 +938,6 @@ mod tests {
         );
     }
 
-    /// Without the Tor client there is no onion relay pool to look on, so a
-    /// perfectly valid anonymous PIN has to be refused — and not as a typo,
-    /// which it is not.
-    #[cfg(not(feature = "tor"))]
-    #[test]
-    fn an_anonymous_pin_is_refused_by_a_build_without_tor() {
-        let pin = crate::crypto::pin::generate_pin(PinKind::Anonymous).unwrap();
-        assert_eq!(
-            classify(&pin),
-            Err(Rejection::Malformed(ANONYMOUS_PIN_REJECTED))
-        );
-    }
-
-    #[cfg(feature = "tor")]
     #[test]
     fn a_pasted_onion_address_is_recognized_in_either_spelling() {
         assert_eq!(classify(ONION), Ok(Pasted::Onion(ONION.to_string())));
@@ -1087,7 +1009,6 @@ mod tests {
         assert_eq!(error, Some(Rejection::Unrecognized.message()));
     }
 
-    #[cfg(feature = "tor")]
     #[test]
     fn an_onion_address_asks_for_the_password_and_then_finishes() {
         // Enter on a recognized address opens the password screen rather than
@@ -1129,7 +1050,6 @@ mod tests {
         assert_eq!(password, entered);
     }
 
-    #[cfg(feature = "tor")]
     #[test]
     fn escaping_the_password_returns_the_address_to_the_box() {
         let Step::Continue(Screen::ReceiveEntry { input, cursor, .. }) = tor_password_key(
@@ -1203,7 +1123,6 @@ mod tests {
         assert!(error.is_none());
     }
 
-    #[cfg(feature = "tor")]
     #[test]
     fn a_full_tor_password_stops_accepting_characters() {
         // Regression: past PIN_LENGTH the typing guard failed and the keystroke
@@ -1227,7 +1146,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "tor")]
     #[test]
     fn a_pasted_tor_password_is_filtered_like_a_pin() {
         let screen = Screen::TorPassword {

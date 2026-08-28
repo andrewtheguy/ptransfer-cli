@@ -27,11 +27,8 @@ const LABEL_CONFIRMATION: &str = "ptransfer:nostr-session:v4:confirmation";
 /// versioned separately from `INTEROP_PROTOCOL_VERSION`, so it derives under
 /// its own labels: a root that came out of a Tor handshake can never produce a
 /// key PIN Exchange would also produce.
-#[cfg(feature = "tor")]
 const LABEL_TOR_CLAIM: &str = "ptransfer:tor-session:v1:claim";
-#[cfg(feature = "tor")]
 const LABEL_TOR_CONFIRM: &str = "ptransfer:tor-session:v1:confirm";
-#[cfg(feature = "tor")]
 const LABEL_TOR_CONTENT: &str = "ptransfer:tor-session:v1:content";
 
 /// Session keys for PIN Exchange. Distinct HKDF info labels
@@ -81,7 +78,6 @@ pub struct ConfirmationCodeBinding<'a> {
 /// the receiver's sealed claim is the only proof the connecting peer knows the
 /// password, and the sender's sealed confirm — which carries the file metadata
 /// — is the only proof the onion service on the other end knows it too.
-#[cfg(feature = "tor")]
 pub struct TorSessionKeys {
     /// Seals the receiver's claim (receiver -> sender).
     pub claim: [u8; AES_KEY_LEN],
@@ -178,7 +174,6 @@ impl PakeRoot {
     }
 }
 
-#[cfg(feature = "tor")]
 impl PakeRoot {
     /// Derive every key one Tor onion transfer uses.
     pub fn tor_session_keys(&self, salt: &[u8]) -> Result<TorSessionKeys> {
@@ -317,7 +312,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tor")]
     #[test]
     fn tor_keys_are_distinct_from_each_other_and_from_pin_exchange() {
         let root = fixed_root();

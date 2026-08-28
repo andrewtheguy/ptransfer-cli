@@ -21,14 +21,14 @@ file/folder selection, output directory, and PIN entry.
   sender; nothing is sent until the sender enters a match. The web app's Code
   Exchange (hand-carried QR/clipboard codes) is web-only and is not implemented
   here.
-- Anonymous signaling (experimental, behind the `tor` feature) is the same PIN
+- Anonymous signaling (experimental) is the same PIN
   Exchange with the relay sockets carried through Tor to a separate pool of
   onion-service relays, so no Nostr relay sees either device's IP address. The
   sender turns it on and the PIN it mints is 16 characters instead of 12; the
   receiver reads the mode off that length and is not asked. File bytes still
   take the direct WebRTC data channel, so this does not make a transfer
   anonymous.
-- Tor Onion Service (behind the `tor` feature) is a second transfer mode, not a
+- Tor Onion Service is a second transfer mode, not a
   variant of PIN Exchange: the sender publishes a throwaway v3 onion service and
   a one-time password, and those two strings are the whole rendezvous — no
   Nostr relay, no signaling server, and no WebRTC. The file bytes travel through
@@ -101,7 +101,7 @@ $env:PTRANSFER_CLI_INSTALL_ARGS='<release-tag>'; irm https://andrewtheguy.github
 ### From Source
 
 ```bash
-cargo build --release --all-features
+cargo build --release
 ```
 
 ## Usage
@@ -121,7 +121,7 @@ Transfers run inside the TUI with live status and progress.
 
 Only the sending side picks a mode. Its menu lists the web app's modes in the
 web app's order, so an option's position means the same thing in both, and adds
-the CLI's own Tor Onion Service after them in a build with the `tor` feature.
+the CLI's own Tor Onion Service after them.
 Anonymous signaling is not a mode there either: it is an option of PIN
 Exchange, toggled with `a` on that row and off unless asked for, the same place
 the web app keeps it. Picking Code Exchange says it is not implemented and
@@ -149,7 +149,7 @@ ptransfer test send /path/to/file more-files a-folder
 ptransfer test receive --output /path/to/dir
 echo "$PIN" | ptransfer test receive --output /path/to/dir
 
-# Anonymous signaling (requires --features tor); the receiver needs no flag
+# Anonymous signaling; the receiver needs no flag
 ptransfer test send --anonymous /path/to/file
 ```
 
@@ -163,7 +163,6 @@ file already exists the receiver fails; pass `--overwrite` to replace it.
 
 ### Tor Onion Service
 
-Built behind the non-default `tor` cargo feature (`cargo build --features tor`).
 The sender publishes a throwaway v3 onion service and a one-time password; the
 `.onion` address and that password are the only things the receiver needs. No
 relay, no account, and no signaling server is involved — the address *is* the
@@ -337,12 +336,11 @@ pTransfer's app version. This build implements version `4`, declared in
 
 ## Development
 
-Run checks with all features (`--all-features` includes `tor`, which pulls in
-the Arti dependency tree and is slow to build the first time):
+The Arti dependency tree is part of every build, so the first one is slow:
 
 ```bash
-cargo test --all-features
-cargo clippy --all-features
+cargo test
+cargo clippy
 ```
 
 The checks that talk to the real Tor network are ignored by default, because
@@ -350,7 +348,7 @@ they take minutes and fail on a machine with no route to it. Run them
 deliberately:
 
 ```bash
-cargo test --all-features -- --ignored --nocapture
+cargo test -- --ignored --nocapture
 ```
 
 Those are the client bootstrap and the anonymous-signaling round trip in
@@ -369,7 +367,7 @@ bun run test:live:tor      # the Tor onion transport
 
 They require internet access, Bun, a Chrome-family browser, and this checkout
 beside that one — `PTRANSFER_CLI_ROOT` and `PTRANSFER_BIN` override where each
-looks for it. The WebRTC one builds this CLI with all features itself; the Tor
-one expects a `cargo build --release --all-features` build to already be there.
+looks for it. The WebRTC one builds this CLI itself; the Tor one expects a
+`cargo build --release` build to already be there.
 Both start the web development server when needed and leave byte-verified
 transfer artifacts in the temporary directory printed at the end.

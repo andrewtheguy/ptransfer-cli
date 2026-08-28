@@ -4,14 +4,13 @@
 //! seconds, and fail on a machine with no route to it. Run them deliberately:
 //!
 //! ```sh
-//! cargo test --all-features --test tor_network -- --ignored --nocapture
+//! cargo test --test tor_network -- --ignored --nocapture
 //! ```
 //!
 //! The transfer over a real onion service is ignored the same way, but lives
-//! with the code it exercises, in `src/tor/transfer.rs`. `cargo test
-//! --all-features -- --ignored` runs both.
+//! with the code it exercises, in `src/tor/transfer.rs`. `cargo test --
+//! --ignored` runs both.
 
-#![cfg(feature = "tor")]
 
 use nostr_sdk::prelude::*;
 use ptransfer_cli::crypto::pin::{

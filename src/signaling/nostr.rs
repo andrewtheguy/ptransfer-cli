@@ -69,12 +69,10 @@ const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// requirement: there is no silent fallback to a clearnet socket, so a pool
 /// that never opens has to be reported rather than left for a publish to
 /// discover.
-#[cfg(feature = "tor")]
 const ANONYMOUS_RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(180);
 /// How often the anonymous wait re-checks whether a relay has come up. Short
 /// enough not to add noticeably to a minutes-long rendezvous, long enough that
 /// the check itself costs nothing.
-#[cfg(feature = "tor")]
 const ANONYMOUS_RELAY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const PUBLISH_RETRIES: usize = 3;
@@ -295,7 +293,6 @@ pub struct NostrClient {
     relays: Vec<String>,
     /// The Tor client every relay socket of an anonymous session runs on. Held
     /// only so it outlives them: dropping it tears down the circuits.
-    #[cfg(feature = "tor")]
     _tor: Option<std::sync::Arc<crate::tor::TorClient>>,
 }
 
@@ -308,13 +305,7 @@ impl NostrClient {
     pub async fn connect(keys: Keys, kind: PinKind) -> Result<Self> {
         match kind {
             PinKind::Standard => Self::connect_clearnet(keys).await,
-            #[cfg(feature = "tor")]
             PinKind::Anonymous => Self::connect_anonymous(keys).await,
-            #[cfg(not(feature = "tor"))]
-            PinKind::Anonymous => bail!(
-                "This PIN uses anonymous signaling, which needs the Tor client \
-                 this build was compiled without — rebuild with --features tor"
-            ),
         }
     }
 
@@ -330,7 +321,6 @@ impl NostrClient {
             client,
             keys,
             relays,
-            #[cfg(feature = "tor")]
             _tor: None,
         })
     }
@@ -342,7 +332,6 @@ impl NostrClient {
     /// are separate errors on purpose — one is the network between here and
     /// Tor, the other is a pool that is community-maintained and monitored by
     /// nobody.
-    #[cfg(feature = "tor")]
     async fn connect_anonymous(keys: Keys) -> Result<Self> {
         use crate::signaling::anonymous::{
             ANONYMOUS_SIGNALING_RELAYS, OnionSignalingTransport, normalize_onion_relay_url,
@@ -529,7 +518,6 @@ async fn add_relays(client: &Client, pool: &[&str]) -> Result<Vec<String>> {
 /// has what it needs for the whole budget. A publish handed to a pool with
 /// nothing open fails naming no cause, which is the other half of why this
 /// waits for a real connection rather than giving the sockets a head start.
-#[cfg(feature = "tor")]
 async fn wait_for_any_onion_relay(client: &Client) -> Result<()> {
     let deadline = tokio::time::Instant::now() + ANONYMOUS_RELAY_CONNECT_TIMEOUT;
     loop {
@@ -851,7 +839,6 @@ mod tests {
                 client: Client::new(keys.clone()),
                 keys: keys.clone(),
                 relays: DEFAULT_RELAYS.iter().map(|r| (*r).to_string()).collect(),
-                #[cfg(feature = "tor")]
                 _tor: None,
             },
             keys,
