@@ -12,20 +12,28 @@ formats as pTransfer. Running the binary with no arguments launches a
 full-screen TUI wizard that walks through the whole transfer: send or receive,
 file/folder selection, output directory, and PIN entry.
 
-- PIN exchange over Nostr is the only signaling mode, compatible with the web
-  app's PIN Exchange: a case-sensitive 12-character PIN (fresh every 2 minutes;
-  the sender can also mint a new one on demand with `r`) drives a SPAKE2
-  password-authenticated key exchange that derives the actual signaling and
-  content keys. Nothing published to a relay can test a PIN guess offline. The
-  receiver then reads an 8-character confirmation code to the sender; nothing
-  is sent until the sender enters a match. The web app's Code Exchange
-  (hand-carried QR/clipboard codes) is web-only and is not implemented here.
+- PIN exchange over Nostr, compatible with the web app's PIN Exchange, is the
+  default and the only relay-signaled mode: a case-sensitive 12-character PIN
+  (fresh every 2 minutes; the sender can also mint a new one on demand with `r`)
+  drives a SPAKE2 password-authenticated key exchange that derives the actual
+  signaling and content keys. Nothing published to a relay can test a PIN guess
+  offline. The receiver then reads an 8-character confirmation code to the
+  sender; nothing is sent until the sender enters a match. The web app's Code
+  Exchange (hand-carried QR/clipboard codes) is web-only and is not implemented
+  here.
 - Anonymous signaling (experimental, behind the `tor` feature) is the same PIN
   Exchange with the relay sockets carried through Tor to a separate pool of
   onion-service relays, so no relay sees either device's IP address. The sender
   turns it on and the PIN it mints is 16 characters instead of 12; the receiver
   reads the mode off that length and is not asked. File bytes still take the
   direct WebRTC data channel, so this does not make a transfer anonymous.
+- Tor Onion Service (behind the `tor` feature) is a second transfer mode, not a
+  variant of PIN Exchange: the sender publishes a throwaway v3 onion service and
+  a one-time password, and those two strings are the whole rendezvous — no
+  relay, no signaling server, and no WebRTC. The file bytes travel through the
+  onion service itself, so it is slow and capped at 100 MiB, and it
+  interoperates with the web app's Tor Onion Service in both directions. See
+  [Tor Onion Service](#tor-onion-service) below.
 - A single file is deflated on the wire and restored by the receiver. Multiple
   files and folders are bundled into a single ZIP on the fly, exactly like the
   web app (`<folder>_<timestamp>.zip` for one folder, `files_<timestamp>.zip`
@@ -38,9 +46,9 @@ file/folder selection, output directory, and PIN entry.
   than route file bytes through a relay server.
 - No QR code support in the CLI.
 
-The file bytes flow over the WebRTC data channel. Nostr relays carry only the
-handshake and WebRTC signaling events. The rendezvous event that advertises a
-transfer is plaintext JSON — a blinded SPAKE2 element and routing fields, with
+In PIN Exchange the file bytes flow over the WebRTC data channel, and Nostr
+relays carry only the handshake and WebRTC signaling events. The rendezvous
+event that advertises a transfer is plaintext JSON — a blinded SPAKE2 element and routing fields, with
 no file metadata — because encrypting it under a PIN-derived key would
 reintroduce the offline guessing target the PAKE removes. The claim, confirm
 (which carries the file metadata), and signaling payloads are all encrypted.
