@@ -6,6 +6,10 @@
 //! ```sh
 //! cargo test --all-features --test tor_network -- --ignored --nocapture
 //! ```
+//!
+//! The transfer over a real onion service is ignored the same way, but lives
+//! with the code it exercises, in `src/tor/transfer.rs`. `cargo test
+//! --all-features -- --ignored` runs both.
 
 #![cfg(feature = "tor")]
 

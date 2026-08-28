@@ -345,6 +345,18 @@ cargo test --all-features
 cargo clippy --all-features
 ```
 
+The checks that talk to the real Tor network are ignored by default, because
+they take minutes and fail on a machine with no route to it. Run them
+deliberately:
+
+```bash
+cargo test --all-features -- --ignored --nocapture
+```
+
+Those are the client bootstrap and the anonymous-signaling round trip in
+`tests/tor_network.rs`, and `a_file_round_trips_over_a_real_onion_service` in
+`src/tor/transfer.rs`, which sends a file to itself over a published service.
+
 Run the live CLI-to-CLI and bidirectional CLI/web interoperability test:
 
 ```bash
