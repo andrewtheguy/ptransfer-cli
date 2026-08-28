@@ -451,6 +451,26 @@ mod tests {
 
     const ONION: &str = "zrmxlosp6cvmkhxwhx7267wkvqyztsrmloqw76eu4fhn2gsbg5zk4kad.onion:9735";
 
+    /// Deterministic bytes that `deflate-raw` cannot shrink.
+    ///
+    /// Wire chunking is what the round trips below are for, and chunks are
+    /// measured on the compressed stream: a counting pattern of this length
+    /// deflates to under two kilobytes and arrives as a single chunk, which
+    /// exercises none of it. Incompressible input keeps the wire payload the
+    /// size of the input, which is several 128 KiB chunks.
+    fn incompressible(len: usize) -> Vec<u8> {
+        // xorshift64*, from a fixed seed: the same bytes on every run.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        (0..len)
+            .map(|_| {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                (state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 32) as u8
+            })
+            .collect()
+    }
+
     /// Run both sides against each other over an in-memory duplex: everything
     /// the real commands do once Arti has produced a stream.
     async fn transfer(
@@ -521,9 +541,9 @@ mod tests {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let port = crate::tor::DEFAULT_PORT;
-        // Several 128 KiB chunks, and compressible, so the deflate-raw wire
-        // encoding is exercised over the circuit rather than only in memory.
-        let payload: Vec<u8> = (0..400_000u32).map(|i| (i % 251) as u8).collect();
+        // Several 128 KiB chunks on the wire, so chunking and reassembly are
+        // exercised over the circuit rather than only in memory.
+        let payload = incompressible(400_000);
 
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("over-tor.bin");
@@ -580,9 +600,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_file_round_trips_over_the_framed_stream() {
-        // Big enough to span several 128 KiB chunks, and compressible, so the
-        // deflate-raw wire encoding is exercised in both directions.
-        let payload: Vec<u8> = (0..400_000u32).map(|i| (i % 251) as u8).collect();
+        // Big enough to span several 128 KiB chunks on the wire, so chunking
+        // and reassembly are exercised in both directions.
+        let payload = incompressible(400_000);
         let (sent, received, dest, _dir) =
             transfer("ABCDEFGHJKLA", "ABCDEFGHJKLA", &payload, "big.bin").await;
 
@@ -659,7 +679,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("slow.bin");
         // Several chunks, so there are hand-offs to advance the clock between.
-        let payload: Vec<u8> = (0..400_000u32).map(|i| (i % 251) as u8).collect();
+        let payload = incompressible(400_000);
         std::fs::write(&input, &payload).unwrap();
         let output = dir.path().join("out");
         std::fs::create_dir(&output).unwrap();

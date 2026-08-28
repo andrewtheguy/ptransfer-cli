@@ -266,11 +266,16 @@ async fn single_file_deflates_on_the_wire_and_inflates_on_receipt() {
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
 
-    // Compressible enough that the wire payload is unmistakably smaller than
-    // the file, but long enough to span many chunks either way.
+    // Hex text: compressible enough that the wire payload is unmistakably
+    // smaller than the file — deflate halves it at best — while keeping enough
+    // entropy that the deflated stream still spans dozens of chunks. A payload
+    // that merely repeats itself would deflate to a single chunk and exercise
+    // none of the flow control this test guards.
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut plain = Vec::with_capacity(8 * 1024 * 1024);
-    while plain.len() < 8 * 1024 * 1024 {
-        plain.extend_from_slice(b"the quick brown fox jumps over the lazy dog\n");
+    for byte in pseudo_random(4, 4 * 1024 * 1024) {
+        plain.push(HEX[usize::from(byte >> 4)]);
+        plain.push(HEX[usize::from(byte & 0x0f)]);
     }
     let input = src.path().join("report.log");
     write_file(&input, &plain);
