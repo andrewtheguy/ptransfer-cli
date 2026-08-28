@@ -23,9 +23,10 @@ const LABEL_CLAIM: &str = "ptransfer:nostr-session:v4:claim";
 const LABEL_CONFIRM: &str = "ptransfer:nostr-session:v4:confirm";
 const LABEL_CONFIRMATION: &str = "ptransfer:nostr-session:v4:confirmation";
 
-/// Labels for the Tor onion transport. It is not part of the interop protocol,
-/// so it derives under its own labels: a root that came out of a Tor handshake
-/// can never produce a key PIN Exchange would also produce.
+/// Labels for the Tor onion transport. Its interoperability contract is
+/// versioned separately from `INTEROP_PROTOCOL_VERSION`, so it derives under
+/// its own labels: a root that came out of a Tor handshake can never produce a
+/// key PIN Exchange would also produce.
 #[cfg(feature = "tor")]
 const LABEL_TOR_CLAIM: &str = "ptransfer:tor-session:v1:claim";
 #[cfg(feature = "tor")]

@@ -346,12 +346,14 @@ pTransfer's app version. This build implements version `4`, declared in
 - No resume support.
 - No QR support.
 - No Code Exchange: hand-carried offer/answer codes are web-only.
-- The Tor transport carries at most 100 MiB per transfer and is not part of
-  the interop protocol; it has a spec of its own that the web app shares.
-- Anonymous signaling is experimental and is not part of the interop protocol
-  either. Its relay pool is two community-listed onion relays that nothing
-  monitors, so expect it to fail more often than ordinary PIN Exchange, and
-  expect a cold Tor bootstrap on both sides before anything happens.
+- The Tor transport carries at most 100 MiB per transfer. Its browser/CLI
+  interoperability contract and handshake version are specified separately
+  from `INTEROP_PROTOCOL.md` in the web app's `docs/TOR_TRANSPORT.md`.
+- Anonymous signaling is experimental and is specified separately from
+  `INTEROP_PROTOCOL.md` too. Its relay pool is two community-listed onion
+  relays that nothing monitors, so expect it to fail more often than ordinary
+  PIN Exchange, and expect a cold Tor bootstrap on both sides before anything
+  happens.
 - No custom relay/discovery mode.
 - Direct P2P only: no TURN relay fallback for the file bytes.
 
