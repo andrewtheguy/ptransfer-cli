@@ -357,15 +357,19 @@ Those are the client bootstrap and the anonymous-signaling round trip in
 `tests/tor_network.rs`, and `a_file_round_trips_over_a_real_onion_service` in
 `src/tor/transfer.rs`, which sends a file to itself over a published service.
 
-Run the live CLI-to-CLI and bidirectional CLI/web interoperability test:
+The live interoperability tests — this CLI against itself, and both directions
+between it and the web app — live in the pTransfer repo, which is the source of
+truth for everything the two share. Run them from a checkout of it:
 
 ```bash
-bun tests/live_interop_e2e.ts
+cd ../ptransfer
+bun run test:live:webrtc   # PIN Exchange over a real data channel
+bun run test:live:tor      # the Tor onion transport
 ```
 
-It requires internet access, Bun, a Chrome-family browser, and a pTransfer
-checkout in the sibling `ptransfer` folder. Set `PTRANSFER_WEB_ROOT`,
-`PTRANSFER_WEB_URL`, or `CHROME_PATH` to override those defaults. The script builds
-the CLI with all features, starts the web development server when needed, and
-leaves byte-verified transfer artifacts in the temporary directory printed at
-the end.
+They require internet access, Bun, a Chrome-family browser, and this checkout
+beside that one — `PTRANSFER_CLI_ROOT` and `PTRANSFER_BIN` override where each
+looks for it. The WebRTC one builds this CLI with all features itself; the Tor
+one expects a `cargo build --release --all-features` build to already be there.
+Both start the web development server when needed and leave byte-verified
+transfer artifacts in the temporary directory printed at the end.
