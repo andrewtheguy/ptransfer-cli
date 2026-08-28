@@ -24,10 +24,10 @@ v3 onion address with a valid checksum — so the wizard classifies what was
 pasted rather than asking, as the web app's receive screen does. Only the Tor
 mode then needs a second input, its one-time password.
 
-**No secret is ever a command-line argument.** The `test` subcommand takes
-paths and options on the command line and everything secret — the PIN, the Tor
-transport's password, the confirmation code — on stdin, prompted for at a
-terminal and piped in from a script. An argument is public: every other process
+**No secret is ever a command-line argument.** Non-interactive commands take
+paths and options on the command line, but read PINs, confirmation codes, and
+the Tor transport's password on stdin, prompted for at a terminal or piped in
+from a script. An argument is public: every other process
 on the machine can read it out of the process list and an interactive shell
 writes it to history, and the receiving side holds its secret for the whole
 connection attempt — tens of seconds for PIN Exchange, minutes when a Tor
@@ -271,11 +271,12 @@ over a `Messenger`, so above the framing the Tor path runs the *same* code as
 PIN Exchange rather than a parallel implementation. `TorMessenger` restores the
 discrete binary/text messages the choreography needs from a byte stream.
 
-**Tor state never leaves memory.** There is no state directory, no cache and no
-keystore: the network directory, the guard and vanguard state and the onion
-service's identity key are values in the process. A transfer cannot touch a
-system Tor or an existing `~/.local/share/arti`, and a process killed outright
-leaves nothing behind. The cost is that every command bootstraps from cold.
+**Tor state never leaves memory.** There is no Tor state directory, cache or
+keystore: the network directory, guard and vanguard state, and onion-service
+identity key are values in the process. A transfer cannot touch a system Tor or
+an existing `~/.local/share/arti`. Transfer output is separate: receiving uses
+a destination `.part` file, which can remain after an abrupt process kill. The
+cost of memory-only Tor state is that every command bootstraps from cold.
 
 This is why the client is assembled from Arti's managers rather than taken
 whole from `arti-client`: `tor-dirmgr` (SQLite plus a blob directory) and
@@ -376,8 +377,11 @@ incoming data-channel message, including
 `DONE:<total_chunks>:<total_bytes>`.
 
 The maximum transfer size is the transport's: 2 GiB (`MAX_MESSAGE_SIZE`) over a
-data channel, matching pTransfer, and 100 MiB over Tor. Both ends stream chunk
-by chunk, so neither bound is RAM.
+data channel, matching pTransfer, and 100 MiB over Tor. The selected input is
+checked before sending; the transfer layer separately checks encoded wire bytes
+and decoded output as it streams. A near-limit selection can therefore pass the
+input check but fail if its wire form grows beyond the cap. Neither bound is a
+RAM requirement.
 
 Both send paths run the same shape: a blocking worker produces wire bytes — a
 deflater over one file, or a ZIP writer over a walked selection — into a chunk

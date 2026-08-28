@@ -1,9 +1,10 @@
 //! ptransfer-cli: the pTransfer command-line client for peer-to-peer file transfer.
 //!
-//! Running with no arguments launches the full-screen TUI wizard, which covers
-//! sending and receiving files and folders over PIN exchange. The `test`
-//! subcommand exposes the same flows as a non-interactive plain-text mode for
-//! testing. QR support is intentionally not part of this CLI.
+//! Running with no arguments launches the full-screen TUI wizard. It covers PIN
+//! Exchange and, with the `tor` feature, Tor onion transfers; Code Exchange is
+//! shown in the mode list but is not implemented. The `test` subcommand exposes
+//! PIN Exchange as a non-interactive plain-text mode for testing. QR support is
+//! intentionally not part of this CLI.
 //! Build with: cargo build --release
 
 use anyhow::Result;
@@ -124,7 +125,7 @@ enum TestCommands {
         ///
         /// Mints a 16-character PIN instead of a 12-character one; the
         /// receiver reads the mode off that length and needs no flag of its
-        /// own. Hides both devices' IP addresses from the relays. The file
+        /// own. Hides both devices' IP addresses from the Nostr relays. The file
         /// bytes still travel over the direct WebRTC data channel.
         #[cfg(feature = "tor")]
         #[arg(long)]

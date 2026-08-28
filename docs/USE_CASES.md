@@ -48,7 +48,8 @@ ptransfer test receive   # then type or pipe the PIN
 
 Needs a build with the `tor` feature. The sender publishes a throwaway onion
 service; the address and the printed password are the only things the receiver
-needs, and no relay or signaling server is involved at all. The other end may be
+needs, and no Nostr relay or signaling server is involved. Tor relays still
+carry the circuits. The other end may be
 another CLI or a pTransfer browser tab, at most 100 MiB per transfer — and
 slow enough that far less than that is the sensible size.
 
@@ -75,9 +76,9 @@ ptransfer tor receive <address> --output ./downloads
 Needs a build with the `tor` feature, and is experimental. This is an ordinary
 PIN Exchange transfer — the file still travels over the direct WebRTC data
 channel, at full speed and up to the usual 2 GiB — with only the handshake moved
-onto a separate pool of Nostr relays reached as onion services. No relay sees
-either device's IP address. The other WebRTC peer and the STUN servers still do,
-so this is not an anonymous transfer.
+onto a separate pool of Nostr relays reached as onion services. No Nostr relay
+sees either device's IP address. The other WebRTC peer and the STUN servers
+still do, so this is not an anonymous transfer.
 
 The sender turns it on and gets a 16-character PIN instead of a 12-character
 one. The receiver is asked nothing: the length is what says which relay pool to

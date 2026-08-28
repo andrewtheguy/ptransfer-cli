@@ -11,10 +11,11 @@
 //!
 //! The Tor client is deliberately not wired to the machine's Tor setup. It
 //! reads no configuration file and shares nothing with a system Tor or an
-//! existing `~/.local/share/arti`. It also writes nothing anywhere: the
-//! directory ([`netdir`]), the guard and vanguard state ([`memstate`]) and the
+//! existing `~/.local/share/arti`. It also writes no Tor state: the directory
+//! ([`netdir`]), the guard and vanguard state ([`memstate`]), and the
 //! onion-service keys ([`service`]) are ordinary values in this process's
-//! memory, so they need no cleanup and cannot outlive it.
+//! memory, so they need no cleanup and cannot outlive it. Received transfer
+//! output is separate and is written to the operator's chosen destination.
 
 pub mod client;
 pub mod config;

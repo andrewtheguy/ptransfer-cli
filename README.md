@@ -23,14 +23,15 @@ file/folder selection, output directory, and PIN entry.
   here.
 - Anonymous signaling (experimental, behind the `tor` feature) is the same PIN
   Exchange with the relay sockets carried through Tor to a separate pool of
-  onion-service relays, so no relay sees either device's IP address. The sender
-  turns it on and the PIN it mints is 16 characters instead of 12; the receiver
-  reads the mode off that length and is not asked. File bytes still take the
-  direct WebRTC data channel, so this does not make a transfer anonymous.
+  onion-service relays, so no Nostr relay sees either device's IP address. The
+  sender turns it on and the PIN it mints is 16 characters instead of 12; the
+  receiver reads the mode off that length and is not asked. File bytes still
+  take the direct WebRTC data channel, so this does not make a transfer
+  anonymous.
 - Tor Onion Service (behind the `tor` feature) is a second transfer mode, not a
   variant of PIN Exchange: the sender publishes a throwaway v3 onion service and
   a one-time password, and those two strings are the whole rendezvous — no
-  relay, no signaling server, and no WebRTC. The file bytes travel through the
+  Nostr relay, no signaling server, and no WebRTC. The file bytes travel through
   onion service itself, so it is slow and capped at 100 MiB, and it
   interoperates with the web app's Tor Onion Service in both directions. See
   [Tor Onion Service](#tor-onion-service) below.
@@ -55,8 +56,8 @@ reintroduce the offline guessing target the PAKE removes. The claim, confirm
 
 ## Install
 
-The release installers fetch a native, standalone executable. You only need the
-binary in your PATH; no runtime dependencies or package managers are required.
+The release installers fetch a native executable. It needs no language runtime
+or package manager; ordinary operating-system libraries are still used.
 
 ### Quick Install (Linux & macOS)
 
@@ -86,15 +87,14 @@ The Windows installer supports x86_64 (AMD64).
 irm https://andrewtheguy.github.io/ptransfer-cli/install.ps1 | iex
 ```
 
-By default the PowerShell installer pulls the latest **stable** release. Because
+The release workflow publishes a Windows binary only for **stable** releases,
+so the PowerShell installer should be used with the latest stable release or a
+specific stable tag. Because
 parameter binding is unavailable when piping into `iex`, pass flags via
 `$env:PTRANSFER_CLI_INSTALL_ARGS`. Examples:
 
 ```powershell
-# Latest prerelease
-$env:PTRANSFER_CLI_INSTALL_ARGS='-PreRelease'; irm https://andrewtheguy.github.io/ptransfer-cli/install.ps1 | iex
-
-# Pin to a specific tag
+# Pin to a specific stable tag
 $env:PTRANSFER_CLI_INSTALL_ARGS='<release-tag>'; irm https://andrewtheguy.github.io/ptransfer-cli/install.ps1 | iex
 ```
 
@@ -138,9 +138,9 @@ that fails its checksum is called out as a typo while it is still being typed.
 ### Non-Interactive Test Mode
 
 The `test` subcommand exists for testing only. Paths and options come from
-arguments; every secret — the PIN, the Tor transport's password, the
-confirmation code — is read from stdin, prompted for at a terminal and piped in
-from a script, so that none of them appears in the process list.
+arguments; its PIN and confirmation code are read from stdin, prompted for at a
+terminal and piped in from a script, so neither appears in the process list.
+The separate `tor receive` command applies the same rule to its password.
 
 ```bash
 ptransfer test send /path/to/file more-files a-folder
@@ -236,7 +236,7 @@ ptransfer tor serve
 Instance B sends one line to that address and prints the echo:
 
 ```bash
-ptransfer tor connect <address>.onion --message hello
+ptransfer tor connect <address> --message hello
 # hello
 ```
 
@@ -247,11 +247,11 @@ the whole line `serve` prints.
 #### How the Tor Client Is Set Up
 
 Each process runs its own Tor client that reads no configuration file and never
-touches a system Tor or an existing `~/.local/share/arti`. It writes nothing,
-anywhere: the directory, the guard and vanguard state, and the onion service's
-identity key are all ordinary values in the process's memory. There is no
-storage to clean up, so a process killed outright leaves nothing behind, and
-the behaviour is identical on every platform.
+touches a system Tor or an existing `~/.local/share/arti`. It writes no Tor
+directory, guard or vanguard state, or onion-service identity key: those are
+ordinary values in the process's memory. This does not describe transfer
+output — a receiver writes its destination through a `.part` file, which an
+abruptly killed process can leave behind.
 
 That takes some assembly, because `arti-client` cannot do it. Two crates in
 Arti require a filesystem and expose no seam to replace it: `tor-dirmgr` keeps
@@ -337,9 +337,11 @@ pTransfer's app version. This build implements version `4`, declared in
 
 ## Limits
 
-- Maximum transfer size is 2 GiB, matching pTransfer. It is enforced against
-  the wire bytes as they are produced, so a selection whose payload crosses the
-  limit fails while it is being generated and sent.
+- Maximum transfer size is 2 GiB, matching pTransfer. The selected input is
+  checked before sending, and both the encoded wire payload and decoded output
+  are checked as the transfer runs. A near-limit selection can therefore pass
+  the input check but fail if deflate or ZIP overhead pushes its wire form over
+  the limit.
 - Received ZIPs are not auto-extracted, matching the web app.
 - No resume support.
 - No QR support.

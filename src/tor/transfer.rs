@@ -2,8 +2,9 @@
 //!
 //! The sender publishes a throwaway onion service and mints a one-time
 //! password. Those two strings are the whole rendezvous: the receiver needs no
-//! relay, no account, and nothing else the sender did not hand it. Everything
-//! after the connection is the shared choreography in [`crate::transfer`],
+//! signaling relay, no account, and nothing else the sender did not hand it.
+//! Tor relays still carry the circuits. Everything after the connection is the
+//! shared choreography in [`crate::transfer`],
 //! keyed by the handshake in [`super::handshake`] and framed by
 //! [`super::wire`].
 //!
