@@ -333,14 +333,28 @@ impl NostrClient {
     /// Tor, the other is a pool that is community-maintained and monitored by
     /// nobody.
     async fn connect_anonymous(keys: Keys) -> Result<Self> {
-        use crate::signaling::anonymous::{
-            ANONYMOUS_SIGNALING_RELAYS, OnionSignalingTransport, normalize_onion_relay_url,
-        };
+        use crate::signaling::anonymous::ANONYMOUS_SIGNALING_RELAYS;
 
         crate::ui::status("Starting the Tor client for anonymous signaling...");
         let tor = std::sync::Arc::new(crate::tor::TorClient::bootstrap().await.context(
             "Anonymous signaling could not reach the Tor network",
         )?);
+        Self::connect_anonymous_with(keys, tor, ANONYMOUS_SIGNALING_RELAYS).await
+    }
+
+    /// Connect to an onion-service relay pool on a Tor client the caller
+    /// already has.
+    ///
+    /// Code Exchange's anonymous fallback bootstraps its own client behind the
+    /// exchange and later publishes an onion service on it, so it arrives here
+    /// holding one. A bootstrap is the slow part of that whole path; doing a
+    /// second one for the control channel would double it for nothing.
+    pub async fn connect_anonymous_with(
+        keys: Keys,
+        tor: std::sync::Arc<crate::tor::TorClient>,
+        pool: &[&str],
+    ) -> Result<Self> {
+        use crate::signaling::anonymous::{OnionSignalingTransport, normalize_onion_relay_url};
 
         let client = Client::builder()
             .signer(keys.clone())
@@ -349,11 +363,11 @@ impl NostrClient {
         // Every URL is put through the onion validator before it reaches a
         // socket, so no relay list can pull an anonymous session onto one that
         // would reveal this device's IP address.
-        for relay in ANONYMOUS_SIGNALING_RELAYS {
+        for relay in pool {
             normalize_onion_relay_url(relay)
                 .with_context(|| format!("Unusable onion relay URL {relay}"))?;
         }
-        let relays = add_relays(&client, ANONYMOUS_SIGNALING_RELAYS).await?;
+        let relays = add_relays(&client, pool).await?;
 
         client.connect().await;
         wait_for_any_onion_relay(&client).await?;

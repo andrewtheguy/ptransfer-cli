@@ -1,10 +1,10 @@
 //! ptransfer-cli: the pTransfer command-line client for peer-to-peer file transfer.
 //!
-//! Running with no arguments launches the full-screen TUI wizard. It covers PIN
-//! Exchange and Tor onion transfers; Code Exchange is
-//! shown in the mode list but is not implemented. The `test` subcommand exposes
-//! PIN Exchange as a non-interactive plain-text mode for testing. QR support is
-//! intentionally not part of this CLI.
+//! Running with no arguments launches the full-screen TUI wizard, which covers
+//! all three transfer modes. The `code` and `tor` subcommands run Code Exchange
+//! and the onion transport non-interactively, and the `test` subcommand exposes
+//! PIN Exchange the same way for testing. QR support is intentionally not part
+//! of this CLI: Code Exchange codes are copied and pasted as text.
 //! Build with: cargo build --release
 
 use anyhow::Result;
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use ptransfer_cli::tor;
 use ptransfer_cli::crypto::pin::PinKind;
 use ptransfer_cli::util::{OnConflict, is_interrupted};
-use ptransfer_cli::{archive, tui, webrtc};
+use ptransfer_cli::{archive, code, tui, webrtc};
 
 #[derive(Parser)]
 #[command(name = "ptransfer")]
@@ -37,6 +37,16 @@ enum Commands {
         verbose: bool,
     },
 
+    /// Code Exchange: hand-carried offer and response codes
+    Code {
+        #[command(subcommand)]
+        command: CodeCommands,
+
+        /// Use verbose logging
+        #[arg(short, long, global = true)]
+        verbose: bool,
+    },
+
     /// Tor onion-service transport (experimental)
     Tor {
         #[command(subcommand)]
@@ -45,6 +55,64 @@ enum Commands {
         /// Use verbose logging
         #[arg(short, long, global = true)]
         verbose: bool,
+    },
+}
+
+/// File transfer with no signaling server: the sender's offer and the
+/// receiver's response are carried by hand, as base64 text.
+///
+/// The web app can carry the same codes as QR grids; this CLI does not, since
+/// there is no camera at a terminal. Codes go to stdout and everything else to
+/// stderr, so either side can be piped.
+#[derive(Subcommand)]
+enum CodeCommands {
+    /// Show an offer code, then take the receiver's response.
+    ///
+    /// Multiple inputs are bundled into one ZIP.
+    Send {
+        /// Files and/or directories to send
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
+
+        /// Fall back to Tor when no direct connection can be made
+        /// (experimental).
+        ///
+        /// Changes nothing about the exchange itself. If the direct WebRTC
+        /// route fails, the file goes over a temporary onion service this
+        /// process publishes, coordinated over onion-service Nostr relays —
+        /// with no address and no password for anyone to carry, both being
+        /// derived from the exchange. Caps the transfer at 100 MiB, needs
+        /// internet on both devices, and starts a Tor bootstrap as soon as the
+        /// code is shown. Without it, a failed direct route ends the transfer.
+        #[arg(long)]
+        anonymous: bool,
+    },
+
+    /// Take a sender's offer code, then show the response to give back.
+    ///
+    /// The offer is read from stdin — a prompt at a terminal, one line from a
+    /// pipe. There is no flag for the anonymous fallback: the code says
+    /// whether the sender selected it.
+    Receive {
+        /// Output directory (defaults to the current directory)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Replace the destination file if it already exists (default: fail)
+        #[arg(long)]
+        overwrite: bool,
+
+        /// Answer as if no direct connection were possible, so the transfer
+        /// takes the sender's fallback.
+        ///
+        /// The response goes back with none of this device's network routes in
+        /// it, which is the situation a device behind a hostile NAT is in
+        /// anyway — the only way to exercise the fallback from a network where
+        /// a direct connection would succeed. Refused for a code whose sender
+        /// selected no fallback, since that would only kill a working
+        /// transfer.
+        #[arg(long)]
+        simulate_no_direct: bool,
     },
 }
 
@@ -229,6 +297,45 @@ async fn async_main() -> Result<()> {
             }
         }
 
+        Some(Commands::Code { command, verbose }) => {
+            // An anonymous fallback can spend minutes inside a Tor bootstrap
+            // saying nothing, so keep info-level progress on by default, as the
+            // `tor` subcommand does. RUST_LOG still overrides.
+            init_logging(if verbose {
+                "debug"
+            } else {
+                "info,webrtc_ice=error"
+            });
+
+            match command {
+                CodeCommands::Send { paths, anonymous } => {
+                    let source =
+                        tokio::task::spawn_blocking(move || archive::prepare_send_source(&paths))
+                            .await??;
+                    code::send_file_code(&source, anonymous).await
+                }
+
+                CodeCommands::Receive {
+                    output,
+                    overwrite,
+                    simulate_no_direct,
+                } => {
+                    let on_conflict = if overwrite {
+                        OnConflict::Overwrite
+                    } else {
+                        OnConflict::Fail
+                    };
+                    // Read like a secret rather than taken as an argument: the
+                    // offer is the secret for the whole transfer, and an
+                    // argument is readable in the process list for as long as
+                    // the receiver runs.
+                    let offer = read_secret("Sender code", "sender code").await?;
+                    code::receive_file_code(&offer, output, on_conflict, simulate_no_direct)
+                        .await
+                }
+            }
+        }
+
         Some(Commands::Tor { command, verbose }) => {
             // Bootstrapping from an empty directory cache takes a while and
             // says nothing on stdout, so keep info-level progress on by
@@ -327,6 +434,70 @@ mod tests {
         assert!(Cli::try_parse_from(["ptransfer", "test", "receive", "PIN123"]).is_err());
         assert!(
             Cli::try_parse_from(["ptransfer", "test", "receive", "PIN123", "--overwrite"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn code_send_takes_multiple_paths_and_the_anonymous_option() {
+        let cli = Cli::try_parse_from([
+            "ptransfer", "code", "send", "a.txt", "b", "dir", "--anonymous",
+        ])
+        .unwrap();
+        let Some(Commands::Code {
+            command: CodeCommands::Send { paths, anonymous },
+            ..
+        }) = cli.command
+        else {
+            panic!("expected code send");
+        };
+        assert_eq!(paths.len(), 3);
+        assert!(anonymous);
+
+        assert!(Cli::try_parse_from(["ptransfer", "code", "send"]).is_err());
+    }
+
+    /// The sender's code is the secret for the whole transfer, so it follows
+    /// the same rule every other secret does: stdin, never an argument.
+    #[test]
+    fn code_receive_never_takes_the_sender_code_as_an_argument() {
+        assert!(Cli::try_parse_from(["ptransfer", "code", "receive"]).is_ok());
+        assert!(Cli::try_parse_from(["ptransfer", "code", "receive", "UFQwMabc"]).is_err());
+
+        // The receiving side is told which fallback to expect by the code
+        // itself, so there is deliberately no anonymous flag here.
+        assert!(Cli::try_parse_from(["ptransfer", "code", "receive", "--anonymous"]).is_err());
+    }
+
+    #[test]
+    fn code_receive_parses_its_options() {
+        let cli = Cli::try_parse_from([
+            "ptransfer",
+            "code",
+            "receive",
+            "--overwrite",
+            "--simulate-no-direct",
+        ])
+        .unwrap();
+        let Some(Commands::Code {
+            command:
+                CodeCommands::Receive {
+                    overwrite,
+                    simulate_no_direct,
+                    ..
+                },
+            ..
+        }) = cli.command
+        else {
+            panic!("expected code receive");
+        };
+        assert!(overwrite);
+        assert!(simulate_no_direct);
+
+        // Simulating a dead route is the receiver's affordance alone: the
+        // sending side has nothing to pretend about.
+        assert!(
+            Cli::try_parse_from(["ptransfer", "code", "send", "a.txt", "--simulate-no-direct"])
                 .is_err()
         );
     }

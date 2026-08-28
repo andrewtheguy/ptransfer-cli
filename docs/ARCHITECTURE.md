@@ -9,18 +9,20 @@ implements version `4` (`package.metadata.ptransfer-protocol-version`). This
 document describes how the CLI realizes that contract; where the two disagree,
 the spec wins.
 
-The web app's Code Exchange — hand-carried QR/clipboard offer and answer codes —
-is deliberately outside that contract while it is still taking shape, and is not
-implemented here. PIN exchange is the CLI's only relay-signaled mode; the Tor
-onion transport below is the other transfer mode, and it rendezvouses on the
-onion address itself rather than through any signaling relay. The wizard's
-send mode menu still lists Code Exchange in the web app's position, so a mode's
-number means the same thing in both interfaces; selecting it reports that it is
-not implemented and goes no further.
+Three transfer modes reach the same transfer layer. **PIN Exchange** is the
+only relay-signaled one. **Code Exchange** has no signaling server at all: the
+offer and the response are carried by a person, and this CLI carries them as
+base64 text, since there is no camera at a terminal to read the QR half the web
+app also offers. The **Tor onion transport** rendezvouses on the onion address
+itself. Code Exchange and the Tor transport have their own wire contracts,
+outside `INTEROP_PROTOCOL.md` and versioned separately — see the sections
+below.
 
-That menu belongs to the sending side alone. The receiving side is handed one
-value and the modes are distinguishable by it — a 12- or 16-character PIN, or a
-v3 onion address with a valid checksum — so the wizard classifies what was
+The wizard's send mode menu lists the three in the web app's order, so a mode's
+number means the same thing in both interfaces. That menu belongs to the
+sending side alone. The receiving side is handed one value and the modes are
+distinguishable by it — a 12- or 16-character PIN, a v3 onion address with a
+valid checksum, or a PT01 sender code — so the wizard classifies what was
 pasted rather than asking, as the web app's receive screen does. Only the Tor
 mode then needs a second input, its one-time password.
 
@@ -244,6 +246,116 @@ Publishes go to the relays that have a socket open, so one relay that is still
 connecting cannot hold every event for its `OK` timeout after another relay has
 already accepted it.
 
+## Code Exchange
+
+The wire contract is the web app's
+[`docs/CODE_EXCHANGE_PROTOCOL.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/CODE_EXCHANGE_PROTOCOL.md),
+which specifies the PT01 container, the payload fields, the ECDH key schedule,
+both transcript digests, and the anonymous fallback's rendezvous — deliberately
+outside `INTEROP_PROTOCOL.md` and versioned separately, by the container's own
+`PT01` magic. Its direct transfer does use that document's §7, the shared
+data-channel layer. Either side of a transfer may be this CLI or a browser tab.
+
+This section describes only what is specific to the CLI's realization of it.
+
+**Text, never QR.** The mode's two codes are carried by hand, and a terminal
+has one way to do that: `ptransfer code send` prints the offer to **stdout**
+and reads the response from **stdin**, and `ptransfer code receive` does the
+reverse, so either side pipes cleanly. Everything else — status, prompts,
+progress — goes to stderr. The wizard shows a code full-screen, offers it to
+the system clipboard over OSC 52, and takes the response by bracketed paste.
+The web app's multi-QR offer path is not implemented and does not need to be:
+both sides carry the same container, and the copy/paste half is enough to
+transfer with a browser on the other end.
+
+**Modules.** `src/code/payload.rs` is the container — obfuscation, validation,
+and the two transcript digests; `keys.rs` is the ECDH agreement and every
+derivation off it; `sender.rs` and `receiver.rs` are the two halves of the
+exchange; `control.rs` and `relay.rs` are the anonymous fallback.
+
+**The response is the confirmation step.** Nothing enters the sending side
+except through its operator's own paste, and what is pasted is checked before
+it is acted on: the tag inside the response is recomputed from this offer's
+bytes and the response's own fields and compared in constant time, before a
+signal is applied, the content key is derived, or a byte moves. A response to
+another transfer, an old one pasted again, and one altered on the way back are
+all refused with the same message rather than turning into a connection that
+never opens.
+
+**Fallbacks: one of the web app's two.** An offer minted here never names
+clearnet relays, because the CLI does not implement the Nostr file relay those
+would exist for and an offer that named them would promise a receiver a path
+this side cannot walk. A web offer that *does* name them is still taken — the
+direct path is identical — but a failed direct route ends the transfer here
+rather than moving onto them. What is implemented is the **anonymous** fallback
+(`code send --anonymous`, or the wizard's `a` toggle on the Code Exchange row):
+the control channel on the onion-service relay pool of *Anonymous Signaling*
+above, and the file over a temporary onion service published on the same Tor
+client, using the transport below unchanged.
+
+**Nothing extra is handed over for it.** The Tor transport's two rendezvous
+values are the password and the address. The password is derived from the ECDH
+secret on both devices and never transmitted; `derive_pake_secret` takes an
+opaque string, so derived key material drops into the same handshake with
+nothing about it changed. The address cannot be derived — Arti mints an
+ephemeral service identity — so it is announced over the sealed control
+channel, and only after a response was accepted and verified. That ordering is
+the security property: the sender cannot reach the shared secret before it
+holds the receiver's public key, so until its operator pastes a response there
+is nothing published and no password that would open the handshake.
+
+**One Tor client, bootstrapped early.** A bootstrap is minutes, so
+`code send --anonymous` starts one the moment it has a code to show and an
+anonymous offer starts one on the receiving side as the code is taken in —
+behind the direct attempt rather than after it fails. The same client carries
+the control channel's relay sockets and publishes the onion service;
+`NostrClient::connect_anonymous_with` exists so the second of those does not
+pay for a second bootstrap. A transfer that connects directly drops the
+bootstrap unused, having published nothing.
+
+**The response stays up until the sender turns up.** A dead direct route —
+real or simulated — does not take the response off the screen. The sender has
+not taken it in yet, so it is still the only thing the transfer is waiting on,
+and the fallback runs behind it: the control channel is opened, the `hello`
+goes out, and the wait for the sender's announcement is the wait for the code
+to be handed over, bounded by the session's own hour rather than by a
+connection timeout. The code comes down at the moment the sender appears — the
+data channel opening on the direct route, the onion announcement on the
+fallback — which is the same point the web app's response page gives way, and
+for the same reason. While it is up, the overlay carries the last few status
+lines beneath the code, because it covers the log and a Tor client that is
+still bootstrapping is the other half of what its reader needs to know.
+
+**Status lines are addressed, not positional.** `ui::status_step` returns a
+handle that rewrites its own line ("Fetching the Tor directory..." → "Fetched
+the Tor directory (36.5 s)"), keyed by an id the TUI matches against the rows
+it holds. Steps overlap here — the Tor bootstrap reports from a background task
+while the foreground reports its own progress — and a "replace the last line"
+rule made them overwrite each other, leaving a log that read as a sequence that
+never happened.
+
+**Windows.** The sender gives the direct route 20 seconds when it has a
+fallback and 120 when it does not; the receiver gives it 120 either way, since
+its wait starts before the sender has even seen the response. These are local
+policy, not contract.
+
+**Exercising the fallback.** `code receive --simulate-no-direct` builds the
+response with an empty candidate list and drops the peer connection before the
+sender can reach it, so the sender's direct attempt fails the way it would
+behind a hostile NAT and the fallback runs for real. It is refused for a code
+that selected no fallback, where it would only kill a working transfer. The web
+app offers the same affordance on its response page, which is what lets the two
+implementations test the Tor path against each other on a network where a
+direct connection would otherwise always succeed.
+
+The wizard has it too, as a `Tab` toggle on the receive box, and only while
+what is in that box decodes to an offer that named the fallback — the same
+condition the web app hides the option behind. The web app puts it under the
+response's advanced options and rebuilds a live connection when it is used;
+the wizard asks a keystroke earlier, before anything has been started, so
+arming it needs no teardown. The flag is refused rather than hidden on the
+command line, because there the code is read after the option.
+
 ## Tor Onion Transport
 
 The wire contract is the web app's
@@ -392,8 +504,12 @@ enforces the limit against actual output and seals the final length in `DONE`.
 ## Scope
 
 The CLI intentionally has no legacy signaling protocol, no resume path, no QR
-support, no Code Exchange, no relay discovery, and no custom fallback mode. The
-Tor transport interoperates with the web app in both directions and is capped at
-100 MiB per transfer, with no resume. Anonymous signaling interoperates in both
-directions too and is experimental on both sides: it changes which relays carry
-the handshake and nothing else, so it inherits every limit above.
+support, no relay discovery, and no custom fallback mode. Code Exchange's codes
+are therefore text only, and its clearnet Nostr file-relay fallback — which
+would need relay discovery — is not implemented, so an offer minted here names
+no relays and a failed direct route ends the transfer. The Tor transport
+interoperates with the web app in both directions and is capped at 100 MiB per
+transfer, with no resume; Code Exchange's anonymous fallback runs over it and
+inherits that cap. Anonymous signaling interoperates in both directions too and
+is experimental on both sides: it changes which relays carry the handshake and
+nothing else, so it inherits every limit above.

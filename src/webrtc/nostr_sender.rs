@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -128,11 +128,10 @@ pub async fn send_file_nostr(source: &SendSource, pin_kind: PinKind) -> Result<(
     // signaling and content comes from the SPAKE2 run itself — each PIN
     // generation carries fresh ephemeral scalars, so there is no key pair to
     // keep across rotations.
-    let step = Instant::now();
-    ui::status("Preparing secure keys...");
+    let step = ui::status_step("Preparing secure keys...");
     let salt = generate_salt()?;
     let transfer_id = generate_transfer_id()?;
-    ui::status_timed("Prepared secure keys", step.elapsed());
+    step.done("Prepared secure keys");
 
     // File metadata never touches the rendezvous; it travels inside the sealed
     // confirm and is bound into the confirmation code through its own digest.
@@ -145,14 +144,13 @@ pub async fn send_file_nostr(source: &SendSource, pin_kind: PinKind) -> Result<(
     };
     let metadata_hash = compute_transfer_metadata_hash(&metadata)?;
 
-    let step = Instant::now();
-    ui::status("Connecting to Nostr relays...");
+    let step = ui::status_step("Connecting to Nostr relays...");
     let client = NostrClient::connect(Keys::generate(), pin_kind).await?;
     let sender_pubkey = client.public_key();
-    ui::status_timed(
-        &format!("Connected to Nostr relays ({})", client.relays().len()),
-        step.elapsed(),
-    );
+    step.done(&format!(
+        "Connected to Nostr relays ({})",
+        client.relays().len()
+    ));
 
     let rendezvous = RendezvousContext {
         client: &client,
@@ -209,10 +207,9 @@ pub async fn send_file_nostr(source: &SendSource, pin_kind: PinKind) -> Result<(
         None,
         None,
     )?;
-    let step = Instant::now();
-    ui::status("Publishing confirmation to Nostr...");
+    let step = ui::status_step("Publishing confirmation to Nostr...");
     client.publish(&confirm_event).await?;
-    ui::status_timed("Published confirmation to Nostr", step.elapsed());
+    step.done("Published confirmation to Nostr");
 
     wait_for_confirmation_code(&expected_confirmation_code).await?;
 
@@ -233,8 +230,7 @@ pub async fn send_file_nostr(source: &SendSource, pin_kind: PinKind) -> Result<(
     let mut notifications = client.notifications();
     let sub_id = client.subscribe(signal_filter.clone()).await?;
 
-    let step = Instant::now();
-    ui::status("Publishing P2P offer to Nostr...");
+    let step = ui::status_step("Publishing P2P offer to Nostr...");
     publish_offer_and_candidates(
         &client,
         &sender_pubkey,
@@ -244,7 +240,7 @@ pub async fn send_file_nostr(source: &SendSource, pin_kind: PinKind) -> Result<(
         &session_keys.signals,
     )
     .await?;
-    ui::status_timed("Published P2P offer to Nostr", step.elapsed());
+    step.done("Published P2P offer to Nostr");
 
     let peer = Arc::new(peer);
     let mut seen = HashSet::new();
@@ -273,8 +269,7 @@ pub async fn send_file_nostr(source: &SendSource, pin_kind: PinKind) -> Result<(
         while !answer_set {
             tokio::select! {
                 _ = retry_interval.tick() => {
-                    let step = Instant::now();
-                    ui::status("Republishing P2P offer to Nostr...");
+                    let step = ui::status_step("Republishing P2P offer to Nostr...");
                     publish_offer_and_candidates(
                         &client,
                         &sender_pubkey,
@@ -283,7 +278,7 @@ pub async fn send_file_nostr(source: &SendSource, pin_kind: PinKind) -> Result<(
                         &candidates,
                         &session_keys.signals,
                     ).await?;
-                    ui::status_timed("Republished P2P offer to Nostr", step.elapsed());
+                    step.done("Republished P2P offer to Nostr");
                 }
                 event = next_event(&mut notifications) => {
                     let event = event?;

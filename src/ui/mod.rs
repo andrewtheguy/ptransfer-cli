@@ -11,8 +11,9 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -37,12 +38,23 @@ pub enum FileExistsChoice {
 /// What a transfer flow reports while running, for the TUI to render.
 #[derive(Debug)]
 pub enum UiEvent {
-    Status(String),
-    /// A newer form of the most recent [`UiEvent::Status`] line — its progress
-    /// while it runs, or its completion ("Doing X..." → "Did X (elapsed)").
-    /// The TUI replaces that line instead of appending, so a step that reports
-    /// a hundred times still costs one row.
-    StatusDone(String),
+    Status {
+        /// Identifies the line, so a later revision can find it again.
+        id: u64,
+        line: String,
+    },
+    /// The finished form of the [`UiEvent::Status`] line with this `id`
+    /// ("Doing X..." → "Did X (elapsed)"). The TUI rewrites that line instead
+    /// of appending, so a step costs one row however long it took.
+    ///
+    /// Keyed by id rather than "the last line", because steps overlap: the Tor
+    /// bootstrap reports from a background task while the foreground is
+    /// reporting its own, and the two would otherwise overwrite each other's
+    /// rows and leave a log nobody can read a sequence out of.
+    StatusReplace {
+        id: u64,
+        line: String,
+    },
     Progress {
         dir: Direction,
         bytes: u64,
@@ -67,6 +79,18 @@ pub enum UiEvent {
     },
     /// The onion descriptor is published, so the address is now reachable.
     TorPublished,
+    /// A Code Exchange code the operator has to carry to the other device:
+    /// the sender's offer, or the receiver's response.
+    ShowCode {
+        label: String,
+        code: String,
+    },
+    /// The code has been acted on and is no longer worth showing.
+    HideCode,
+    /// Sender-side request for the response the receiver is showing.
+    ResponseCodeInput {
+        reply: oneshot::Sender<String>,
+    },
     /// Receiver-side code the user must read to the sender.
     ShowConfirmationCode(String),
     HideConfirmationCode,
@@ -118,37 +142,64 @@ fn sink() -> Option<&'static mpsc::UnboundedSender<UiEvent>> {
     TUI_SINK.get()
 }
 
+/// Ids for status lines. A counter rather than a position, so a line can still
+/// be found after other steps have reported over it.
+static NEXT_STATUS_ID: AtomicU64 = AtomicU64::new(0);
+
+fn next_status_id() -> u64 {
+    NEXT_STATUS_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Informational status line (stderr).
 pub fn status(line: &str) {
     if let Some(tx) = sink() {
-        let _ = tx.send(UiEvent::Status(line.to_string()));
+        let _ = tx.send(UiEvent::Status {
+            id: next_status_id(),
+            line: line.to_string(),
+        });
     } else {
         eprintln!("{line}");
     }
 }
 
-/// Informational status line with elapsed time, completing the step announced
-/// by the preceding [`status`] call.
-pub fn status_timed(line: &str, elapsed: Duration) {
-    let full = format!("{line} ({})", format_elapsed(elapsed));
-    if let Some(tx) = sink() {
-        let _ = tx.send(UiEvent::StatusDone(full));
-    } else {
-        eprintln!("{full}");
-    }
-}
-
-/// Replace the most recent status line with a newer form of the same step.
+/// A status line that will be rewritten in place when its step reports again.
 ///
-/// For a long step whose only news is that it is still going. The TUI
-/// overwrites the row it already has, so a minute of Tor bootstrap progress
-/// costs one line rather than a scrolling wall of them; without a sink each
-/// update is its own line on stderr, which is why callers throttle.
-pub fn status_update(line: &str) {
+/// Held by the step it announces, so "Fetching the Tor directory..." becomes
+/// "Fetched the Tor directory (36.5 s)" on the row it was written to, however
+/// many other steps reported in between. Without a sink there is no row to
+/// rewrite and the completion is simply a second line on stderr.
+#[must_use = "a step that is never completed leaves its line saying it is still running"]
+pub struct StatusStep {
+    id: u64,
+    started: Instant,
+}
+
+/// Announce a step and keep hold of its line.
+pub fn status_step(line: &str) -> StatusStep {
+    let id = next_status_id();
     if let Some(tx) = sink() {
-        let _ = tx.send(UiEvent::StatusDone(line.to_string()));
+        let _ = tx.send(UiEvent::Status {
+            id,
+            line: line.to_string(),
+        });
     } else {
         eprintln!("{line}");
+    }
+    StatusStep {
+        id,
+        started: Instant::now(),
+    }
+}
+
+impl StatusStep {
+    /// Rewrite the step's line as finished, with how long it took.
+    pub fn done(self, line: &str) {
+        let line = format!("{line} ({})", format_elapsed(self.started.elapsed()));
+        if let Some(tx) = sink() {
+            let _ = tx.send(UiEvent::StatusReplace { id: self.id, line });
+        } else {
+            eprintln!("{line}");
+        }
     }
 }
 
@@ -242,6 +293,67 @@ pub fn tor_published() {
     // The line callers script against: nothing can connect before it.
     println!("ready");
     let _ = std::io::stdout().flush();
+}
+
+/// Present a Code Exchange code for the operator to carry.
+///
+/// The code goes to stdout and everything else to stderr, so a piped run
+/// captures the code alone — it is a couple of kilobytes of base64, which is
+/// worth redirecting rather than reading.
+pub fn show_code(label: &str, code: &str) {
+    if let Some(tx) = sink() {
+        let _ = tx.send(UiEvent::ShowCode {
+            label: label.to_string(),
+            code: code.to_string(),
+        });
+        return;
+    }
+    eprintln!("{label}");
+    println!("{code}");
+    let _ = std::io::stdout().flush();
+}
+
+/// Stop showing a code that has been acted on. Plain mode prints nothing: the
+/// code is already scrolled into the terminal's history, where it is harmless
+/// once the session it belongs to has moved on.
+pub fn hide_code() {
+    if let Some(tx) = sink() {
+        let _ = tx.send(UiEvent::HideCode);
+    }
+}
+
+/// Read the receiver's response code, which is Code Exchange's confirmation
+/// step: nothing enters this session unless the operator puts it there.
+pub async fn prompt_response_code() -> Result<String> {
+    if let Some(tx) = sink() {
+        let (reply, rx) = oneshot::channel();
+        tx.send(UiEvent::ResponseCodeInput { reply })
+            .map_err(|_| anyhow!("TUI closed"))?;
+        return rx.await.map_err(|_| anyhow!("TUI closed"));
+    }
+
+    eprint!("Paste the receiver's response code: ");
+    std::io::stderr().flush()?;
+    // A detached OS thread, for the same reason the confirmation prompt uses
+    // one: Tokio's blocking pool waits for a stuck stdin read when the runtime
+    // is dropped, and this read has no deadline over it.
+    let (reply, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let mut input = String::new();
+        let result = std::io::stdin()
+            .read_line(&mut input)
+            .map_err(anyhow::Error::from)
+            .and_then(|_| {
+                let input = input.trim();
+                if input.is_empty() {
+                    Err(anyhow!("no response code entered"))
+                } else {
+                    Ok(input.to_string())
+                }
+            });
+        let _ = reply.send(result);
+    });
+    rx.await.map_err(|_| anyhow!("response code input closed"))?
 }
 
 /// Display the ECDH-derived code the receiver must read to the sender.

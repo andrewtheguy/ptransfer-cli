@@ -116,10 +116,9 @@ pub async fn receive_file_nostr(
         .map(|offset| pin_hint_for_bucket(&locator, current_bucket.saturating_sub(offset)))
         .collect();
 
-    let step = Instant::now();
-    ui::status("Connecting to Nostr relays...");
+    let step = ui::status_step("Connecting to Nostr relays...");
     let client = NostrClient::connect(Keys::generate(), pin_kind).await?;
-    ui::status_timed("Connected to Nostr relays", step.elapsed());
+    step.done("Connected to Nostr relays");
 
     ui::status("Searching for sender...");
     let candidates = find_rendezvous_candidates(&client, &hints).await?;
@@ -262,8 +261,7 @@ pub async fn receive_file_nostr(
     let answer_sdp = advertise_max_message_size(answer.sdp);
     let candidates = candidate_strings(candidates)?;
 
-    let step = Instant::now();
-    ui::status("Publishing P2P answer to Nostr...");
+    let step = ui::status_step("Publishing P2P answer to Nostr...");
     publish_answer_and_candidates(
         &client,
         &sender_pubkey,
@@ -273,7 +271,7 @@ pub async fn receive_file_nostr(
         &session_keys.signals,
     )
     .await?;
-    ui::status_timed("Published P2P answer to Nostr", step.elapsed());
+    step.done("Published P2P answer to Nostr");
 
     let peer = Arc::new(peer);
     let mut answer_retry = tokio::time::interval(ANSWER_RETRY_INTERVAL);
@@ -286,8 +284,7 @@ pub async fn receive_file_nostr(
     let data_channel = loop {
         tokio::select! {
             _ = answer_retry.tick() => {
-                let step = Instant::now();
-                ui::status("Republishing P2P answer to Nostr...");
+                let step = ui::status_step("Republishing P2P answer to Nostr...");
                 publish_answer_and_candidates(
                     &client,
                     &sender_pubkey,
@@ -296,7 +293,7 @@ pub async fn receive_file_nostr(
                     &candidates,
                     &session_keys.signals,
                 ).await?;
-                ui::status_timed("Republished P2P answer to Nostr", step.elapsed());
+                step.done("Republished P2P answer to Nostr");
             }
             maybe_channel = data_channel_rx.recv() => {
                 break maybe_channel.context("Sender never opened a data channel")?;
@@ -328,8 +325,7 @@ pub async fn receive_file_nostr(
         tokio::select! {
             result = &mut open => break result?,
             _ = answer_retry.tick() => {
-                let step = Instant::now();
-                ui::status("Republishing P2P answer to Nostr...");
+                let step = ui::status_step("Republishing P2P answer to Nostr...");
                 publish_answer_and_candidates(
                     &client,
                     &sender_pubkey,
@@ -338,7 +334,7 @@ pub async fn receive_file_nostr(
                     &candidates,
                     &session_keys.signals,
                 ).await?;
-                ui::status_timed("Republished P2P answer to Nostr", step.elapsed());
+                step.done("Republished P2P answer to Nostr");
             }
             event = next_event(&mut notifications) => {
                 let event = event?;
@@ -397,13 +393,12 @@ async fn find_rendezvous_candidates(
     client: &NostrClient,
     hints: &[String],
 ) -> Result<Vec<RendezvousCandidate>> {
-    let step = Instant::now();
-    ui::status("Fetching rendezvous events from Nostr...");
+    let step = ui::status_step("Fetching rendezvous events from Nostr...");
     let mut events = client.fetch(rendezvous_filter(hints)).await?;
-    ui::status_timed(
-        &format!("Fetched {} candidate rendezvous event(s)", events.len()),
-        step.elapsed(),
-    );
+    step.done(&format!(
+        "Fetched {} candidate rendezvous event(s)",
+        events.len()
+    ));
 
     if events.is_empty() {
         bail!(
@@ -613,8 +608,7 @@ async fn wait_for_confirm(
     // above stays valid for every claim this wait can accumulate.
     let rendezvous_sub_id = client.subscribe(rendezvous_filter(hints)).await?;
 
-    let step = Instant::now();
-    ui::status("Publishing claim to Nostr...");
+    let step = ui::status_step("Publishing claim to Nostr...");
     // Most candidates are hint collisions or forgeries; only one can be our
     // sender, and we cannot tell which. A relay refusing any single claim (a
     // burst of up to MAX_CLAIM_CANDIDATES events invites rate limiting) must
@@ -634,7 +628,7 @@ async fn wait_for_confirm(
             .unwrap_or_else(|| anyhow::anyhow!("no claim was published"))
             .context("Failed to publish any claim to Nostr"));
     }
-    ui::status_timed("Published claim to Nostr", step.elapsed());
+    step.done("Published claim to Nostr");
 
     ui::status("Waiting for the sender to verify...");
     let mut seen = HashSet::new();
