@@ -264,7 +264,8 @@ transfer then has no fallback rather than a broken one.
 
 What those probes learn is kept between runs, the way the web app keeps it in
 IndexedDB: a relay cache of every relay discovered, when it was last probed,
-whether it passed, and how fast, good for 24 hours. A later transfer leads its
+whether it passed, and how fast. A relay that passed stays cached until it
+fails; failures and unprobed listings expire after seven days. A later transfer leads its
 candidate list with relays already proven, so it fills its ring from the first
 batch instead of sampling the population again, and successive transfers
 rotate through the proven relays rather than all landing on the same few.
