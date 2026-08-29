@@ -31,6 +31,11 @@ use crate::webrtc::{add_ice_candidate_safely, advertise_max_message_size, candid
 
 use super::control::seconds;
 use super::keys::CodeKeyPair;
+use super::nostr_file::RELAY_MAX_BYTES;
+use super::nostr_file::codec::PayloadCompression;
+use super::nostr_file::pool::FilePool;
+use super::nostr_file::relay_pool::{PreparedRing, resolve_control_relays};
+use super::nostr_file::upload::{RelaySource, SendContext, send_over_relays};
 use super::payload::{
     self, PayloadKind, SignalingPayload, TRANSFER_EXPIRATION_MS, now_ms,
 };
@@ -47,9 +52,11 @@ const FALLBACK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Send `source` over Code Exchange.
 ///
-/// `anonymous` is the sender's switch and the only thing that decides which
-/// fallback this transfer has: it goes into the offer, and the receiving side
-/// reads it from there rather than being told separately.
+/// `anonymous` is the sender's switch, and the only thing that decides which
+/// of the two fallbacks this transfer has: it goes into the offer, and the
+/// receiving side reads it from there rather than being told separately. An
+/// ordinary transfer gets the clearnet one, on relays proven here and named in
+/// the code.
 pub async fn send_file_code(source: &SendSource, anonymous: bool) -> Result<()> {
     check_size(source, anonymous)?;
 
@@ -60,6 +67,19 @@ pub async fn send_file_code(source: &SendSource, anonymous: bool) -> Result<()> 
     let tor = anonymous.then(|| {
         ui::status("Starting the Tor client for the anonymous fallback...");
         tokio::spawn(async { TorClient::bootstrap().await.map(Arc::new) })
+    });
+
+    // The clearnet fallback's relays are proven before the code exists,
+    // because the code is what names them: a receiver has no other way to
+    // learn where the control channel lives. It runs behind ICE gathering,
+    // which is the one other thing the code waits on.
+    let relay_probe = relay_eligible(source, anonymous).then(|| {
+        let pool = Arc::new(FilePool::new());
+        let probe = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move { resolve_control_relays(&pool, &|_, _| {}).await }
+        });
+        (pool, probe)
     });
 
     let salt = generate_salt()?;
@@ -77,6 +97,38 @@ pub async fn send_file_code(source: &SendSource, anonymous: bool) -> Result<()> 
     ui::status("Gathering network candidates...");
     let candidates = candidate_strings(peer.gather_ice_candidates().await?)?;
 
+    // Whatever the probe proved, awaited only now: an offer names its relays
+    // or it has no clearnet fallback, and either way the code cannot be shown
+    // before that is settled.
+    let mut fallback = Fallback::None;
+    if let Some((pool, probe)) = relay_probe {
+        let step = ui::status_step("Proving Nostr relays for the fallback...");
+        match probe.await {
+            Ok(Ok(selection)) => {
+                let relays = selection.relays.clone();
+                step.done(&format!(
+                    "{} Nostr relays proven for the fallback",
+                    relays.len()
+                ));
+                // The storage ring is prepared behind the exchange, on the
+                // same pool: the code does not depend on it, and a direct
+                // connection simply leaves it unused.
+                let ring = PreparedRing::spawn(Arc::clone(&pool), relays.clone(), selection);
+                fallback = Fallback::Relays { pool, relays, ring };
+            }
+            Ok(Err(error)) => {
+                step.done("No Nostr relay fallback for this transfer");
+                log::info!("no relay fallback: {error:#}");
+                pool.shutdown().await;
+            }
+            Err(error) => {
+                step.done("No Nostr relay fallback for this transfer");
+                log::info!("the relay probe failed: {error}");
+                pool.shutdown().await;
+            }
+        }
+    }
+
     let offer_payload = SignalingPayload {
         kind: PayloadKind::Offer,
         sdp: advertise_max_message_size(offer.sdp),
@@ -89,10 +141,10 @@ pub async fn send_file_code(source: &SendSource, anonymous: bool) -> Result<()> 
         content_encoding: Some(source.wire_encoding),
         mime_type: Some(source.mime_type.to_string()),
         salt: Some(salt.to_vec()),
-        // This CLI never names clearnet relays: it does not implement the
-        // Nostr file-relay fallback they would exist for, and an offer that
-        // named them would promise a receiver a path this side cannot walk.
-        relays: None,
+        // Named only when they were proven: an offer that named relays this
+        // side had not reached would promise a receiver a path neither of them
+        // can walk.
+        relays: fallback.offer_relays(),
         anon: anonymous.then_some(true),
     };
     let offer_binary = payload::encode(&offer_payload)?;
@@ -106,19 +158,38 @@ pub async fn send_file_code(source: &SendSource, anonymous: bool) -> Result<()> 
         &payload::to_clipboard(&offer_binary),
     );
 
-    let answer = take_response(&offer_binary, &salt, &keys, created_at).await?;
+    // Every exit from here on lets go of the fallback: the ring being prepared
+    // behind this exchange holds a socket to every relay in it, and in the
+    // wizard — where the process does not end with the transfer — each one
+    // would reconnect for as long as it ran.
+    let answer = match take_response(&offer_binary, &salt, &keys, created_at).await {
+        Ok(answer) => answer,
+        Err(error) => {
+            fallback.discard().await;
+            return Err(error);
+        }
+    };
     ui::hide_code();
 
     ui::status("Response accepted. Establishing the connection...");
-    peer.set_remote_description(
-        RTCSessionDescription::answer(answer.sdp).context("Invalid answer SDP")?,
-    )
-    .await?;
-    for candidate in &answer.candidates {
-        add_ice_candidate_safely(&peer, candidate).await;
+    let applied = async {
+        peer.set_remote_description(
+            RTCSessionDescription::answer(answer.sdp.clone()).context("Invalid answer SDP")?,
+        )
+        .await?;
+        for candidate in &answer.candidates {
+            add_ice_candidate_safely(&peer, candidate).await;
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    if let Err(error) = applied {
+        fallback.discard().await;
+        return Err(error);
     }
 
-    let direct_window = if anonymous {
+    let has_fallback = anonymous || matches!(fallback, Fallback::Relays { .. });
+    let direct_window = if has_fallback {
         FALLBACK_ATTEMPT_TIMEOUT
     } else {
         CONNECTION_TIMEOUT
@@ -128,11 +199,13 @@ pub async fn send_file_code(source: &SendSource, anonymous: bool) -> Result<()> 
 
     match (opened, tor) {
         (Ok(raw), bootstrap) => {
-            // A transfer that connected directly published nothing through
-            // Tor, so a bootstrap still running behind it is simply dropped.
+            // A transfer that connected directly published nothing anywhere,
+            // so a bootstrap or a relay ring still being prepared behind it is
+            // simply dropped.
             if let Some(bootstrap) = bootstrap {
                 bootstrap.abort();
             }
+            fallback.discard().await;
             let info = peer.get_connection_info().await;
             ui::status(&format!("Connected via {}", info.connection_type));
             let mut messenger = DcMessenger::new(raw);
@@ -141,14 +214,57 @@ pub async fn send_file_code(source: &SendSource, anonymous: bool) -> Result<()> 
             let _ = peer.close().await;
             result?;
         }
-        // No fallback was selected, so a direct route was the whole transfer.
         (Err(error), None) => {
+            log::info!("the direct route did not open: {error:#}");
             let _ = peer.close().await;
-            return Err(error);
+            match fallback {
+                // The clearnet fallback: only now is the file read, hashed,
+                // and put on relays. Nothing was staged while a direct
+                // connection was still possible.
+                Fallback::Relays { pool, relays, ring } => {
+                    ui::status(
+                        "No direct connection — relaying the file through Nostr relays instead.",
+                    );
+                    let prepared = async {
+                        let data = source.materialize(RELAY_MAX_BYTES).await?;
+                        anyhow::Ok((data, answer.secret.relay_session(&salt)?))
+                    }
+                    .await;
+                    let (data, session) = match prepared {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            ring.abort();
+                            pool.shutdown().await;
+                            return Err(error);
+                        }
+                    };
+                    let result = send_over_relays(
+                        SendContext {
+                            pool: Arc::clone(&pool),
+                            session: &session,
+                            control_relays: relays,
+                            ring,
+                            file_name: source.file_name.clone(),
+                            mime_type: source.mime_type.to_string(),
+                        },
+                        RelaySource {
+                            data,
+                            compression: PayloadCompression::of(source.wire_encoding),
+                        },
+                    )
+                    .await;
+                    pool.shutdown().await;
+                    result?;
+                }
+                // No fallback at all, so a direct route was the whole
+                // transfer.
+                Fallback::None => return Err(error),
+            }
         }
         (Err(error), Some(bootstrap)) => {
             log::info!("the direct route did not open: {error:#}");
             let _ = peer.close().await;
+            fallback.discard().await;
             let step = ui::status_step("Waiting for the Tor client to finish starting...");
             let tor = bootstrap
                 .await
@@ -173,6 +289,56 @@ pub async fn send_file_code(source: &SendSource, anonymous: bool) -> Result<()> 
 
     ui::status("File sent successfully.");
     Ok(())
+}
+
+/// What this transfer falls back to when the direct route does not open.
+///
+/// Only the clearnet one is held here: the anonymous fallback is a Tor
+/// bootstrap and travels with the `tor` handle instead, because the two are
+/// alternatives and an offer names one or neither.
+enum Fallback {
+    None,
+    Relays {
+        pool: Arc<FilePool>,
+        /// The control relays, which is exactly what the offer names.
+        relays: Vec<String>,
+        ring: PreparedRing,
+    },
+}
+
+impl Fallback {
+    fn offer_relays(&self) -> Option<Vec<String>> {
+        match self {
+            Self::None => None,
+            Self::Relays { relays, .. } => Some(relays.clone()),
+        }
+    }
+
+    /// Let go of relays a transfer turned out not to need: a prepared ring
+    /// holds a socket to every relay in it, and each one would otherwise
+    /// reconnect for as long as the process lives.
+    async fn discard(self) {
+        if let Self::Relays { pool, ring, .. } = self {
+            ring.abort();
+            pool.shutdown().await;
+        }
+    }
+}
+
+/// Whether the clearnet fallback could carry this selection at all.
+///
+/// A relay-borne payload is capped, and the cap lands on what is actually
+/// chunked: a single file's own bytes, or the whole generated ZIP. Checked
+/// before any relay is probed, so an offer never names relays for a transfer
+/// they could not carry.
+fn relay_eligible(source: &SendSource, anonymous: bool) -> bool {
+    if anonymous {
+        return false;
+    }
+    match source.wire_encoding {
+        crate::wire::WireEncoding::DeflateRaw => source.estimated_size <= RELAY_MAX_BYTES,
+        crate::wire::WireEncoding::Identity => source.projected_wire_size <= RELAY_MAX_BYTES,
+    }
 }
 
 /// Ask for the receiver's response until one that answers this code arrives.

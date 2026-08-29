@@ -106,9 +106,10 @@ pub struct SignalingPayload {
     /// Offer-only: the HKDF salt of every derivation off the ECDH secret.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub salt: Option<Vec<u8>>,
-    /// Offer-only: the clearnet relays the web app's Nostr file-relay fallback
-    /// would use. This CLI never mints one and cannot use one; it is carried
-    /// here only so a web offer round-trips through parsing intact.
+    /// Offer-only: the control relays of the clearnet Nostr file-relay
+    /// fallback, proven before the code was shown. An offer that names them
+    /// promises a receiver that path; one that names none has no clearnet
+    /// fallback at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relays: Option<Vec<String>>,
     /// Offer-only, and only ever `true`: this transfer's fallback runs inside
@@ -152,6 +153,14 @@ impl SignalingPayload {
                 if self.relays.is_some() && self.anon.is_some() {
                     bail!("an offer names relays or asks for Tor, never both");
                 }
+                // A relay list that is not one invalidates the whole offer
+                // rather than being trimmed to what parses: it is covered by
+                // the offer digest the answer's confirmation tag is bound to,
+                // so a list neither side would have written is not an offer
+                // either side made.
+                if let Some(relays) = self.relays.as_ref() {
+                    self.fallback_relays_from(relays)?;
+                }
                 let Some(salt) = self.salt.as_ref() else {
                     bail!("an offer must carry a salt");
                 };
@@ -193,6 +202,25 @@ impl SignalingPayload {
             }
         }
         Ok(())
+    }
+
+    /// The clearnet fallback's control relays, in canonical form, or `None`
+    /// when this offer has no clearnet fallback.
+    pub fn fallback_relays(&self) -> Option<Vec<String>> {
+        if self.kind != PayloadKind::Offer || self.is_anonymous() {
+            return None;
+        }
+        self.relays
+            .as_ref()
+            .and_then(|relays| self.fallback_relays_from(relays).ok())
+    }
+
+    fn fallback_relays_from(&self, relays: &[String]) -> Result<Vec<String>> {
+        crate::code::nostr_file::relays::offer_relays(
+            relays,
+            crate::code::nostr_file::OFFER_RELAY_COUNT,
+            crate::code::nostr_file::MIN_OFFER_RELAYS,
+        )
     }
 
     /// The tag as raw bytes. Only ever `Some` on a payload that validated as

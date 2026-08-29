@@ -51,8 +51,8 @@ pub enum WizardPlan {
         output: PathBuf,
         /// Whether to answer with none of this device's network routes in the
         /// response, so the sender's direct attempt has nothing to connect to
-        /// and the offer's anonymous fallback runs instead. Only ever set for
-        /// an offer that has one.
+        /// and whichever fallback the offer carries runs instead. Only ever
+        /// set for an offer that has one.
         simulate_no_direct: bool,
     },
     SendTor(Vec<PathBuf>),
@@ -226,9 +226,10 @@ enum Pasted {
         /// Kept exactly as pasted, because the confirmation tag the response
         /// carries is bound to a digest of exactly these bytes.
         offer: String,
-        /// Whether the offer asks for the anonymous fallback. That is the only
-        /// thing a dead direct route can fall back onto, so it is also what
-        /// decides whether the simulated one is offered at all.
+        /// Whether the offer carries a fallback at all — relays it named, or
+        /// the anonymous option. A dead direct route has nowhere to go
+        /// without one, so it is also what decides whether the simulated one
+        /// is offered.
         fallback: bool,
     },
 }
@@ -330,8 +331,9 @@ fn classify(text: &str) -> Result<Pasted, Rejection> {
         // why — expired, or minted in some other hour — is the receive path's
         // job, which reports the reason. All that is read out of it here is
         // whether there is a fallback for the simulation to run into.
-        let fallback =
-            crate::code::payload::decode(&binary).is_ok_and(|offer| offer.is_anonymous());
+        let fallback = crate::code::payload::decode(&binary).is_ok_and(|offer| {
+            offer.is_anonymous() || offer.fallback_relays().is_some()
+        });
         return Ok(Pasted::Code {
             offer: text.to_string(),
             fallback,
@@ -590,7 +592,8 @@ fn receive_entry_key(
 }
 
 /// Whether what is in the receive box has a fallback to simulate a dead route
-/// into: a sender code, from a sender that turned the anonymous option on.
+/// into: a sender code whose sender named relays or turned the anonymous
+/// option on.
 fn simulate_offered(input: &str) -> bool {
     matches!(classify(input), Ok(Pasted::Code { fallback: true, .. }))
 }
@@ -1102,6 +1105,22 @@ mod tests {
     /// A sender code as the sending side would hand it over, with the
     /// anonymous option `anonymous` says.
     fn sender_code(anonymous: bool) -> String {
+        sender_code_with(anonymous, None)
+    }
+
+    /// A code naming the control relays of the ordinary fallback, which is
+    /// what an offer carries when the sender did not pick the anonymous one.
+    fn relay_sender_code() -> String {
+        sender_code_with(
+            false,
+            Some(vec![
+                "wss://one.example".to_string(),
+                "wss://two.example".to_string(),
+            ]),
+        )
+    }
+
+    fn sender_code_with(anonymous: bool, relays: Option<Vec<String>>) -> String {
         use crate::code::payload::{
             CODE_SALT_LEN, PUBLIC_KEY_LEN, PayloadKind, SignalingPayload, encode, now_ms,
             to_clipboard,
@@ -1118,7 +1137,7 @@ mod tests {
             content_encoding: Some(crate::wire::WireEncoding::DeflateRaw),
             mime_type: Some("application/pdf".to_string()),
             salt: Some(vec![7u8; CODE_SALT_LEN]),
-            relays: None,
+            relays,
             anon: anonymous.then_some(true),
         };
         to_clipboard(&encode(&offer).unwrap())
@@ -1138,12 +1157,23 @@ mod tests {
             })
         );
 
+        // The ordinary fallback is named rather than flagged: relays in the
+        // code are as much a fallback to simulate a dead route into.
+        let relayed = relay_sender_code();
+        assert_eq!(
+            classify(&relayed),
+            Ok(Pasted::Code {
+                offer: relayed,
+                fallback: true,
+            })
+        );
+
         let plain = sender_code(false);
         let Ok(Pasted::Code { offer, fallback }) = classify(&format!("  {plain}\n")) else {
             panic!("a sender code should be recognized");
         };
         assert_eq!(offer, plain, "the code is kept exactly as it was pasted");
-        assert!(!fallback, "this sender turned the anonymous option off");
+        assert!(!fallback, "this sender named no relays and turned Tor off");
     }
 
     /// The receiver's half of the simulated dead route, which the web app has

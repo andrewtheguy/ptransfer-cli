@@ -384,6 +384,13 @@ impl NostrClient {
         &self.relays
     }
 
+    /// The identity this client signs with. Held rather than cloned: a caller
+    /// that builds an event elsewhere — the Code Exchange control channel does
+    /// — still has to sign it as this client.
+    pub fn keys(&self) -> &Keys {
+        &self.keys
+    }
+
     pub fn public_key(&self) -> PublicKey {
         self.keys.public_key()
     }

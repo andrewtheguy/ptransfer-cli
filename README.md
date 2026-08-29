@@ -24,9 +24,18 @@ file/folder selection, output directory, and PIN entry.
   and the receiver's response comes back the same way — the sender's own paste
   of that response is what admits a receiver, and it is checked against the
   code being shown before anything moves. The web app can carry those codes as
-  QR grids; this CLI carries them as base64 text, which is the half of the
-  exchange a terminal can take part in and is enough to transfer with a browser
-  on the other end. See [Code Exchange](#code-exchange) below.
+  QR grids; this CLI carries them as base64 text, which is enough to transfer
+  with a browser on the other end. Drawing the offer as a QR grid is planned
+  ([`docs/ROADMAP.md`](docs/ROADMAP.md)); reading one is not, since there is no
+  camera at a terminal. See [Code Exchange](#code-exchange) below.
+- The Nostr relay fallback is what carries a Code Exchange transfer when no
+  direct route can be made, and it is the ordinary one — nothing to turn on.
+  The sender proves a handful of public relays before the code is shown and
+  names them in it; if the direct connection then fails, the file goes out as
+  encrypted 48 KiB pieces spread across a ring of storage relays discovered
+  behind the exchange, and the receiver fetches them and says which it could
+  not get. Nothing is uploaded ahead of time, the pieces expire after an hour,
+  and it caps the transfer at 100 MiB.
 - Anonymous signaling (experimental) is the same PIN
   Exchange with the relay sockets carried through Tor to a separate pool of
   onion-service relays, so no Nostr relay sees either device's IP address. The
@@ -35,11 +44,12 @@ file/folder selection, output directory, and PIN entry.
   take the direct WebRTC data channel, so this does not make a transfer
   anonymous.
 - Anonymous signaling and relay (experimental) is Code Exchange's own option,
-  and a different thing: when no direct route can be made, the file goes over a
-  temporary onion service the sender publishes, coordinated over the same
-  onion-service relay pool. Nothing extra is handed over for it — the password
-  is derived from the exchange on both devices and the address is announced
-  over the encrypted control channel — and it caps the transfer at 100 MiB.
+  and the alternative to that fallback rather than an addition to it: when no
+  direct route can be made, the file goes over a temporary onion service the
+  sender publishes, coordinated over a pool of onion-service relays. Nothing
+  extra is handed over for it — the password is derived from the exchange on
+  both devices and the address is announced over the encrypted control channel
+  — and it caps the transfer at 100 MiB too.
 - Tor Onion Service is a second transfer mode, not a
   variant of PIN Exchange: the sender publishes a throwaway v3 onion service and
   a one-time password, and those two strings are the whole rendezvous — no
@@ -57,7 +67,8 @@ file/folder selection, output directory, and PIN entry.
 - WebRTC data-channel transfer using the web app's encrypted chunk protocol.
   Transport is direct-only (STUN, no TURN relay): the transfer fails rather
   than route file bytes through a relay server.
-- No QR code support in the CLI.
+- No QR code support yet: drawing an offer QR is on the roadmap, reading one
+  is not. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 In PIN Exchange the file bytes flow over the WebRTC data channel, and Nostr
 relays carry only the handshake and WebRTC signaling events. The rendezvous
@@ -177,8 +188,9 @@ file already exists the receiver fails; pass `--overwrite` to replace it.
 
 ### Code Exchange
 
-No relay is involved at any point: the sender shows a code, a person carries it
-to the receiver, and the receiver's response comes back the same way.
+No relay carries the exchange: the sender shows a code, a person carries it to
+the receiver, and the receiver's response comes back the same way. Relays only
+appear if the direct connection fails, and only then.
 
 ```bash
 # Sending side. It prints the code and then waits, so leave it running.
@@ -212,7 +224,27 @@ A code expires an hour after it is made. Multiple paths or a folder are sent as
 one ZIP, exactly as in PIN Exchange. If the destination file already exists the
 receiver fails; pass `--overwrite` to replace it.
 
-`--anonymous` adds a fallback for when no direct connection can be made:
+When no direct connection can be made, the file goes through public Nostr
+relays instead. That is the ordinary fallback and there is nothing to turn on:
+before the code is shown, the sender proves a few relays with a real
+write-and-read round trip and names them in the code, and behind the exchange
+it discovers and health-checks a ring of storage relays. Only if the direct
+attempt then fails is the file read, hashed, and published — as encrypted 48
+KiB pieces, one copy each, spread across that ring — while the receiver fetches
+them and acknowledges what it could not get; only those pieces are sent again,
+somewhere else. Both sides derive the key and the transfer id from the exchange
+itself, so no relay is ever told what it is holding, and every event asks the
+relays to drop it after an hour. It carries at most 100 MiB, and a selection
+over that is sent without naming relays, since a code that named them would
+promise a path this side could not walk.
+
+Proving those relays is most of what the sending side is doing in the seconds
+before a code appears: dead relays in the built-in pool are replaced by
+discovered ones proven at full chunk size, and the probe stops the moment the
+gap is filled. A sender that cannot prove at least two relays names none — the
+transfer then has no fallback rather than a broken one.
+
+`--anonymous` replaces that fallback with one that runs inside Tor:
 
 ```bash
 ptransfer code send --anonymous ./file.bin
@@ -229,22 +261,21 @@ announced over that control channel, only after the sender has accepted a
 response. Both devices need internet, both spend a Tor bootstrap (started as
 soon as the code is shown, behind the direct attempt), the transfer is capped
 at 100 MiB, and it fails more often than a direct connection. The receiver
-needs no flag: the code says which fallback the sender chose.
+needs no flag: the code says which fallback the sender chose. The two are
+alternatives — an anonymous code names no clearnet relays, because that pool is
+a constant on both sides.
 
 The receiving side has one option of its own, `--simulate-no-direct`, which
 answers as if no direct connection were possible: the response goes back with
 none of this device's network routes in it, so the sender falls back. It is the
 only way to exercise the fallback from a network where a direct connection
 would succeed — the situation a device behind a hostile NAT is in anyway — and
-it exists only for a code whose sender selected a fallback, since anywhere else
-it would only kill a working transfer. The web app offers the same thing as
+it exists only for a code that carries a fallback, since anywhere else it would
+only kill a working transfer. The web app offers the same thing as
 *Simulate no direct connection* under its response page's advanced options.
 
-Without `--anonymous` there is no fallback at all, and a failed direct route
-ends the transfer. The web app's other fallback — encrypted pieces on public
-Nostr relays — is not implemented here, so a code minted by this CLI names no
-relays, and a code from the web app that does name some is still taken but its
-relays go unused.
+A code with no fallback at all — no relays named and no anonymous flag — is
+still a valid code, and a failed direct route simply ends that transfer.
 
 The wizard covers the same transfer: the sender picks **Code Exchange** from
 its mode menu (with `a` for the anonymous fallback), and the receiver pastes
@@ -431,12 +462,16 @@ their own, versioned separately: `docs/CODE_EXCHANGE_PROTOCOL.md`,
   the limit.
 - Received ZIPs are not auto-extracted, matching the web app.
 - No resume support.
-- No QR support: Code Exchange codes are copied and pasted as text, which is
-  the half of that exchange a terminal can take part in.
-- No clearnet relay fallback for Code Exchange: the web app's Nostr file relay
-  is not implemented, so a code minted here names no relays and a failed direct
-  route ends the transfer. Its anonymous Tor fallback *is* implemented, and
-  carries at most 100 MiB.
+- No QR support yet: Code Exchange codes are copied and pasted as text.
+  Drawing the offer as a QR grid is on the roadmap; reading a response QR is
+  not, since there is no camera at a terminal. See
+  [`docs/ROADMAP.md`](docs/ROADMAP.md).
+- Both Code Exchange fallbacks carry at most 100 MiB. The relay one keeps no
+  cache between transfers — the web app remembers which relays worked, this CLI
+  discovers and probes them afresh every time, which is on the roadmap to
+  change ([`docs/ROADMAP.md`](docs/ROADMAP.md)) — and it runs no background sweep
+  of the relay population behind a transfer, so it starts from the same six
+  signaling seeds each run.
 - The Tor transport carries at most 100 MiB per transfer. Its browser/CLI
   interoperability contract and handshake version are specified separately
   from `INTEROP_PROTOCOL.md` in the web app's `docs/TOR_TRANSPORT.md`.
@@ -476,14 +511,14 @@ truth for everything the two share. Run them from a checkout of it:
 ```bash
 cd ../ptransfer
 bun run test:live:webrtc   # PIN Exchange over a real data channel
-bun run test:live:code     # Code Exchange, direct and its anonymous fallback
+bun run test:live:code     # Code Exchange: direct, relay, and Tor fallbacks
 bun run test:live:tor      # the Tor onion transport
 ```
 
 Run the one covering what you touched: anything in Code Exchange that both
 implementations share — the container, the key schedule, the confirmation tag,
-the anonymous fallback's rendezvous — needs `test:live:code` before it is
-considered done.
+the relay fallback's manifest, pieces and control channel, the anonymous
+fallback's rendezvous — needs `test:live:code` before it is considered done.
 
 They require internet access, Bun, a Chrome-family browser, and this checkout
 beside that one — `PTRANSFER_CLI_ROOT` and `PTRANSFER_BIN` override where each

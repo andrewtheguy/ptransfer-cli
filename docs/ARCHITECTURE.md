@@ -12,8 +12,9 @@ the spec wins.
 Three transfer modes reach the same transfer layer. **PIN Exchange** is the
 only relay-signaled one. **Code Exchange** has no signaling server at all: the
 offer and the response are carried by a person, and this CLI carries them as
-base64 text, since there is no camera at a terminal to read the QR half the web
-app also offers. The **Tor onion transport** rendezvouses on the onion address
+base64 text; drawing the offer as the QR grid the web app also offers is on the
+[roadmap](ROADMAP.md), reading one back is not, since there is no camera at a
+terminal. The **Tor onion transport** rendezvouses on the onion address
 itself. Code Exchange and the Tor transport have their own wire contracts,
 outside `INTEROP_PROTOCOL.md` and versioned separately — see the sections
 below.
@@ -258,15 +259,19 @@ data-channel layer. Either side of a transfer may be this CLI or a browser tab.
 
 This section describes only what is specific to the CLI's realization of it.
 
-**Text, never QR.** The mode's two codes are carried by hand, and a terminal
-has one way to do that: `ptransfer code send` prints the offer to **stdout**
+**Text today, and text for the response always.** The mode's two codes are
+carried by hand, and a terminal has one way to do that today:
+`ptransfer code send` prints the offer to **stdout**
 and reads the response from **stdin**, and `ptransfer code receive` does the
 reverse, so either side pipes cleanly. Everything else — status, prompts,
 progress — goes to stderr. The wizard shows a code full-screen, offers it to
 the system clipboard over OSC 52, and takes the response by bracketed paste.
-The web app's multi-QR offer path is not implemented and does not need to be:
-both sides carry the same container, and the copy/paste half is enough to
-transfer with a browser on the other end.
+The web app's multi-QR offer path is not implemented: both sides carry the
+same container, and the copy/paste half is enough to transfer with a browser on
+the other end. Drawing that grid in terminal blocks is on the
+[roadmap](ROADMAP.md) — it is a rendering job, not a protocol one. Reading a
+response QR is not, and cannot be: there is no camera here, so the response
+comes back as text whatever the offer looks like.
 
 **Three ways off the screen, because two of them do not always work.** OSC 52
 is refused by terminals that do not implement it and by tmux unless it is
@@ -291,7 +296,8 @@ waiting for a line that would fix it.
 **Modules.** `src/code/payload.rs` is the container — obfuscation, validation,
 and the two transcript digests; `keys.rs` is the ECDH agreement and every
 derivation off it; `sender.rs` and `receiver.rs` are the two halves of the
-exchange; `control.rs` and `relay.rs` are the anonymous fallback.
+exchange; `nostr_file/` is the clearnet relay fallback; `control.rs` and
+`relay.rs` are the anonymous one.
 
 **The response is the confirmation step.** Nothing enters the sending side
 except through its operator's own paste, and what is pasted is checked before
@@ -302,16 +308,53 @@ another transfer, an old one pasted again, and one altered on the way back are
 all refused with the same message rather than turning into a connection that
 never opens.
 
-**Fallbacks: one of the web app's two.** An offer minted here never names
-clearnet relays, because the CLI does not implement the Nostr file relay those
-would exist for and an offer that named them would promise a receiver a path
-this side cannot walk. A web offer that *does* name them is still taken — the
-direct path is identical — but a failed direct route ends the transfer here
-rather than moving onto them. What is implemented is the **anonymous** fallback
-(`code send --anonymous`, or the wizard's `a` toggle on the Code Exchange row):
-the control channel on the onion-service relay pool of *Anonymous Signaling*
-above, and the file over a temporary onion service published on the same Tor
-client, using the transport below unchanged.
+**Two fallbacks, and the offer is what says which.** They are alternatives, and
+the sender picks between them before the code exists. An ordinary offer names
+the control relays of the **clearnet Nostr file relay**, described below; `code
+send --anonymous` (or the wizard's `a` toggle on the Code Exchange row) picks
+the **anonymous** one instead — the control channel on the onion-service relay
+pool of *Anonymous Signaling* above, and the file over a temporary onion
+service published on the same Tor client, using the transport below unchanged.
+An anonymous offer names no clearnet relays, because that pool is a constant on
+both sides; an offer that could carry neither has no fallback, and a failed
+direct route ends that transfer.
+
+**The relay fallback, and what is this CLI's own about it.** Its wire contract
+is the web app's
+[`docs/NOSTR_FILE_RELAY.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/NOSTR_FILE_RELAY.md)
+— the derived session, the sealed control channel, the manifest, the 48 KiB
+AES-GCM/Z85 chunk events, the placement ring, and the acknowledge-and-re-send
+loop — implemented in `src/code/nostr_file/`. Three things about the CLI's
+realization are worth naming:
+
+- **The relays are proven before the code, the ring behind it.** A receiver
+  learns where the control channel lives only from the code, so the control
+  relays have to exist before it is shown: the signaling seeds are probed with
+  a control-sized write-and-read round trip, and a defunct seed is replaced by
+  a discovered relay proven at full chunk size. That probe runs beside ICE
+  gathering, which is the one other thing the code waits on. The storage ring
+  is not in the code, so it is prepared on the same pool behind the exchange
+  and adopted whenever it resolves — a transfer that connects directly drops it
+  unused, exactly as it drops an unused Tor bootstrap. Below
+  `MIN_CONTROL_RELAYS` the offer names none and the transfer has no clearnet
+  fallback at all.
+- **Nothing is remembered between transfers.** The web app keeps a relay-health
+  cache in IndexedDB and runs a background sweep of the relay population behind
+  every transfer; this CLI has neither, and each run discovers and probes
+  afresh. Carrying that cache here is on the [roadmap](ROADMAP.md), along with
+  the question of what it means for a CLI that writes nothing to disk today. What the cache buys the web app is a candidate list that leads with
+  relays it has already proved; cold, both implementations probe in discovery
+  order, and both stop the moment enough have passed. The selection itself is
+  the same either way — the ring comes from what the control backfill left
+  proven and untried, or from a discovery of its own when the seeds needed no
+  backfill.
+- **The source is materialized, once, and only then.** Every other path here
+  streams: the archiver hands 128 KiB wire chunks across a bounded channel and
+  nothing whole is ever held. This one cannot — the payload is hashed before
+  any of it is published, chunks are re-sent on demand, and the receiver
+  assembles out of order — so `SendSource::materialize` reads the selection
+  into memory under the 100 MiB cap. It runs after the direct route is known to
+  be dead, so a transfer that connected never reads the file twice.
 
 **Nothing extra is handed over for it.** The Tor transport's two rendezvous
 values are the password and the address. The password is derived from the ECDH
@@ -369,8 +412,9 @@ implementations test the Tor path against each other on a network where a
 direct connection would otherwise always succeed.
 
 The wizard has it too, as a `Tab` toggle on the receive box, and only while
-what is in that box decodes to an offer that named the fallback — the same
-condition the web app hides the option behind. The web app puts it under the
+what is in that box decodes to an offer that carries a fallback — relays it
+named, or the anonymous flag — the same condition the web app hides the option
+behind. The web app puts it under the
 response's advanced options and rebuilds a live connection when it is used;
 the wizard asks a keystroke earlier, before anything has been started, so
 arming it needs no teardown. The flag is refused rather than hidden on the
@@ -523,11 +567,13 @@ enforces the limit against actual output and seals the final length in `DONE`.
 
 ## Scope
 
-The CLI intentionally has no legacy signaling protocol, no resume path, no QR
-support, no relay discovery, and no custom fallback mode. Code Exchange's codes
-are therefore text only, and its clearnet Nostr file-relay fallback — which
-would need relay discovery — is not implemented, so an offer minted here names
-no relays and a failed direct route ends the transfer. The Tor transport
+The CLI intentionally has no legacy signaling protocol, no resume path, and no
+custom relay mode, and carries no QR support yet: Code Exchange's codes are
+therefore text today, and the relay pools are the built-in ones. Its relay
+discovery exists for one job — finding storage relays for Code Exchange's
+clearnet fallback — and keeps nothing between transfers. Drawing an offer QR
+and keeping a relay-health cache are both on the [roadmap](ROADMAP.md);
+*reading* a QR is not, for want of a camera. The Tor transport
 interoperates with the web app in both directions and is capped at 100 MiB per
 transfer, with no resume; Code Exchange's anonymous fallback runs over it and
 inherits that cap. Anonymous signaling interoperates in both directions too and
