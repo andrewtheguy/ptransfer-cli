@@ -84,9 +84,13 @@ impl CachedRelay {
         }
     }
 
-    /// When the relay was last known to exist: listed, or proven.
+    /// When the relay was last heard of: listed, probed, or proven. A failed
+    /// probe counts — it is the verdict the entry exists to keep, and an entry
+    /// that expired on it would come back from the next listing as unprobed,
+    /// at the front of the sweep's queue.
     fn freshness(&self) -> u64 {
         self.last_discovered_at
+            .max(self.last_checked_at.unwrap_or(0))
             .max(self.last_succeeded_at.unwrap_or(0))
     }
 
@@ -679,14 +683,18 @@ mod tests {
         assert_eq!(find(&cache, "wss://new.example").last_discovered_at, NOW);
         assert_eq!(find(&cache, "wss://old.example").last_discovered_at, NOW - 2 * HOUR);
 
-        // Past the TTL the candidate list is stale and the failed and unprobed
-        // verdicts expire, but the healthy relays still lead the list.
+        // Past the TTL the candidate list is stale and the old failed and
+        // unprobed verdicts expire, but the healthy relays still lead the
+        // list, and a failure recent enough keeps its entry — with its count.
         let mut stale = cache.clone();
-        let merged = stale.merge_candidates(Vec::new(), &seeds(), Capability::Storage, NOW + 8 * 24 * HOUR);
+        let later = NOW + 8 * 24 * HOUR;
+        stale.record_probes(&[], &["wss://dead.example".to_string()], Capability::Storage, later - HOUR);
+        let merged = stale.merge_candidates(Vec::new(), &seeds(), Capability::Storage, later);
         assert_eq!(merged, vec!["wss://fast.example", "wss://slow.example"]);
         let mut kept: Vec<&str> = stale.relays.iter().map(|relay| relay.url.as_str()).collect();
         kept.sort();
-        assert_eq!(kept, vec!["wss://fast.example", "wss://slow.example"]);
+        assert_eq!(kept, vec!["wss://dead.example", "wss://fast.example", "wss://slow.example"]);
+        assert_eq!(find(&stale, "wss://dead.example").consecutive_failures, 2);
     }
 
     #[test]
