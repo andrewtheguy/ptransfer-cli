@@ -280,14 +280,13 @@ fn save_code(text: &str) -> Result<PathBuf> {
     use std::io::Write as _;
 
     let path = std::env::temp_dir().join(format!("ptransfer-code-{}.txt", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&path)?;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
     // A trailing newline, because everything that will read this file back —
     // `cat`, an editor, a mail client — expects one.
     writeln!(file, "{text}")?;

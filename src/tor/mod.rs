@@ -109,7 +109,6 @@ pub fn is_disconnect(err: &std::io::Error) -> bool {
 /// cleaned up on the way out — there is no storage to remove — but unwinding
 /// normally lets the onion service tell its introduction points it is going
 /// away, instead of leaving them to time it out.
-#[cfg(unix)]
 pub async fn shutdown_signal() -> std::io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -118,12 +117,6 @@ pub async fn shutdown_signal() -> std::io::Result<()> {
         result = tokio::signal::ctrl_c() => result,
         _ = term.recv() => Ok(()),
     }
-}
-
-/// Resolve when the process is asked to stop.
-#[cfg(not(unix))]
-pub async fn shutdown_signal() -> std::io::Result<()> {
-    tokio::signal::ctrl_c().await
 }
 
 #[cfg(test)]

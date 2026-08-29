@@ -104,25 +104,6 @@ curl -sSL https://andrewtheguy.github.io/ptransfer-cli/install.sh | bash -s -- -
 curl -sSL https://andrewtheguy.github.io/ptransfer-cli/install.sh | bash -s <release-tag>
 ```
 
-### Quick Install (Windows)
-
-The Windows installer supports x86_64 (AMD64).
-
-```powershell
-irm https://andrewtheguy.github.io/ptransfer-cli/install.ps1 | iex
-```
-
-The release workflow publishes a Windows binary only for **stable** releases,
-so the PowerShell installer should be used with the latest stable release or a
-specific stable tag. Because
-parameter binding is unavailable when piping into `iex`, pass flags via
-`$env:PTRANSFER_CLI_INSTALL_ARGS`. Examples:
-
-```powershell
-# Pin to a specific stable tag
-$env:PTRANSFER_CLI_INSTALL_ARGS='<release-tag>'; irm https://andrewtheguy.github.io/ptransfer-cli/install.ps1 | iex
-```
-
 ### From Source
 
 ```bash
@@ -273,8 +254,7 @@ Behind every transfer a background sweep enumerates the whole relay population
 and probes as far as the transfer lasts, so the next one is not limited to
 what this one happened to need. The cache is one JSON file,
 `ptransfer/relay-cache.json` under the platform's per-user cache directory
-(`~/.cache` on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on
-Windows), holding relay URLs and verdicts and nothing about any transfer;
+(`~/.cache` on Linux, `~/Library/Caches` on macOS), holding relay URLs and verdicts and nothing about any transfer;
 several commands running at once share it safely. `PTRANSFER_RELAY_CACHE=off`
 keeps it in memory for one run, and `PTRANSFER_RELAY_CACHE=<directory>` moves
 it.
