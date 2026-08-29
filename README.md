@@ -164,29 +164,45 @@ that fails its checksum is called out as a typo while it is still being typed.
 ### Non-Interactive PIN Exchange
 
 The `pin` subcommand runs PIN Exchange without the wizard, for scripts and
-pipes. Paths and options come from arguments; its PIN and confirmation code
-are read from stdin, prompted for at a terminal and piped in from a script, so
-neither appears in the process list. The separate `tor receive` command
-applies the same rule to its password.
+pipes. The sender prints a PIN; the receiver enters it and prints a
+confirmation code; the sender enters that, and the transfer starts.
 
 ```bash
-ptransfer pin send /path/to/file more-files a-folder
-
-# The PIN is typed at the prompt, or piped
-ptransfer pin receive --output /path/to/dir
-echo "$PIN" | ptransfer pin receive --output /path/to/dir
-
-# Anonymous signaling; the receiver needs no flag
-ptransfer pin send --anonymous /path/to/file
+ptransfer pin send ./file.bin
+# 7Kq2mXp9Rt4L
+# Enter the receiver's 8-character confirmation code: <the code the receiver printed>
 ```
 
-The sender prints a case-sensitive 12-character PIN on stdout — 16 characters
-with `--anonymous` — and prints a fresh one each time it rotates (every 2
-minutes) until a receiver claims the transfer; enter the PIN currently shown
-exactly. The receiver then prints an
-8-character confirmation code which the sender must enter before the transfer
-continues. Multiple paths or a folder are sent as one ZIP. If the destination
-file already exists the receiver fails; pass `--overwrite` to replace it.
+Hand the PIN to the receiver, who runs:
+
+```bash
+ptransfer pin receive --output ./downloads
+# PIN: <the PIN the sender printed>
+# J4X9PQ2M
+```
+
+Both secrets are read from stdin, never taken as an argument — an argument
+would be readable by every other process on the machine for as long as the
+process holding it runs. At a terminal each is prompted for; from a script,
+pipe it in: `printf '%s\n' "$PIN" | ptransfer pin receive --output ./downloads`
+for the receiver, and the confirmation code goes to the *sender's* stdin the
+same way, so a script that drives `pin send` keeps its stdin open and writes
+the code there once the receiver has printed it. The `tor receive` command
+applies the same rule to its password.
+
+The PIN is case-sensitive, 12 characters — 16 with `--anonymous`, which the
+receiver reads off the length and needs no flag for — and the sender prints a
+fresh one each time it rotates (every 2 minutes) until a receiver claims the
+transfer; enter the PIN currently shown exactly. The 8-character confirmation
+code is not case-sensitive. Each side prints only its own secret on stdout, so
+redirecting it yields just that; everything else goes to stderr. Multiple
+paths or a folder are sent as one ZIP. If the destination file already exists
+the receiver fails; pass `--overwrite` to replace it.
+
+```bash
+# Anonymous signaling; the receiver needs no flag
+ptransfer pin send --anonymous ./file.bin
+```
 
 ### Code Exchange
 
