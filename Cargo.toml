@@ -1,7 +1,7 @@
 [package]
 name = "ptransfer-cli"
 # does not have to match pTransfer's npm version
-version = "0.0.13"
+version = "0.0.14"
 edition = "2024"
 publish = false
 
@@ -14,7 +14,7 @@ publish = false
 # The modes outside that document — Code Exchange, its two fallbacks, anonymous
 # signaling, the Tor transport — carry their own contracts and are not
 # versioned here.
-ptransfer-protocol-version = "4"
+ptransfer-protocol-version = "5"
 
 [lib]
 name = "ptransfer_cli"
