@@ -55,6 +55,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Nostr signaling
 nostr-sdk = "0.44.1"
+# The relay cache's home: the platform's per-user cache directory.
+dirs = "6"
 
 # Anonymous signaling: the PIN Exchange handshake carried to
 # onion-service Nostr relays over the Tor client this crate already assembles.

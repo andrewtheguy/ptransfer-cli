@@ -262,6 +262,22 @@ discovered ones proven at full chunk size, and the probe stops the moment the
 gap is filled. A sender that cannot prove at least two relays names none — the
 transfer then has no fallback rather than a broken one.
 
+What those probes learn is kept between runs, the way the web app keeps it in
+IndexedDB: a relay cache of every relay discovered, when it was last probed,
+whether it passed, and how fast, good for 24 hours. A later transfer leads its
+candidate list with relays already proven, so it fills its ring from the first
+batch instead of sampling the population again, and successive transfers
+rotate through the proven relays rather than all landing on the same few.
+Behind every transfer a background sweep enumerates the whole relay population
+and probes as far as the transfer lasts, so the next one is not limited to
+what this one happened to need. The cache is one JSON file,
+`ptransfer/relay-cache.json` under the platform's per-user cache directory
+(`~/.cache` on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on
+Windows), holding relay URLs and verdicts and nothing about any transfer;
+several commands running at once share it safely. `PTRANSFER_RELAY_CACHE=off`
+keeps it in memory for one run, and `PTRANSFER_RELAY_CACHE=<directory>` moves
+it.
+
 `--anonymous` replaces that fallback with one that runs inside Tor:
 
 ```bash
@@ -487,12 +503,7 @@ and [`docs/TOR_TRANSPORT.md`](https://github.com/andrewtheguy/ptransfer/blob/mai
   Drawing the offer as a QR grid is on the roadmap; reading a response QR is
   not, since there is no camera at a terminal. See
   [`docs/ROADMAP.md`](docs/ROADMAP.md).
-- Both Code Exchange fallbacks carry at most 100 MiB. The relay one keeps no
-  cache between transfers — the web app remembers which relays worked, this CLI
-  discovers and probes them afresh every time, which is on the roadmap to
-  change ([`docs/ROADMAP.md`](docs/ROADMAP.md)) — and it runs no background sweep
-  of the relay population behind a transfer, so it starts from the same six
-  signaling seeds each run.
+- Both Code Exchange fallbacks carry at most 100 MiB.
 - The Tor transport carries at most 100 MiB per transfer. Its browser/CLI
   interoperability contract and handshake version are specified separately
   from `INTEROP_PROTOCOL.md` in the web app's `docs/TOR_TRANSPORT.md`.

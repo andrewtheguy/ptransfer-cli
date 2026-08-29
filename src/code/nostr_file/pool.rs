@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -52,6 +53,10 @@ pub struct FilePool {
     /// `relay not found`. Upload workers reach this directly — several of them
     /// publish to the same ring relay the moment the ring is announced.
     gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Set by [`Self::shutdown`], and never cleared: the pool ends with the
+    /// transfer, and work still running behind it — the relay sweep — reads
+    /// this to stop rather than record the teardown as relay failures.
+    shut_down: AtomicBool,
 }
 
 impl FilePool {
@@ -67,7 +72,14 @@ impl FilePool {
                 .build(),
             opened: Mutex::new(HashSet::new()),
             gates: Mutex::new(HashMap::new()),
+            shut_down: AtomicBool::new(false),
         }
+    }
+
+    /// Whether [`Self::shutdown`] has run. Nothing opened after it is a socket
+    /// anyone will close.
+    pub fn is_shut_down(&self) -> bool {
+        self.shut_down.load(Ordering::Acquire)
     }
 
     /// Open a socket to one relay, or report that it would not open.
@@ -77,6 +89,9 @@ impl FilePool {
     /// both connect it, and a failure on either drops the socket the other is
     /// about to use.
     pub async fn ensure(&self, url: &str) -> Result<()> {
+        if self.is_shut_down() {
+            bail!("the relay pool has been shut down");
+        }
         if self.opened.lock().await.contains(url) {
             return Ok(());
         }
@@ -225,6 +240,7 @@ impl FilePool {
     }
 
     pub async fn shutdown(&self) {
+        self.shut_down.store(true, Ordering::Release);
         self.client.shutdown().await;
         self.opened.lock().await.clear();
         self.gates.lock().await.clear();

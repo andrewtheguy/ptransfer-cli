@@ -338,16 +338,22 @@ realization are worth naming:
   unused, exactly as it drops an unused Tor bootstrap. Below
   `MIN_CONTROL_RELAYS` the offer names none and the transfer has no clearnet
   fallback at all.
-- **Nothing is remembered between transfers.** The web app keeps a relay-health
-  cache in IndexedDB and runs a background sweep of the relay population behind
-  every transfer; this CLI has neither, and each run discovers and probes
-  afresh. Carrying that cache here is on the [roadmap](ROADMAP.md), along with
-  the question of what it means for a CLI that writes nothing to disk today. What the cache buys the web app is a candidate list that leads with
-  relays it has already proved; cold, both implementations probe in discovery
-  order, and both stop the moment enough have passed. The selection itself is
-  the same either way — the ring comes from what the control backfill left
-  proven and untried, or from a discovery of its own when the seeds needed no
-  backfill.
+- **What the probes learn is kept.** The web app keeps a relay-health cache
+  in IndexedDB and runs a background sweep of the relay population behind
+  every transfer; this CLI carries both (`src/code/nostr_file/relay_cache.rs`,
+  and the sweep in `relay_pool.rs`). The cache is one JSON file under the
+  user's cache directory — relay URLs and verdicts, nothing about any
+  transfer — and every change to it is a locked read-modify-write on a
+  sibling lock file, so several commands running at once add to each other's
+  verdicts rather than overwriting them. What it buys is a candidate list that
+  leads with relays already proved, so a warm run fills its ring from the
+  first batch; cold, both implementations probe in discovery order, and both
+  stop the moment enough have passed. The ring is cut from the healthy list
+  at a cursor the cache rotates between uploads. The sweep starts once the
+  ring has resolved, on the same pool, and ends when the pool is shut down:
+  a probe still in flight then is discarded rather than recorded as a failure.
+  `PTRANSFER_RELAY_CACHE` moves the file or, set to `off`, keeps the cache in
+  memory for one run.
 - **The source is materialized, once, and only then.** Every other path here
   streams: the archiver hands 128 KiB wire chunks across a bounded channel and
   nothing whole is ever held. This one cannot — the payload is hashed before
@@ -449,7 +455,9 @@ keystore: the network directory, guard and vanguard state, and onion-service
 identity key are values in the process. A transfer cannot touch a system Tor or
 an existing `~/.local/share/arti`. Transfer output is separate: receiving uses
 a destination `.part` file, which can remain after an abrupt process kill. The
-cost of memory-only Tor state is that every command bootstraps from cold.
+cost of memory-only Tor state is that every command bootstraps from cold. The
+one thing this CLI does write under the user's cache directory is the
+clearnet relay cache above, which holds nothing about Tor or any transfer.
 
 This is why the client is assembled from Arti's managers rather than taken
 whole from `arti-client`: `tor-dirmgr` (SQLite plus a blob directory) and
@@ -571,8 +579,7 @@ The CLI intentionally has no legacy signaling protocol, no resume path, and no
 custom relay mode, and carries no QR support yet: Code Exchange's codes are
 therefore text today, and the relay pools are the built-in ones. Its relay
 discovery exists for one job — finding storage relays for Code Exchange's
-clearnet fallback — and keeps nothing between transfers. Drawing an offer QR
-and keeping a relay-health cache are both on the [roadmap](ROADMAP.md);
+clearnet fallback. Drawing an offer QR is on the [roadmap](ROADMAP.md);
 *reading* a QR is not, for want of a camera. The Tor transport
 interoperates with the web app in both directions and is capped at 100 MiB per
 transfer, with no resume; Code Exchange's anonymous fallback runs over it and

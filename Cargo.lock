@@ -3620,6 +3620,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "dirs",
  "env_logger",
  "flate2",
  "futures-channel",
