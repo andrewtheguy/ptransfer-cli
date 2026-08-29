@@ -624,10 +624,9 @@ pub async fn sweep_relay_health(
         .cloned()
         .collect();
 
+    // A stop during discovery does not return yet: what was enumerated so far
+    // is real, and it is written down below before the stop is honoured.
     let discovered = discover_all_candidates(pool, &seeds, &stopped).await;
-    if stopped() {
-        return;
-    }
     // Discovery reopened the seeds; the ones not carrying this transfer are
     // done again.
     let done_seeds: Vec<String> = seeds
@@ -760,10 +759,10 @@ pub async fn sweep_relay_health(
 /// relays are known, awaited only if the direct route dies.
 ///
 /// Once the ring has resolved, the sweep of the rest of the population runs
-/// on from it, on the same pool, for as long as the pool lives — a direct
-/// connection leaves the ring unused and the cache warmer for the next
-/// transfer; a relayed one keeps the sweep going behind the upload. Shutting
-/// the pool down is what ends it.
+/// on from it, on the same pool, for as long as the pool lives, and shutting
+/// the pool down is what ends it. A direct connection shuts it down at once,
+/// so only the ring's own probes reach the cache then; a relayed transfer
+/// keeps the sweep going behind the upload.
 pub struct PreparedRing {
     task: tokio::task::JoinHandle<Result<Vec<String>>>,
 }
