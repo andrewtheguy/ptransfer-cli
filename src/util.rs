@@ -61,9 +61,9 @@ pub fn sanitize_filename(name: &str) -> String {
 pub enum OnConflict {
     /// Ask the user with the TUI modal.
     Prompt,
-    /// Error out (non-interactive test mode without --overwrite).
+    /// Error out (non-interactive commands without --overwrite).
     Fail,
-    /// Replace the existing file (test mode with --overwrite).
+    /// Replace the existing file (non-interactive commands with --overwrite).
     Overwrite,
 }
 
