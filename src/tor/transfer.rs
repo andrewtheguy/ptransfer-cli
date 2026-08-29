@@ -39,12 +39,11 @@ use super::{display_address, shutdown_signal, split_address};
 
 /// Largest payload a Tor transfer carries, measured on the input.
 ///
-/// The spec's number, and the web app spends it on its relayed transfers too:
-/// both paths push bytes through third parties at a fraction of a data
-/// channel's speed and neither can resume. It is a hard limit because it is
-/// the receiver's rule as well as the sender's — a peer that ignored it would
-/// only find out after a bootstrap and a handshake.
-pub const MAX_TRANSFER_BYTES: u64 = 100 * 1024 * 1024;
+/// [`crate::crypto::SLOW_TRANSPORT_MAX_BYTES`], which every transport that
+/// goes through third parties shares. It is a hard limit because it is the
+/// receiver's rule as well as the sender's — a peer that ignored it would only
+/// find out after a bootstrap and a handshake.
+pub const MAX_TRANSFER_BYTES: u64 = crate::crypto::SLOW_TRANSPORT_MAX_BYTES;
 
 /// The size past which a Tor transfer is worth a word to the operator. Advice
 /// printed once, never enforced: a circuit's throughput is the luck of the

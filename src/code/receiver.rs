@@ -25,6 +25,9 @@ use crate::wire::TransferMetadata;
 
 use super::control::seconds;
 use super::keys::{CodeKeyPair, CodeSecret};
+use super::nostr_file::RELAY_MAX_BYTES;
+use super::nostr_file::download::{ReceiveContext, receive_over_relays};
+use super::nostr_file::pool::FilePool;
 use super::payload::{
     self, PayloadKind, SignalingPayload, TRANSFER_EXPIRATION_MS,
 };
@@ -54,14 +57,25 @@ pub async fn receive_file_code(
 ) -> Result<()> {
     let offer = decode_offer(offer_code)?;
     let anonymous = offer.is_anonymous();
-    if simulate_no_direct && !anonymous {
-        bail!(
-            "This code has no fallback to simulate one into: its sender did not \
-             select the anonymous option, so a dead direct route ends the transfer."
-        );
-    }
     let salt = offer.offer_salt()?;
     let metadata = offer_metadata(&offer)?;
+    // The sender's choice, read out of the offer: the relays it named carry
+    // the clearnet fallback's control channel, and an offer naming none has no
+    // clearnet fallback to run.
+    let relays = offer.fallback_relays();
+    // Named relays are not enough on their own: past the relay size cap the
+    // fallback would refuse the file, so simulating a dead route would kill a
+    // working direct connection and leave both sides with nowhere to go.
+    if simulate_no_direct
+        && !anonymous
+        && (relays.is_none() || metadata.file_size > RELAY_MAX_BYTES)
+    {
+        bail!(
+            "This code has no fallback to simulate one into: its sender named no relays \
+             this transfer could use and did not select the anonymous option, so a dead \
+             direct route ends the transfer."
+        );
+    }
 
     // The slow part, started as the offer is taken in rather than once the
     // direct route is known to be dead: by then the sender is already waiting,
@@ -169,9 +183,46 @@ pub async fn receive_file_code(
             result?;
         }
         (Err(error), None) => {
-            ui::hide_code();
+            log::info!("the direct route did not open: {error:#}");
             let _ = peer.close().await;
-            return Err(error);
+            let Some(relays) = relays else {
+                ui::hide_code();
+                return Err(error);
+            };
+            if metadata.file_size > RELAY_MAX_BYTES {
+                ui::hide_code();
+                return Err(error.context(format!(
+                    "The file is over {}, so it cannot be relayed through Nostr either.",
+                    format_bytes(RELAY_MAX_BYTES)
+                )));
+            }
+            if !simulate_no_direct {
+                ui::status(
+                    "No direct connection — taking the file through Nostr relays instead. \
+                     Hand your response to the sender to start it.",
+                );
+            }
+            let session = secret.relay_session(&salt)?;
+            let pool = Arc::new(FilePool::new());
+            let received = receive_over_relays(ReceiveContext {
+                pool: Arc::clone(&pool),
+                session: &session,
+                control_relays: relays,
+                since: seconds(offer.created_at),
+                expires_at: seconds(offer.created_at + TRANSFER_EXPIRATION_MS),
+                // The sender may not have been handed the response yet, and a
+                // sender that has not been handed it is not silent, it is
+                // uninvolved: until its first message only the code's own hour
+                // bounds this wait.
+                awaiting_handover: true,
+                expected_name: metadata.file_name.clone(),
+            })
+            .await;
+            pool.shutdown().await;
+            ui::hide_code();
+            tokio::fs::write(&dest, received?)
+                .await
+                .with_context(|| format!("Cannot write {}", dest.display()))?;
         }
         (Err(error), Some(bootstrap)) => {
             log::info!("the direct route did not open: {error:#}");

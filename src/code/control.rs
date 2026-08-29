@@ -1,90 +1,39 @@
-//! The encrypted control channel the anonymous fallback meets on.
+//! The anonymous fallback's control channel: the same sealed kind-30078
+//! channel the clearnet fallback runs on, carried to the onion relay pool over
+//! Tor.
 //!
-//! When the direct WebRTC route does not exist, the two sides still hold the
-//! ECDH secret their offer/answer exchange produced — but nothing to connect
-//! to. The onion service the sender is about to publish has an identity the
-//! Tor client mints on the spot, so it cannot be derived, which leaves exactly
-//! one thing that has to travel: its address. This channel is what carries it.
+//! Everything about the events — the tags, the AAD, the counter, the sealing —
+//! is [`super::nostr_file::control`]'s, because it is one contract with two
+//! transports. What differs here is the transport and the vocabulary: this
+//! channel rides the onion-service relay pool anonymous PIN Exchange uses,
+//! reached through the same Tor client the sender publishes its service on,
+//! and only two messages cross it.
 //!
-//! It rides the same onion-service relay pool anonymous PIN Exchange uses,
-//! reached through the same Tor client, as **addressable kind-30078 events**:
-//!
-//! ```text
-//! d          <transferId>:ctl:<role>:<n>     unique per message
-//! x          <transferId>:ctl                what both sides subscribe to
-//! expiration <unix seconds>                  NIP-40, the session's own clock
-//! content    base64( AES-GCM( deflate-raw(JSON), aad ) )
-//! aad        ptransfer-nostr-file:v1:ctl:<transferId>:<role>
-//! ```
-//!
-//! The transfer id and the key are derived, never carried (see
-//! [`super::keys`]), so a relay sees an opaque tag namespace and ciphertext.
-//! The AAD binds every message to the transfer *and* to the sending role, so a
-//! receiver's message can never be replayed as a sender's.
-//!
-//! Only two messages cross it here — the receiver's `hello` and the sender's
-//! `onion` announcement — because the anonymous fallback puts the file on an
-//! onion service rather than on the relays. The clearnet Nostr file relay the
-//! web app can fall back to instead carries its whole transfer over a channel
-//! of this shape; this CLI does not implement that path.
+//! The clearnet fallback puts the whole file on relays and needs a manifest,
+//! availability, and acknowledgements to do it. This one puts the file on an
+//! onion service, so the only thing that has to travel is the address the Tor
+//! client mints on the spot — plus the receiver's `hello`, which is the same
+//! "the direct route is dead" signal both fallbacks send.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use flate2::Compression;
-use flate2::write::DeflateEncoder;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::crypto::aes::{self, AES_KEY_LEN};
+use crate::crypto::aes::AES_KEY_LEN;
 use crate::signaling::nostr::NostrClient;
 use crate::tor::TorClient;
-use crate::wire::Inflater;
 
-/// NIP-78 addressable event kind the control channel publishes under, shared
-/// with the web app's relay file transfer.
-const EVENT_KIND_CONTROL: u16 = 30078;
-/// AAD prefix. Shared with the web app's relay transfer, whose control channel
-/// this is the same shape as.
-const AAD_PREFIX: &str = "ptransfer-nostr-file:v1";
-/// Decompression bound for one control body. Two tiny messages cross this
-/// channel; the bound only stops a relay from making this process allocate.
-const MAX_CONTROL_BYTES: u64 = 256 * 1024;
+use super::nostr_file::control::{
+    build_control_event, channel_tag, control_kind, is_peer_event, seal, unseal,
+};
 
-/// Which side of the channel a message came from. It is part of the AAD and of
-/// the `d` tag, so the two directions never overlap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlRole {
-    Sender,
-    Receiver,
-}
-
-impl ControlRole {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Sender => "sender",
-            Self::Receiver => "receiver",
-        }
-    }
-
-    fn peer(self) -> Self {
-        match self {
-            Self::Sender => Self::Receiver,
-            Self::Receiver => Self::Sender,
-        }
-    }
-}
+pub use super::nostr_file::control::ControlRole;
 
 /// The messages this channel carries.
-///
-/// `hello` is the receiver saying it has given up on the direct route — the
-/// same signal the web app's clearnet fallback sends, read by the same watch.
-/// `onion` is the sender's answer to it, and the one value of the anonymous
-/// fallback that cannot be derived on both sides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum ControlMessage {
@@ -154,7 +103,7 @@ impl ControlChannel {
             .context("The anonymous fallback could not reach its onion relays")?;
 
         let filter = Filter::new()
-            .kind(Kind::from_u16(EVENT_KIND_CONTROL))
+            .kind(control_kind())
             .custom_tag(SingleLetterTag::lowercase(Alphabet::X), channel_tag(&transfer_id))
             .since(Timestamp::from(config.since));
         let mut notifications = client.notifications();
@@ -209,14 +158,13 @@ impl ControlChannel {
         self.counter += 1;
         message.set_counter(self.counter);
         let content = seal(&self.key, &self.transfer_id, self.role, &message)?;
-        let tags = vec![
-            tag("d", format!("{}:ctl:{}:{}", self.transfer_id, self.role.as_str(), self.counter))?,
-            tag("x", channel_tag(&self.transfer_id))?,
-            tag("expiration", self.expires_at.to_string())?,
-        ];
-        let event = self.client.sign(
-            EventBuilder::new(Kind::from_u16(EVENT_KIND_CONTROL), content).tags(tags),
-        )?;
+        let event = self.client.sign(build_control_event(
+            &self.transfer_id,
+            self.role,
+            self.counter,
+            content,
+            self.expires_at,
+        )?)?;
         self.client.publish(&event).await
     }
 
@@ -238,47 +186,6 @@ impl ControlChannel {
     }
 }
 
-/// The public tag both sides subscribe to. Derived, so it names the session
-/// without naming either device.
-fn channel_tag(transfer_id: &str) -> String {
-    format!("{transfer_id}:ctl")
-}
-
-fn control_aad(transfer_id: &str, role: ControlRole) -> String {
-    format!("{AAD_PREFIX}:ctl:{transfer_id}:{}", role.as_str())
-}
-
-/// JSON → deflate-raw → AES-GCM (transfer- and role-bound AAD) → base64.
-fn seal(
-    key: &[u8; AES_KEY_LEN],
-    transfer_id: &str,
-    role: ControlRole,
-    message: &ControlMessage,
-) -> Result<String> {
-    use std::io::Write as _;
-    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&serde_json::to_vec(message)?)?;
-    let compressed = encoder.finish()?;
-    let sealed = aes::encrypt_with_aad(key, &compressed, control_aad(transfer_id, role).as_bytes())?;
-    Ok(BASE64.encode(sealed))
-}
-
-fn unseal(
-    key: &[u8; AES_KEY_LEN],
-    transfer_id: &str,
-    role: ControlRole,
-    content: &str,
-) -> Result<ControlMessage> {
-    let sealed = BASE64.decode(content).context("control message is not base64")?;
-    let compressed =
-        aes::decrypt_with_aad(key, &sealed, control_aad(transfer_id, role).as_bytes())?;
-    let mut inflater = Inflater::new(MAX_CONTROL_BYTES);
-    let mut json = Vec::new();
-    json.extend_from_slice(inflater.push(&compressed)?);
-    json.extend_from_slice(inflater.finish()?);
-    serde_json::from_slice(&json).context("control message is not one this channel carries")
-}
-
 /// The message inside an event, or `None` when it is not one of the peer's.
 fn open_control_event(
     event: &Event,
@@ -286,25 +193,11 @@ fn open_control_event(
     transfer_id: &str,
     peer_role: ControlRole,
 ) -> Option<ControlMessage> {
-    if event.kind != Kind::from_u16(EVENT_KIND_CONTROL) {
+    if !is_peer_event(event, transfer_id, peer_role) {
         return None;
     }
-    // The `d` tag says which direction the message went. It carries no
-    // authority — the AAD checked below is what does — but routing on it first
-    // keeps this side from trying to open its own messages.
-    let d_tag = event
-        .tags
-        .iter()
-        .find(|tag| tag.as_slice().first().map(String::as_str) == Some("d"))
-        .and_then(|tag| tag.as_slice().get(1))?;
-    if !d_tag.starts_with(&format!("{transfer_id}:ctl:{}:", peer_role.as_str())) {
-        return None;
-    }
-    unseal(key, transfer_id, peer_role, &event.content).ok()
-}
-
-fn tag(name: &str, value: impl Into<String>) -> Result<Tag> {
-    Tag::parse([name.to_string(), value.into()]).context("invalid Nostr tag")
+    let value = unseal(key, transfer_id, peer_role, &event.content).ok()?;
+    serde_json::from_value(value).ok()
 }
 
 /// Unix seconds from a millisecond stamp, the clock every control event's
@@ -333,6 +226,15 @@ mod tests {
 
     const TRANSFER_ID: &str = "c05587dba544d9543610d42f7b7b640d";
 
+    fn open(
+        key: &[u8; AES_KEY_LEN],
+        transfer_id: &str,
+        role: ControlRole,
+        content: &str,
+    ) -> Result<ControlMessage> {
+        Ok(serde_json::from_value(unseal(key, transfer_id, role, content)?)?)
+    }
+
     #[test]
     fn a_message_round_trips_through_its_own_role() {
         let key = [9u8; AES_KEY_LEN];
@@ -341,7 +243,7 @@ mod tests {
             onion: "abc.onion:9735".to_string(),
         };
         let sealed = seal(&key, TRANSFER_ID, ControlRole::Sender, &message).unwrap();
-        let opened = unseal(&key, TRANSFER_ID, ControlRole::Sender, &sealed).unwrap();
+        let opened = open(&key, TRANSFER_ID, ControlRole::Sender, &sealed).unwrap();
         assert!(matches!(opened, ControlMessage::Onion { onion, .. } if onion == "abc.onion:9735"));
     }
 
@@ -351,9 +253,10 @@ mod tests {
     #[test]
     fn a_message_does_not_open_as_the_other_direction() {
         let key = [9u8; AES_KEY_LEN];
-        let sealed = seal(&key, TRANSFER_ID, ControlRole::Receiver, &ControlMessage::hello()).unwrap();
-        assert!(unseal(&key, TRANSFER_ID, ControlRole::Sender, &sealed).is_err());
-        assert!(unseal(&key, TRANSFER_ID, ControlRole::Receiver, &sealed).is_ok());
+        let sealed =
+            seal(&key, TRANSFER_ID, ControlRole::Receiver, &ControlMessage::hello()).unwrap();
+        assert!(open(&key, TRANSFER_ID, ControlRole::Sender, &sealed).is_err());
+        assert!(open(&key, TRANSFER_ID, ControlRole::Receiver, &sealed).is_ok());
     }
 
     /// The transfer id is in the AAD too, so a message from another session on
@@ -361,14 +264,21 @@ mod tests {
     #[test]
     fn a_message_does_not_open_under_another_transfer_id() {
         let key = [9u8; AES_KEY_LEN];
-        let sealed = seal(&key, TRANSFER_ID, ControlRole::Receiver, &ControlMessage::hello()).unwrap();
-        assert!(unseal(&key, &"a".repeat(32), ControlRole::Receiver, &sealed).is_err());
+        let sealed =
+            seal(&key, TRANSFER_ID, ControlRole::Receiver, &ControlMessage::hello()).unwrap();
+        assert!(open(&key, &"a".repeat(32), ControlRole::Receiver, &sealed).is_err());
     }
 
     #[test]
     fn a_message_sealed_under_another_key_is_refused() {
-        let sealed = seal(&[1u8; AES_KEY_LEN], TRANSFER_ID, ControlRole::Sender, &ControlMessage::hello()).unwrap();
-        assert!(unseal(&[2u8; AES_KEY_LEN], TRANSFER_ID, ControlRole::Sender, &sealed).is_err());
+        let sealed = seal(
+            &[1u8; AES_KEY_LEN],
+            TRANSFER_ID,
+            ControlRole::Sender,
+            &ControlMessage::hello(),
+        )
+        .unwrap();
+        assert!(open(&[2u8; AES_KEY_LEN], TRANSFER_ID, ControlRole::Sender, &sealed).is_err());
     }
 
     /// The wire shape the two implementations meet on: the JSON is what the

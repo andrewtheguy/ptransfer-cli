@@ -1,7 +1,7 @@
 [package]
 name = "ptransfer-cli"
 # does not have to match pTransfer's npm version
-version = "0.0.7"
+version = "0.0.8"
 edition = "2024"
 publish = false
 
@@ -10,10 +10,10 @@ publish = false
 # in the pTransfer web app's src/lib/protocol.ts, specified by its
 # docs/INTEROP_PROTOCOL.md, which covers PIN Exchange and the shared
 # data-channel transfer layer. Deliberately not pTransfer's npm version — that
-# moves for web-only changes (the multi-QR codes, the clearnet relay fallback)
-# this CLI does not implement. The modes outside that document — Code Exchange,
-# anonymous signaling, the Tor transport — carry their own contracts and are
-# not versioned here.
+# moves for web-only changes (the multi-QR codes) this CLI does not implement.
+# The modes outside that document — Code Exchange, its two fallbacks, anonymous
+# signaling, the Tor transport — carry their own contracts and are not
+# versioned here.
 ptransfer-protocol-version = "4"
 
 [lib]

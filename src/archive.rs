@@ -101,6 +101,50 @@ impl SendSource {
     }
 }
 
+impl SendSource {
+    /// Read the whole source into memory: the file's own bytes for a single
+    /// file, the generated ZIP for anything else.
+    ///
+    /// This is what the relay fallback needs and the direct path never does.
+    /// Chunks are placed on relays one at a time and re-sent on demand, the
+    /// whole payload is hashed before any of it is published, and a receiver
+    /// assembles it out of order — none of which a stream that can only be
+    /// read once can serve. It is bounded by the same cap that fallback is.
+    pub(crate) async fn materialize(&self, cap: u64) -> Result<Vec<u8>> {
+        if self.estimated_size > cap {
+            bail!(
+                "This selection is {}, over the {} the relay fallback allows.",
+                crate::util::format_bytes(self.estimated_size),
+                crate::util::format_bytes(cap)
+            );
+        }
+        match &self.kind {
+            // The plaintext, not the wire bytes: what travels is deflated
+            // once as a whole by the relay codec, and what is hashed and
+            // verified on the far side is the file itself.
+            SendSourceKind::File(path) => {
+                let data = tokio::fs::read(path)
+                    .await
+                    .with_context(|| format!("Cannot read {}", path.display()))?;
+                check_size_cap(data.len() as u64, cap)?;
+                Ok(data)
+            }
+            // A generated ZIP is already the payload: its entries are
+            // deflated, so it is never compressed again, and the archive
+            // itself is what both sides hash.
+            SendSourceKind::Zip(_) => {
+                let mut stream = self.open().await?;
+                let mut data = Vec::new();
+                while let Some(chunk) = stream.next_chunk().await? {
+                    check_size_cap(data.len() as u64 + chunk.len() as u64, cap)?;
+                    data.extend_from_slice(&chunk);
+                }
+                Ok(data)
+            }
+        }
+    }
+}
+
 /// Produce the source's wire bytes into `writer`, on a blocking worker.
 fn produce_wire_bytes(kind: &SendSourceKind, writer: ChunkWriter) -> Result<()> {
     match kind {

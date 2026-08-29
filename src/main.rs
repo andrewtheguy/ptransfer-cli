@@ -3,8 +3,8 @@
 //! Running with no arguments launches the full-screen TUI wizard, which covers
 //! all three transfer modes. The `code` and `tor` subcommands run Code Exchange
 //! and the onion transport non-interactively, and the `test` subcommand exposes
-//! PIN Exchange the same way for testing. QR support is intentionally not part
-//! of this CLI: Code Exchange codes are copied and pasted as text.
+//! PIN Exchange the same way for testing. Code Exchange codes are copied and
+//! pasted as text; drawing an offer QR is on the roadmap, reading one is not.
 //! Build with: cargo build --release
 
 use anyhow::Result;
@@ -61,9 +61,10 @@ enum Commands {
 /// File transfer with no signaling server: the sender's offer and the
 /// receiver's response are carried by hand, as base64 text.
 ///
-/// The web app can carry the same codes as QR grids; this CLI does not, since
-/// there is no camera at a terminal. Codes go to stdout and everything else to
-/// stderr, so either side can be piped.
+/// The web app can carry the same codes as QR grids; this CLI does not yet
+/// draw one, and can never read one, since there is no camera at a terminal.
+/// Codes go to stdout and everything else to stderr, so either side can be
+/// piped.
 #[derive(Subcommand)]
 enum CodeCommands {
     /// Show an offer code, then take the receiver's response.
@@ -74,7 +75,7 @@ enum CodeCommands {
         #[arg(required = true, num_args = 1..)]
         paths: Vec<PathBuf>,
 
-        /// Fall back to Tor when no direct connection can be made
+        /// Fall back through Tor rather than through public Nostr relays
         /// (experimental).
         ///
         /// Changes nothing about the exchange itself. If the direct WebRTC
@@ -83,7 +84,9 @@ enum CodeCommands {
         /// with no address and no password for anyone to carry, both being
         /// derived from the exchange. Caps the transfer at 100 MiB, needs
         /// internet on both devices, and starts a Tor bootstrap as soon as the
-        /// code is shown. Without it, a failed direct route ends the transfer.
+        /// code is shown. Without it the fallback is the ordinary one: the
+        /// file itself as encrypted pieces on public Nostr relays, capped at
+        /// 100 MiB too.
         #[arg(long)]
         anonymous: bool,
     },
