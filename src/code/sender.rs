@@ -259,7 +259,11 @@ fn decode_response(
 /// Compare two tags without an early return, so a near miss is not measurably
 /// nearer than a wild one.
 fn constant_time_equal(a: &[u8], b: &[u8]) -> bool {
-    let mut difference = (a.len() ^ b.len()) as u8;
+    // A mismatch in length is one nonzero byte, not the XOR of the two lengths
+    // truncated: that truncation is zero whenever the lengths differ only in
+    // bits a `u8` cannot hold, and the padded comparison below would then let
+    // a short tag pass against a long one of zeros.
+    let mut difference = u8::from(a.len() != b.len());
     for index in 0..a.len().max(b.len()) {
         let left = a.get(index).copied().unwrap_or(0);
         let right = b.get(index).copied().unwrap_or(0);
@@ -317,6 +321,9 @@ mod tests {
         assert!(!constant_time_equal(&[1, 2, 3], &[1, 2, 4]));
         assert!(!constant_time_equal(&[1, 2, 3], &[1, 2]));
         assert!(!constant_time_equal(&[], &[0]));
+        // Lengths whose difference vanishes in a `u8`: two tags of zeros, 256
+        // bytes apart, are still two different tags.
+        assert!(!constant_time_equal(&[], &[0; 256]));
     }
 
     /// One side of an exchange as the sender holds it: the code it is showing,

@@ -818,10 +818,18 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
             );
             // A sender code is kilobytes of base64: rendering it into a
             // one-line field would show a meaningless slice of it and put the
-            // cursor somewhere off screen, so it is summarized instead.
+            // cursor somewhere off screen, so it is summarized instead. What
+            // the summary calls it comes from the same classification the row
+            // below reports, so a long paste that is not a code is not
+            // announced as one.
             if is_long_paste(input) {
+                let what = if matches!(classify(input), Ok(Pasted::Code { .. })) {
+                    "sender code"
+                } else {
+                    "unrecognized text"
+                };
                 f.render_widget(
-                    Paragraph::new(format!("> [sender code, {} characters]", input.len())),
+                    Paragraph::new(format!("> [{what}, {} characters]", input.len())),
                     line,
                 );
             } else {
@@ -1246,6 +1254,36 @@ mod tests {
                 "the toggle should{} be on screen",
                 if shown { "" } else { " not" }
             );
+        }
+    }
+
+    /// A value too long to draw is summarized, and the summary says what the
+    /// row under it says: text of that length that is not a code is not
+    /// announced as one.
+    #[test]
+    fn a_long_paste_is_summarized_as_what_it_classifies_as() {
+        for (input, label) in [
+            (sender_code(true), "sender code"),
+            ("x".repeat(200), "unrecognized text"),
+        ] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 20)).unwrap();
+            let mut screen = Screen::ReceiveEntry {
+                output: PathBuf::from("."),
+                cursor: input.len(),
+                input,
+                error: None,
+                simulate: false,
+            };
+            terminal.draw(|f| draw(f, &mut screen)).unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains(label), "expected {label:?} on screen");
         }
     }
 

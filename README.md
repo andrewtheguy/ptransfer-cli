@@ -472,12 +472,18 @@ truth for everything the two share. Run them from a checkout of it:
 ```bash
 cd ../ptransfer
 bun run test:live:webrtc   # PIN Exchange over a real data channel
+bun run test:live:code     # Code Exchange, direct and its anonymous fallback
 bun run test:live:tor      # the Tor onion transport
 ```
 
+Run the one covering what you touched: anything in Code Exchange that both
+implementations share — the container, the key schedule, the confirmation tag,
+the anonymous fallback's rendezvous — needs `test:live:code` before it is
+considered done.
+
 They require internet access, Bun, a Chrome-family browser, and this checkout
 beside that one — `PTRANSFER_CLI_ROOT` and `PTRANSFER_BIN` override where each
-looks for it. The WebRTC one builds this CLI itself; the Tor one expects a
-`cargo build --release` build to already be there.
+looks for it. The WebRTC and Code Exchange ones build this CLI themselves; the
+Tor one expects a `cargo build --release` build to already be there.
 Both start the web development server when needed and leave byte-verified
 transfer artifacts in the temporary directory printed at the end.
