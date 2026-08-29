@@ -34,6 +34,7 @@ use super::keys::CodeKeyPair;
 use super::nostr_file::RELAY_MAX_BYTES;
 use super::nostr_file::codec::PayloadCompression;
 use super::nostr_file::pool::FilePool;
+use super::nostr_file::relay_cache::RelayCache;
 use super::nostr_file::relay_pool::{ControlSelection, PreparedRing, resolve_control_relays};
 use super::nostr_file::upload::{RelaySource, SendContext, send_over_relays};
 use super::payload::{
@@ -75,11 +76,13 @@ pub async fn send_file_code(source: &SendSource, anonymous: bool) -> Result<()> 
     // which is the one other thing the code waits on.
     let relay_probe = relay_eligible(source, anonymous).then(|| {
         let pool = Arc::new(FilePool::new());
+        let cache = Arc::new(RelayCache::open());
         let probe = tokio::spawn({
             let pool = Arc::clone(&pool);
-            async move { resolve_control_relays(&pool, &|_, _| {}).await }
+            let cache = Arc::clone(&cache);
+            async move { resolve_control_relays(&pool, &cache, &|_, _| {}).await }
         });
-        (pool, probe)
+        (pool, cache, probe)
     });
 
     let salt = generate_salt()?;
@@ -101,7 +104,7 @@ pub async fn send_file_code(source: &SendSource, anonymous: bool) -> Result<()> 
     // or it has no clearnet fallback, and either way the code cannot be shown
     // before that is settled.
     let mut fallback = Fallback::None;
-    if let Some((pool, probe)) = relay_probe {
+    if let Some((pool, cache, probe)) = relay_probe {
         let step = ui::status_step("Proving Nostr relays for the fallback...");
         match probe.await {
             Ok(Ok(selection)) => {
@@ -113,7 +116,8 @@ pub async fn send_file_code(source: &SendSource, anonymous: bool) -> Result<()> 
                 // The storage ring is prepared behind the exchange, on the
                 // same pool: the code does not depend on it, and a direct
                 // connection simply leaves it unused.
-                let ring = PreparedRing::spawn(Arc::clone(&pool), relays.clone(), discovered);
+                let ring =
+                    PreparedRing::spawn(Arc::clone(&pool), cache, relays.clone(), discovered);
                 fallback = Fallback::Relays { pool, relays, ring };
             }
             Ok(Err(error)) => {

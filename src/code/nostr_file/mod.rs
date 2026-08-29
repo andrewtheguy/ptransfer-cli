@@ -17,7 +17,9 @@
 //! ciphertext.
 //!
 //! - [`relays`]: what counts as a relay URL, and the seed pool.
-//! - [`relay_pool`]: discovery, health probes, and the two relay sets.
+//! - [`relay_pool`]: discovery, health probes, the two relay sets, and the
+//!   background sweep of the relay population.
+//! - [`relay_cache`]: what earlier runs learned, kept between transfers.
 //! - [`control`]: the sealed control channel and its message vocabulary.
 //! - [`codec`], [`z85`], [`events`], [`manifest`]: what a chunk is on the wire.
 //! - [`upload`] / [`download`]: the two halves of the transfer.
@@ -33,6 +35,7 @@ pub mod download;
 pub mod events;
 pub mod manifest;
 pub mod pool;
+pub mod relay_cache;
 pub mod relay_pool;
 pub mod relays;
 pub mod upload;
@@ -84,6 +87,17 @@ pub const PUBLISH_BACKOFF_JITTER: Duration = Duration::from_millis(250);
 pub const HEALTH_CHECK_CONCURRENCY: usize = 16;
 pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Once the ring is full the foreground health check stops, and the rest of
+/// the relay population would never be looked at. A background sweep runs
+/// behind the transfer instead: it enumerates every relay it can find and
+/// probes as far as the transfer lasts, so the next transfer starts from a
+/// cache of the whole population. It shares the upload's bandwidth, so it
+/// stays well below [`HEALTH_CHECK_CONCURRENCY`].
+pub const BACKGROUND_PROBE_CONCURRENCY: usize = 4;
+/// Sweep verdicts are written to the cache in batches of this size, plus a
+/// final flush, so a transfer that ends mid-sweep still keeps most of the work.
+pub const BACKGROUND_PROBE_SAVE_BATCH: usize = 8;
+
 /// Control relays the offer aims to name, and the fewest it may name at all:
 /// below this the offer names none and the transfer has no fallback.
 pub const CONTROL_RELAY_COUNT: usize = 6;
@@ -100,9 +114,29 @@ pub const CONTROL_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 pub const OFFER_RELAY_COUNT: usize = CONTROL_RELAY_COUNT;
 pub const MIN_OFFER_RELAYS: usize = MIN_CONTROL_RELAYS;
 
+/// One page of discovery per listing kind: the foreground pass only has to
+/// fill one ring.
 pub const DISCOVERY_CANDIDATE_LIMIT: usize = 100;
+/// Candidates a single transfer will rank and probe. A bound on the working
+/// set, not on what is known: the cache holds far more (see
+/// [`RELAY_CACHE_MAX_ENTRIES`]) and the best of it leads this list.
 pub const DISCOVERY_CANDIDATE_CAP: usize = 150;
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The sweep enumerates instead of sampling: it pages back through NIP-66 and
+/// NIP-65 history by `created_at` until a page turns up nothing new. These
+/// bound the paging, not the result.
+pub const DISCOVERY_PAGE_LIMIT: usize = 500;
+pub const DISCOVERY_MAX_PAGES: usize = 20;
+pub const DISCOVERY_PAGE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How long a discovery or a verdict counts for.
+pub const RELAY_CANDIDATE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Relays kept in the cache — everything the sweep has found, proved, or
+/// buried. Far above [`DISCOVERY_CANDIDATE_CAP`] on purpose: each transfer
+/// draws its working set from here, and capping this at the working-set size
+/// would throw the enumeration away.
+pub const RELAY_CACHE_MAX_ENTRIES: usize = 2000;
 
 /// Chunk identifiers per fetch filter (~3 MiB of content per query).
 pub const D_TAG_FILTER_BATCH: usize = 50;
