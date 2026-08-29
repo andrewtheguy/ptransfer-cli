@@ -294,6 +294,19 @@ fn save_code(text: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+/// A full-width rule carrying a label, drawn above and below the code. Made of
+/// box-drawing characters so it cannot be mistaken for the code, which is
+/// plain ASCII: a selection that strayed onto it is visibly wrong.
+fn edge_rule(label: &str, width: u16) -> Paragraph<'static> {
+    let label = format!("── {label} ");
+    let fill = (width as usize).saturating_sub(label.chars().count());
+    Paragraph::new(Line::from(format!("{label}{}", "─".repeat(fill))).dim())
+}
+
 /// What the Tor sender is showing its operator to hand over.
 struct TorRendezvous {
     address: String,
@@ -625,12 +638,16 @@ impl State {
         let body = block.inner(inner);
         f.render_widget(block, inner);
 
-        let [label_area, code_area, footer] = Layout::vertical([
+        let [label_area, top_edge, code_area, bottom_edge, footer] = Layout::vertical([
             Constraint::Length(2),
-            Constraint::Fill(1),
+            Constraint::Length(1),
+            // The code outranks everything under it: a footer line lost to a
+            // short terminal is a hint, a code row lost is the transfer.
+            Constraint::Min(1),
+            Constraint::Length(1),
             // The status excerpt, then the copy line, the scroll line and the
             // paste prompt.
-            Constraint::Length(STATUS_BESIDE_CODE as u16 + 3),
+            Constraint::Max(STATUS_BESIDE_CODE as u16 + 3),
         ])
         .areas(body);
 
@@ -641,6 +658,23 @@ impl State {
         code.scroll = code.scroll.min(code.max_scroll());
 
         f.render_widget(Paragraph::new(code.label.clone()).bold(), label_area);
+        // The code is a run of identical-looking characters with nothing to
+        // mark where it starts or stops, so a screen that cut it off would
+        // look exactly like one that did not. Each edge says which it is:
+        // the end of the code, or more of it out of view.
+        let above = code.scroll;
+        let below = code.rows.saturating_sub(code.scroll + code.page);
+        let top_label = if above == 0 {
+            "beginning of code".to_string()
+        } else {
+            format!("{above} more line{} above ↑", plural(above))
+        };
+        let bottom_label = if below == 0 {
+            "end of code".to_string()
+        } else {
+            format!("{below} more line{} below ↓", plural(below))
+        };
+        f.render_widget(edge_rule(&top_label, code_area.width), top_edge);
         let visible: Vec<Line> = rows
             .iter()
             .skip(code.scroll)
@@ -648,6 +682,7 @@ impl State {
             .map(|row| Line::from(row.as_str()).green())
             .collect();
         f.render_widget(Paragraph::new(visible), code_area);
+        f.render_widget(edge_rule(&bottom_label, code_area.width), bottom_edge);
 
         let mut lines: Vec<Line> = status
             .iter()
@@ -1048,6 +1083,42 @@ mod tests {
             rows.iter().any(|row| row.contains("s saves it to a file")),
             "a code that does not fit should offer the file: {rows:#?}"
         );
+        // The edges say the code continues, so a cut-off code never looks
+        // whole.
+        assert!(
+            rows.iter().any(|row| row.contains("beginning of code")),
+            "the top edge should mark the start: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("more lines below")),
+            "the bottom edge should say the code goes on: {rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("end of code")),
+            "the end is not on screen yet: {rows:#?}"
+        );
+
+        state.code_key(KeyCode::PageDown);
+        state.code_key(KeyCode::PageDown);
+        state.code_key(KeyCode::PageDown);
+        let rows = rendered(&mut terminal, &mut state);
+        assert!(
+            rows.iter().any(|row| row.contains("more lines above")),
+            "scrolled down, the top edge should say what is out of view: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("end of code")),
+            "scrolled to the bottom, the end should be marked: {rows:#?}"
+        );
+        let shown: String = rows
+            .iter()
+            .filter(|row| row.chars().all(|c| c == 'A'))
+            .map(|row| row.as_str())
+            .collect();
+        assert!(
+            code.ends_with(&shown) && !shown.is_empty(),
+            "the rows between the edges are the code's tail: {rows:#?}"
+        );
 
         state.code_key(KeyCode::Char('s'));
         let path = state
@@ -1091,5 +1162,49 @@ mod tests {
 
         assert_eq!(received.await.unwrap(), "A4BCD9ZT");
         assert!(state.confirmation_prompt.is_none());
+    }
+
+    /// A terminal too short for the footer still shows the code and both of
+    /// its edges: the footer gives way, the code never does.
+    #[tokio::test]
+    async fn a_short_terminal_keeps_the_code_and_its_edges() {
+        let code = "A".repeat(2000);
+        let mut state = State::new(&WizardPlan::SendPin {
+            paths: Vec::new(),
+            pin_kind: crate::crypto::pin::PinKind::Standard,
+        });
+        state.code = Some(ShownCode {
+            label: "Give this code to the receiver:".to_string(),
+            code,
+            copied: false,
+            scroll: 0,
+            page: 1,
+            rows: 1,
+            saved: None,
+            save_failed: false,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+        terminal.draw(|f| state.render(f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            rows.iter().any(|row| row.contains("beginning of code")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("more lines below")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.chars().all(|c| c == 'A')),
+            "at least one row of the code should be visible: {rows:#?}"
+        );
     }
 }
