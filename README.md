@@ -10,7 +10,8 @@ protocol support is maintained.
 The `ptransfer` command sends and receives files and folders with the same wire
 formats as pTransfer. Running the binary with no arguments launches a
 full-screen TUI wizard that walks through the whole transfer: send or receive,
-file/folder selection, output directory, and PIN entry.
+file/folder selection, output directory, and the PIN, sender code, or onion
+address appropriate to the transfer.
 
 - PIN exchange over Nostr, compatible with the web app's PIN Exchange, is the
   default and the only relay-signaled mode: a case-sensitive 12-character PIN
@@ -50,7 +51,7 @@ file/folder selection, output directory, and PIN entry.
   extra is handed over for it — the password is derived from the exchange on
   both devices and the address is announced over the encrypted control channel
   — and it caps the transfer at 100 MiB too.
-- Tor Onion Service is a second transfer mode, not a
+- Tor Onion Service is a separate transfer mode, not a
   variant of PIN Exchange: the sender publishes a throwaway v3 onion service and
   a one-time password, and those two strings are the whole rendezvous — no
   Nostr relay, no signaling server, and no WebRTC. The file bytes travel through
@@ -65,8 +66,9 @@ file/folder selection, output directory, and PIN entry.
   without a complete archive or temporary scratch file. Received ZIPs are
   saved as-is; extraction is up to you.
 - WebRTC data-channel transfer using the web app's encrypted chunk protocol.
-  Transport is direct-only (STUN, no TURN relay): the transfer fails rather
-  than route file bytes through a relay server.
+  The WebRTC path itself is direct-only (STUN, no TURN relay). PIN Exchange
+  therefore fails if it cannot open a direct route; Code Exchange can instead
+  switch to the public-relay or Tor fallback its offer selected.
 - No QR code support yet: drawing an offer QR is on the roadmap, reading one
   is not. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
@@ -142,9 +144,8 @@ browser (Space to multi-select); when receiving, browse to the output directory
 (or create a new folder with `n`) and paste whatever the sender handed over.
 Transfers run inside the TUI with live status and progress.
 
-Only the sending side picks a mode. Its menu lists the web app's modes in the
-web app's order, so an option's position means the same thing in both, and adds
-the CLI's own Tor Onion Service after them.
+Only the sending side picks a mode. Its menu lists the same three modes as the
+web app in the same order, so an option's position means the same thing in both.
 The anonymous option is not a mode there either: it belongs to the row it is
 on — signaling over Tor for PIN Exchange, a Tor fallback for Code Exchange —
 toggled with `a` and off unless asked for, the same place the web app keeps it.
@@ -412,10 +413,13 @@ The normative wire contract is the sibling pTransfer checkout's
 It covers PIN Exchange and the shared data-channel transfer layer, and carries
 an interop protocol version independent of pTransfer's app version. This build
 implements version `4`, declared in
-`package.metadata.ptransfer-protocol-version`. Code Exchange, anonymous
-signaling and the Tor transport sit outside that document and are specified by
-their own, versioned separately: `docs/CODE_EXCHANGE_PROTOCOL.md`,
-`docs/ANONYMOUS_SIGNALING.md`, and `docs/TOR_TRANSPORT.md`.
+`package.metadata.ptransfer-protocol-version`. Code Exchange, its Nostr relay
+fallback, anonymous signaling, and the Tor transport sit outside that document
+and have their own contracts and fail-closed version boundaries in the web
+app's [`docs/CODE_EXCHANGE_PROTOCOL.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/CODE_EXCHANGE_PROTOCOL.md),
+[`docs/NOSTR_FILE_RELAY.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/NOSTR_FILE_RELAY.md),
+[`docs/ANONYMOUS_SIGNALING.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/ANONYMOUS_SIGNALING.md),
+and [`docs/TOR_TRANSPORT.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/TOR_TRANSPORT.md).
 
 - Rendezvous event: Nostr kind `4243` (a regular kind, so relays retain it for a
   receiver that connects after the sender published), tagged with a rotation-bucket-scoped

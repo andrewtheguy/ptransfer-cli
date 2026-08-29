@@ -65,7 +65,7 @@ pub enum WizardPlan {
 
 /// The transfer modes the sending side chooses between, in the pTransfer web
 /// app's order, so an option's number means the same thing in both interfaces.
-/// The Tor transport is the CLI's own third mode.
+/// The Tor transport is the same third mode in both.
 ///
 /// The anonymous option is deliberately not a fourth entry. It is not a mode:
 /// on PIN Exchange it changes which relays signaling goes over, and on Code
@@ -435,8 +435,9 @@ fn handle_key(screen: Screen, key: KeyEvent) -> Step {
 
 /// The plan a confirmed send selection produces in `mode`.
 ///
-/// `anonymous` only ever reaches PIN Exchange: it is the length its PINs are
-/// minted at, which is the whole of what the option changes.
+/// `anonymous` belongs to PIN Exchange and Code Exchange. In the first it
+/// selects the longer-PIN signaling pool; in the second it selects the Tor
+/// fallback carried by the sender code.
 fn send_plan(mode: usize, anonymous: bool, paths: Vec<PathBuf>) -> WizardPlan {
     match mode {
         MODE_TOR => WizardPlan::SendTor(paths),
@@ -1003,10 +1004,10 @@ mod tests {
         ));
     }
 
-    /// The option is PIN Exchange's, the way the web app has it under that
-    /// mode's advanced options rather than as a mode of its own.
+    /// The option belongs to PIN Exchange and Code Exchange, under each mode
+    /// rather than as a mode of its own, and never to the Tor row.
     #[test]
-    fn the_anonymous_toggle_belongs_to_pin_exchange_alone() {
+    fn the_anonymous_toggle_belongs_to_pin_and_code_exchange() {
         let toggle = press(KeyCode::Char(ANONYMOUS_KEY));
 
         let Step::Continue(Screen::ModeMenu {
@@ -1026,6 +1027,15 @@ mod tests {
         };
         assert!(!anonymous);
 
+        let Step::Continue(Screen::ModeMenu {
+            selected, anonymous, ..
+        }) = mode_menu_key(MODE_CODE, false, toggle)
+        else {
+            panic!("the toggle should stay on the mode menu");
+        };
+        assert_eq!(selected, MODE_CODE);
+        assert!(anonymous, "a should turn the Code Exchange option on");
+
         // On the Tor row the key is not a toggle, so it falls through to the
         // menu's ordinary handling and changes nothing.
         let Step::Continue(Screen::ModeMenu {
@@ -1038,8 +1048,8 @@ mod tests {
         assert!(!anonymous);
     }
 
-    /// Turning it on and then picking files has to reach the plan: the browser
-    /// sits between the two and carries the answer across.
+    /// Turning it on and then picking files has to reach the plan: the file
+    /// browser sits between the mode menu and the completed selection.
     #[test]
     fn the_toggle_survives_the_file_browser() {
         let Step::Continue(Screen::FileBrowser { mode, anonymous, .. }) =

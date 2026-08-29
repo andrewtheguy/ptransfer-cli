@@ -3,8 +3,8 @@
 //! Code Exchange has no signaling server: the sender's offer and the
 //! receiver's answer are both carried by a person. The web app can carry them
 //! as QR codes or as base64 text; this CLI carries them as **base64 text
-//! only** — there is no camera at a terminal, and printing a QR grid a person
-//! would have to scan back into a shell buys nothing.
+//! only** today. Drawing the offer as a QR grid is on the roadmap; reading a
+//! code back is not, since there is no camera at a terminal.
 //!
 //! What travels is the same container either way:
 //!

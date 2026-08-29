@@ -2,7 +2,9 @@
 
 The interactive interface is the TUI wizard — run `ptransfer` with no
 arguments and follow the screens. The examples below show the equivalent
-non-interactive `test` mode, which exists for testing only.
+non-interactive commands. PIN Exchange's plain-text command is the `test`
+subcommand and exists for testing only; Code Exchange and Tor have their own
+subcommands.
 
 ## Send Between CLI and pTransfer
 
@@ -43,6 +45,35 @@ Test mode:
 ptransfer test send ./file.bin
 ptransfer test receive   # then type or pipe the PIN
 ```
+
+## Code Exchange
+
+Choose **Code Exchange** in the sending wizard and carry the sender code to
+the receiver, then carry the receiver's response back. A browser can scan or
+paste those containers; the CLI carries the same bytes as text, so either end
+may be a browser tab or another CLI.
+
+The ordinary public-Nostr fallback is automatic when no direct route can be
+made and the sender could prove enough relays before showing its code. Press
+`a` on the sending wizard's Code Exchange row to select the experimental Tor
+fallback instead; the receiver needs no flag because the sender code names the
+choice.
+
+Non-interactive commands:
+
+```bash
+# Leave this process running after it writes the offer; it will ask for the
+# receiver's response on stdin.
+ptransfer code send ./file.bin > offer.txt
+
+ptransfer code receive --output ./downloads < offer.txt > response.txt
+
+# Paste response.txt into the still-running sender.
+```
+
+Use `ptransfer code send --anonymous ./file.bin` to select the Tor fallback.
+The receiver can add `--simulate-no-direct` when deliberately exercising
+either available fallback on a network where a direct connection would work.
 
 ## Over Tor
 
