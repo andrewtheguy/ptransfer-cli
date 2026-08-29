@@ -696,7 +696,6 @@ mod tests {
         assert!(err.to_string().contains("same.txt"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinks_followed_for_files_skipped_for_dirs() {
         let dir = tempfile::tempdir().unwrap();

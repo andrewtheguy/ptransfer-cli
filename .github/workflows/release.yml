@@ -113,44 +113,8 @@ jobs:
           name: release-ptransfer-${{ matrix.suffix }}
           path: target/release/ptransfer-${{ matrix.suffix }}
 
-  build-windows:
-    needs: setup
-    # Windows binaries are only built for stable (non-prerelease) releases.
-    if: needs.setup.outputs.is_prerelease == 'false'
-    runs-on: windows-latest
-    env:
-      TARGET: x86_64-pc-windows-msvc
-      SUFFIX: windows-amd64
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build Release
-        run: cargo build --release --target ${{ env.TARGET }}
-
-      - name: Rename CLI binary
-        run: move target\${{ env.TARGET }}\release\ptransfer.exe target\release\ptransfer-${{ env.SUFFIX }}.exe
-
-      - name: Upload CLI release artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-ptransfer-${{ env.SUFFIX }}
-          path: target/release/ptransfer-${{ env.SUFFIX }}.exe
-
   create-release:
-    needs: [setup, build-linux, build-macos, build-windows]
-    # build-windows is skipped for prereleases; tolerate that while still
-    # requiring the other build jobs to have succeeded.
-    if: >-
-      always()
-      && needs.setup.result == 'success'
-      && needs.build-linux.result == 'success'
-      && needs.build-macos.result == 'success'
-      && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
+    needs: [setup, build-linux, build-macos]
     runs-on: ubuntu-latest
     steps:
       - name: Download all release artifacts
