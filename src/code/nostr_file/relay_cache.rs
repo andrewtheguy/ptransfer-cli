@@ -90,8 +90,17 @@ impl CachedRelay {
             .max(self.last_succeeded_at.unwrap_or(0))
     }
 
+    /// The latest verdict was a pass.
+    fn is_healthy(&self) -> bool {
+        self.consecutive_failures == 0 && self.last_succeeded_at.is_some()
+    }
+
+    /// Whether the entry is still worth keeping. A healthy relay is kept for
+    /// good: it is what a warm start with dead seeds runs on, and it is probed
+    /// again before it carries anything, so age costs one probe at most. Only
+    /// failures and unprobed listings age out.
     fn is_fresh(&self, now: u64) -> bool {
-        is_fresh(self.freshness(), now)
+        self.is_healthy() || is_fresh(self.freshness(), now)
     }
 }
 
@@ -159,8 +168,8 @@ impl Cache {
         by_url
     }
 
-    /// Drop expired entries and order the cache by how much a future transfer
-    /// wants each relay: proven storage relays first, then fewer failures,
+    /// Drop expired entries (healthy relays never expire) and order the cache
+    /// by how much a future transfer wants each relay: proven storage relays first, then fewer failures,
     /// then lower latency, then most recently seen. The cap then sheds
     /// repeatedly failing relays before ones the sweep has yet to reach.
     fn rank(&mut self, now: u64) {
@@ -244,10 +253,7 @@ impl Cache {
                         Capability::Storage => relay.supports_storage,
                         Capability::Control => relay.supports_control,
                     }
-                    && relay.consecutive_failures == 0
-                    && relay
-                        .last_succeeded_at
-                        .is_some_and(|at| is_fresh(at, now))
+                    && relay.is_healthy()
             })
             .collect();
         known_working.sort_by(|a, b| {
@@ -673,11 +679,14 @@ mod tests {
         assert_eq!(find(&cache, "wss://new.example").last_discovered_at, NOW);
         assert_eq!(find(&cache, "wss://old.example").last_discovered_at, NOW - 2 * HOUR);
 
-        // Past the TTL the candidate list is stale and the verdicts expire.
+        // Past the TTL the candidate list is stale and the failed and unprobed
+        // verdicts expire, but the healthy relays still lead the list.
         let mut stale = cache.clone();
         let merged = stale.merge_candidates(Vec::new(), &seeds(), Capability::Storage, NOW + 8 * 24 * HOUR);
-        assert!(merged.is_empty());
-        assert!(stale.relays.is_empty());
+        assert_eq!(merged, vec!["wss://fast.example", "wss://slow.example"]);
+        let mut kept: Vec<&str> = stale.relays.iter().map(|relay| relay.url.as_str()).collect();
+        kept.sort();
+        assert_eq!(kept, vec!["wss://fast.example", "wss://slow.example"]);
     }
 
     #[test]

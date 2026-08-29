@@ -130,9 +130,10 @@ pub const DISCOVERY_PAGE_LIMIT: usize = 500;
 pub const DISCOVERY_MAX_PAGES: usize = 20;
 pub const DISCOVERY_PAGE_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// How long a discovery or a verdict counts for. Generous, because nothing
-/// is trusted on the cache's word alone: a relay is probed again before it
-/// carries anything, so an old verdict costs one probe, never a transfer.
+/// How long a discovery or a failed verdict counts for. A healthy relay is
+/// exempt and stays cached until it fails: it is what a start with dead seeds
+/// runs on, and it is probed again before it carries anything, so an old
+/// verdict costs one probe, never a transfer.
 pub const RELAY_CANDIDATE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Relays kept in the cache — everything the sweep has found, proved, or
 /// buried. Far above [`DISCOVERY_CANDIDATE_CAP`] on purpose: each transfer
