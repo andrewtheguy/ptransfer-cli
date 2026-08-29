@@ -18,9 +18,15 @@ file/folder selection, output directory, and PIN entry.
   drives a SPAKE2 password-authenticated key exchange that derives the actual
   signaling and content keys. Nothing published to a relay can test a PIN guess
   offline. The receiver then reads an 8-character confirmation code to the
-  sender; nothing is sent until the sender enters a match. The web app's Code
-  Exchange (hand-carried QR/clipboard codes) is web-only and is not implemented
-  here.
+  sender; nothing is sent until the sender enters a match.
+- Code Exchange, compatible with the web app's, is the mode with no signaling
+  server at all: the sender shows a code, a person carries it to the receiver,
+  and the receiver's response comes back the same way — the sender's own paste
+  of that response is what admits a receiver, and it is checked against the
+  code being shown before anything moves. The web app can carry those codes as
+  QR grids; this CLI carries them as base64 text, which is the half of the
+  exchange a terminal can take part in and is enough to transfer with a browser
+  on the other end. See [Code Exchange](#code-exchange) below.
 - Anonymous signaling (experimental) is the same PIN
   Exchange with the relay sockets carried through Tor to a separate pool of
   onion-service relays, so no Nostr relay sees either device's IP address. The
@@ -28,6 +34,12 @@ file/folder selection, output directory, and PIN entry.
   receiver reads the mode off that length and is not asked. File bytes still
   take the direct WebRTC data channel, so this does not make a transfer
   anonymous.
+- Anonymous signaling and relay (experimental) is Code Exchange's own option,
+  and a different thing: when no direct route can be made, the file goes over a
+  temporary onion service the sender publishes, coordinated over the same
+  onion-service relay pool. Nothing extra is handed over for it — the password
+  is derived from the exchange on both devices and the address is announced
+  over the encrypted control channel — and it caps the transfer at 100 MiB.
 - Tor Onion Service is a second transfer mode, not a
   variant of PIN Exchange: the sender publishes a throwaway v3 onion service and
   a one-time password, and those two strings are the whole rendezvous — no
@@ -122,17 +134,19 @@ Transfers run inside the TUI with live status and progress.
 Only the sending side picks a mode. Its menu lists the web app's modes in the
 web app's order, so an option's position means the same thing in both, and adds
 the CLI's own Tor Onion Service after them.
-Anonymous signaling is not a mode there either: it is an option of PIN
-Exchange, toggled with `a` on that row and off unless asked for, the same place
-the web app keeps it. Picking Code Exchange says it is not implemented and
-stays on the menu; the other modes run a transfer.
+The anonymous option is not a mode there either: it belongs to the row it is
+on — signaling over Tor for PIN Exchange, a Tor fallback for Code Exchange —
+toggled with `a` and off unless asked for, the same place the web app keeps it.
 
-The receiving side is never asked which mode to use. A PIN and an onion address
-are told apart by their own contents, and a PIN's length says which relay pool
-its sender is on, so the single receive box reads the mode off what lands in it
-and names what it recognized — the same way the web app's receive screen works.
-A PIN starts the transfer; an onion address asks for the one-time password on
-the next screen, since that is a separate secret. Something of the right shape
+The receiving side is never asked which mode to use. A PIN, an onion address
+and a sender code are told apart by their own contents, and a PIN's length says
+which relay pool its sender is on, so the single receive box reads the mode off
+what lands in it and names what it recognized — the same way the web app's
+receive screen works.
+A PIN or a sender code starts the transfer; an onion address asks for the
+one-time password on the next screen, since that is a separate secret. A sender
+code is kilobytes of base64, so the box reports it by length rather than trying
+to draw it. Something of the right shape
 that fails its checksum is called out as a typo while it is still being typed.
 
 ### Non-Interactive Test Mode
@@ -160,6 +174,99 @@ exactly. The receiver then prints an
 8-character confirmation code which the sender must enter before the transfer
 continues. Multiple paths or a folder are sent as one ZIP. If the destination
 file already exists the receiver fails; pass `--overwrite` to replace it.
+
+### Code Exchange
+
+No relay is involved at any point: the sender shows a code, a person carries it
+to the receiver, and the receiver's response comes back the same way.
+
+```bash
+# Sending side. It prints the code and then waits, so leave it running.
+ptransfer code send ./file.bin > offer.txt
+
+# Receiving side, with the sender's code on stdin. It prints the response and
+# then waits too.
+ptransfer code receive --output ./downloads < offer.txt > response.txt
+
+# Back on the sending side: paste the response at its prompt, or pipe it in.
+```
+
+Codes go to stdout and everything else to stderr, so either side pipes cleanly
+and neither command needs a terminal. Both codes are read from stdin rather
+than taken as arguments: the offer is the secret for the whole transfer, and an
+argument is readable by every other process on the machine for as long as the
+command runs. A code that arrives wrapped across lines is still a whole code —
+lines are read until they add up to one, or until a blank line ends the paste.
+
+Pasting the response back is the confirmation step, and it is checked before it
+is acted on. The response carries a tag bound to the exact code being shown and
+to the response's own contents, so a response to a different transfer, an old
+one pasted again, or one altered on the way back is refused with *Response does
+not match this transfer* rather than turning into a connection that never
+opens. Anyone who obtained the code before it expired could produce a matching
+response, so treat the code as the secret for the whole transfer — what selects
+the recipient is the sender accepting the response that person returned, the
+same role the 8-character code plays in PIN Exchange.
+
+A code expires an hour after it is made. Multiple paths or a folder are sent as
+one ZIP, exactly as in PIN Exchange. If the destination file already exists the
+receiver fails; pass `--overwrite` to replace it.
+
+`--anonymous` adds a fallback for when no direct connection can be made:
+
+```bash
+ptransfer code send --anonymous ./file.bin
+```
+
+It changes nothing about the exchange — the code and the response are still
+carried by hand — and a direct WebRTC connection is still tried first. What it
+adds is where the file goes when there is no direct route: over a temporary
+onion service the sender publishes, with the two sides meeting over an
+encrypted control channel on onion-service Nostr relays. Neither of the Tor
+transport's two rendezvous values is handed over: the password is derived from
+the exchange on both devices and never transmitted, and the address is
+announced over that control channel, only after the sender has accepted a
+response. Both devices need internet, both spend a Tor bootstrap (started as
+soon as the code is shown, behind the direct attempt), the transfer is capped
+at 100 MiB, and it fails more often than a direct connection. The receiver
+needs no flag: the code says which fallback the sender chose.
+
+The receiving side has one option of its own, `--simulate-no-direct`, which
+answers as if no direct connection were possible: the response goes back with
+none of this device's network routes in it, so the sender falls back. It is the
+only way to exercise the fallback from a network where a direct connection
+would succeed — the situation a device behind a hostile NAT is in anyway — and
+it exists only for a code whose sender selected a fallback, since anywhere else
+it would only kill a working transfer. The web app offers the same thing as
+*Simulate no direct connection* under its response page's advanced options.
+
+Without `--anonymous` there is no fallback at all, and a failed direct route
+ends the transfer. The web app's other fallback — encrypted pieces on public
+Nostr relays — is not implemented here, so a code minted by this CLI names no
+relays, and a code from the web app that does name some is still taken but its
+relays go unused.
+
+The wizard covers the same transfer: the sender picks **Code Exchange** from
+its mode menu (with `a` for the anonymous fallback), and the receiver pastes
+the code into the one box it asks for. The wizard shows a code full-screen,
+offers it to the system clipboard over OSC 52 where the terminal allows it, and
+takes the response by paste. Where the clipboard is refused, `s` writes the
+code to a file and names the path — a code is taller than an ordinary terminal,
+so a mouse selection cannot take all of it. That file holds the same secret the
+code does and is removed as soon as the code leaves the screen. A response stays on screen until the sender turns
+up — a direct route that dies, or is simulated dead, does not clear it, because
+the sender still needs it to start the fallback — with what is happening behind
+it reported underneath. Pasting a code whose sender chose the anonymous
+fallback also brings up the receiving side's own option, `Tab` for *Simulate no
+direct connection* — the wizard's form of `--simulate-no-direct`, asked before
+the transfer starts rather than while a connection is already running.
+
+The container the codes travel in, the ECDH key schedule behind them, the
+confirmation tag, and the anonymous fallback's rendezvous are specified in the
+web app's
+[`docs/CODE_EXCHANGE_PROTOCOL.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/CODE_EXCHANGE_PROTOCOL.md),
+which both implementations follow; `docs/ARCHITECTURE.md` covers what is
+specific to this one.
 
 ### Tor Onion Service
 
@@ -271,10 +378,13 @@ address and a little more before it prints `ready`.
 
 The normative wire contract is the sibling pTransfer checkout's
 [`docs/INTEROP_PROTOCOL.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/INTEROP_PROTOCOL.md).
-It covers PIN Exchange and the shared data-channel transfer layer — exactly what
-this CLI implements — and carries an interop protocol version independent of
-pTransfer's app version. This build implements version `4`, declared in
-`package.metadata.ptransfer-protocol-version`.
+It covers PIN Exchange and the shared data-channel transfer layer, and carries
+an interop protocol version independent of pTransfer's app version. This build
+implements version `4`, declared in
+`package.metadata.ptransfer-protocol-version`. Code Exchange, anonymous
+signaling and the Tor transport sit outside that document and are specified by
+their own, versioned separately: `docs/CODE_EXCHANGE_PROTOCOL.md`,
+`docs/ANONYMOUS_SIGNALING.md`, and `docs/TOR_TRANSPORT.md`.
 
 - Rendezvous event: Nostr kind `4243` (a regular kind, so relays retain it for a
   receiver that connects after the sender published), tagged with a rotation-bucket-scoped
@@ -321,8 +431,12 @@ pTransfer's app version. This build implements version `4`, declared in
   the limit.
 - Received ZIPs are not auto-extracted, matching the web app.
 - No resume support.
-- No QR support.
-- No Code Exchange: hand-carried offer/answer codes are web-only.
+- No QR support: Code Exchange codes are copied and pasted as text, which is
+  the half of that exchange a terminal can take part in.
+- No clearnet relay fallback for Code Exchange: the web app's Nostr file relay
+  is not implemented, so a code minted here names no relays and a failed direct
+  route ends the transfer. Its anonymous Tor fallback *is* implemented, and
+  carries at most 100 MiB.
 - The Tor transport carries at most 100 MiB per transfer. Its browser/CLI
   interoperability contract and handshake version are specified separately
   from `INTEROP_PROTOCOL.md` in the web app's `docs/TOR_TRANSPORT.md`.
@@ -362,12 +476,18 @@ truth for everything the two share. Run them from a checkout of it:
 ```bash
 cd ../ptransfer
 bun run test:live:webrtc   # PIN Exchange over a real data channel
+bun run test:live:code     # Code Exchange, direct and its anonymous fallback
 bun run test:live:tor      # the Tor onion transport
 ```
 
+Run the one covering what you touched: anything in Code Exchange that both
+implementations share — the container, the key schedule, the confirmation tag,
+the anonymous fallback's rendezvous — needs `test:live:code` before it is
+considered done.
+
 They require internet access, Bun, a Chrome-family browser, and this checkout
 beside that one — `PTRANSFER_CLI_ROOT` and `PTRANSFER_BIN` override where each
-looks for it. The WebRTC one builds this CLI itself; the Tor one expects a
-`cargo build --release` build to already be there.
+looks for it. The WebRTC and Code Exchange ones build this CLI themselves; the
+Tor one expects a `cargo build --release` build to already be there.
 Both start the web development server when needed and leave byte-verified
 transfer artifacts in the temporary directory printed at the end.

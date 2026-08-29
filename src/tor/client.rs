@@ -18,7 +18,7 @@
 //! remains Arti's.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt as _;
@@ -144,13 +144,12 @@ impl TorClient {
 
         // Nothing above can build a multi-hop circuit until this lands: the
         // managers are all waiting on a directory that only arrives here.
-        ui::status("Fetching the Tor directory; this usually takes under a minute...");
-        let started = Instant::now();
+        let step = ui::status_step("Fetching the Tor directory; this usually takes under a minute...");
         let directory = netdir::download(&runtime, &circmgr, &config, None)
             .await
             .context("failed to fetch the Tor directory")?;
         netdir.publish(directory);
-        ui::status_timed("Fetched the Tor directory", started.elapsed());
+        step.done("Fetched the Tor directory");
 
         // The consensus expires; `serve` can outlive it.
         tokio::spawn(netdir::keep_current(

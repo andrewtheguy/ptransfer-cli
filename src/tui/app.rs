@@ -39,6 +39,22 @@ pub enum WizardPlan {
         pin: String,
         output: PathBuf,
     },
+    SendCode {
+        paths: Vec<PathBuf>,
+        /// Whether the offer asks for the Tor fallback when no direct route
+        /// exists. The sender's switch, carried in the code itself.
+        anonymous: bool,
+    },
+    ReceiveCode {
+        /// The sender's offer code, exactly as it was pasted.
+        offer: String,
+        output: PathBuf,
+        /// Whether to answer with none of this device's network routes in the
+        /// response, so the sender's direct attempt has nothing to connect to
+        /// and the offer's anonymous fallback runs instead. Only ever set for
+        /// an offer that has one.
+        simulate_no_direct: bool,
+    },
     SendTor(Vec<PathBuf>),
     ReceiveTor {
         address: String,
@@ -51,11 +67,12 @@ pub enum WizardPlan {
 /// app's order, so an option's number means the same thing in both interfaces.
 /// The Tor transport is the CLI's own third mode.
 ///
-/// Anonymous signaling is deliberately not a fourth entry. It is not a mode:
-/// it changes which relays PIN Exchange signals over and nothing else, and the
-/// web app has it as an advanced option of the PIN Exchange choice rather than
-/// beside it. It is the same here — a toggle on the [`MODE_PIN`] row, off
-/// until asked for.
+/// The anonymous option is deliberately not a fourth entry. It is not a mode:
+/// on PIN Exchange it changes which relays signaling goes over, and on Code
+/// Exchange it changes where a failed direct connection falls back to. The web
+/// app has it as an advanced option of each of those choices rather than
+/// beside them, and it is the same here — a toggle on the row it belongs to,
+/// off until asked for.
 ///
 /// There is no matching menu on the receiving side: what the sender hands over
 /// says which mode it is, so [`classify`] reads the mode off it.
@@ -68,35 +85,70 @@ const MODES: [&str; 3] = [
 /// One line of explanation per entry in [`MODES`].
 const MODE_HINTS: [&str; 3] = [
     "A short PIN over relays, then a direct WebRTC transfer.",
-    "Hand-carried connection codes. Not implemented in the CLI yet.",
+    "Codes you carry by hand. No relay sees the exchange.",
     "An onion address and a password. Slow; up to 100 MiB.",
 ];
 
 const MODE_PIN: usize = 0;
+const MODE_CODE: usize = 1;
 const MODE_TOR: usize = 2;
 
-/// The key that turns anonymous signaling on and off on the [`MODE_PIN`] row.
+/// The key that turns the anonymous option on and off, on the two rows that
+/// have one.
 const ANONYMOUS_KEY: char = 'a';
 
-/// What the toggle under the menu says, given its state.
-fn anonymous_toggle_line(on: bool) -> &'static str {
-    if on {
-        "[x] Anonymous signaling (experimental)   a to turn off"
-    } else {
-        "[ ] Anonymous signaling (experimental)   a to turn on"
+/// Whether the highlighted mode has an anonymous option at all.
+fn has_anonymous_option(mode: usize) -> bool {
+    mode == MODE_PIN || mode == MODE_CODE
+}
+
+/// What the toggle under the menu says, given the row it is on and its state.
+fn anonymous_toggle_line(mode: usize, on: bool) -> &'static str {
+    match (mode, on) {
+        (MODE_CODE, true) => "[x] Anonymous signaling and relay (experimental)   a to turn off",
+        (MODE_CODE, false) => "[ ] Anonymous signaling and relay (experimental)   a to turn on",
+        (_, true) => "[x] Anonymous signaling (experimental)   a to turn off",
+        (_, false) => "[ ] Anonymous signaling (experimental)   a to turn on",
     }
 }
 
 /// What the toggle does, said the same way whichever state it is in: this is
 /// the line someone reads to decide, so it cannot only appear once they have.
-const ANONYMOUS_TOGGLE_HINT: &str =
-    "Signaling over Tor, so relays never see an IP. Slow to start; longer PIN.";
+fn anonymous_toggle_hint(mode: usize) -> &'static str {
+    if mode == MODE_CODE {
+        "No direct route? Relay the file over Tor instead. Slow; up to 100 MiB."
+    } else {
+        "Signaling over Tor, so relays never see an IP. Slow to start; longer PIN."
+    }
+}
 
-const CODE_EXCHANGE_UNAVAILABLE: &str =
-    "Code Exchange is not implemented in the CLI yet — use PIN Exchange.";
+/// The key that turns the receiving side's simulated dead route on and off.
+///
+/// Not a letter, unlike the sending side's: the row it sits under is a text
+/// field, where every printable character is part of the value being typed.
+const SIMULATE_KEY: KeyCode = KeyCode::Tab;
+
+/// What the simulated-dead-route toggle says, in the state it is in.
+fn simulate_toggle_line(on: bool) -> &'static str {
+    if on {
+        "[x] Simulate no direct connection   Tab to turn off"
+    } else {
+        "[ ] Simulate no direct connection   Tab to turn on"
+    }
+}
+
+/// What the toggle does, said in both states for the same reason the sending
+/// side's hint is: this is the line someone reads to decide.
+fn simulate_toggle_hint(on: bool) -> &'static str {
+    if on {
+        "The response leaves out this device's routes, so the file comes over Tor."
+    } else {
+        "Drops the direct route on purpose, to exercise the sender's Tor fallback."
+    }
+}
 
 /// What the receive box accepts, in the wording every message naming it uses.
-const ACCEPTED: &str = "a PIN or an onion address";
+const ACCEPTED: &str = "a PIN, an onion address, or a sender code";
 
 /// What to say about text shaped like an onion address that is not one.
 const ONION_REJECTED: &str = "Not a valid onion address — check for typos";
@@ -109,9 +161,8 @@ enum Screen {
     /// from what it was handed.
     ModeMenu {
         selected: usize,
-        /// Set when the highlighted mode cannot be started, cleared on move.
-        notice: Option<String>,
-        /// Whether PIN Exchange will signal over the onion relay pool.
+        /// Whether the highlighted mode's anonymous option is on. Every mode
+        /// that has one starts with it off.
         anonymous: bool,
     },
     /// The browser is shared by every send mode, so it carries the mode it was
@@ -137,6 +188,10 @@ enum Screen {
         cursor: usize,
         /// Set by a submit with nothing to act on; cleared by the next edit.
         error: Option<String>,
+        /// Whether the simulated dead route is armed. Kept across edits, and
+        /// read only while what is in the box is an offer with a fallback, so
+        /// it can never reach a transfer that has nothing to fall back onto.
+        simulate: bool,
     },
     /// The second half of a Tor receive. The password is asked for only once
     /// the address is recognized, because it is a separate secret and the
@@ -166,6 +221,16 @@ enum Pasted {
     /// A valid v3 onion address, in whichever of its two spellings was pasted;
     /// the transfer re-splits it into the `<host>:<port>` its handshake binds.
     Onion(String),
+    /// A Code Exchange sender code: the whole offer, carried by hand.
+    Code {
+        /// Kept exactly as pasted, because the confirmation tag the response
+        /// carries is bound to a digest of exactly these bytes.
+        offer: String,
+        /// Whether the offer asks for the anonymous fallback. That is the only
+        /// thing a dead direct route can fall back onto, so it is also what
+        /// decides whether the simulated one is offered at all.
+        fallback: bool,
+    },
 }
 
 /// Why the receive box holds nothing to act on yet.
@@ -211,6 +276,15 @@ fn looks_like_pin(text: &str) -> bool {
         && text.chars().all(|c| pin_char(c).is_some())
 }
 
+/// Whether a receive-box value is too long to render as an editable line.
+///
+/// Only a Code Exchange offer ever is: a PIN is 12 or 16 characters and an
+/// onion address 62. The threshold sits above both with room to spare, so a
+/// half-typed value of either kind still edits normally.
+fn is_long_paste(text: &str) -> bool {
+    text.len() > 80
+}
+
 /// Whether the text has an onion address's shape, checksum aside.
 fn looks_like_onion(text: &str) -> bool {
     let host = match text.rsplit_once(':') {
@@ -244,6 +318,24 @@ fn classify(text: &str) -> Result<Pasted, Rejection> {
     // typo that survived to here would reach the plain internet.
     if crate::tor::split_address(text, crate::tor::DEFAULT_PORT).is_ok() {
         return Ok(Pasted::Onion(text.to_string()));
+    }
+
+    // A sender code is the one entry here with no shape of its own to guess
+    // at, so it is recognized by decoding: base64 that unwraps to a PT01
+    // container is one, and nothing else is.
+    if let Ok(binary) = crate::code::payload::from_clipboard(text)
+        && crate::code::payload::is_code_payload(&binary)
+    {
+        // A container that will not decode is still a sender code, and saying
+        // why — expired, or minted in some other hour — is the receive path's
+        // job, which reports the reason. All that is read out of it here is
+        // whether there is a fallback for the simulation to run into.
+        let fallback =
+            crate::code::payload::decode(&binary).is_ok_and(|offer| offer.is_anonymous());
+        return Ok(Pasted::Code {
+            offer: text.to_string(),
+            fallback,
+        });
     }
 
     if looks_like_pin(text) {
@@ -319,6 +411,7 @@ fn handle_key(screen: Screen, key: KeyEvent) -> Step {
                 input: String::new(),
                 cursor: 0,
                 error: None,
+                simulate: false,
             }),
         },
         Screen::ReceiveEntry {
@@ -326,7 +419,8 @@ fn handle_key(screen: Screen, key: KeyEvent) -> Step {
             input,
             cursor,
             error,
-        } => receive_entry_key(output, input, cursor, error, key),
+            simulate,
+        } => receive_entry_key(output, input, cursor, error, simulate, key),
         Screen::TorPassword {
             output,
             address,
@@ -344,6 +438,7 @@ fn handle_key(screen: Screen, key: KeyEvent) -> Step {
 fn send_plan(mode: usize, anonymous: bool, paths: Vec<PathBuf>) -> WizardPlan {
     match mode {
         MODE_TOR => WizardPlan::SendTor(paths),
+        MODE_CODE => WizardPlan::SendCode { paths, anonymous },
         _ => WizardPlan::SendPin {
             paths,
             pin_kind: if anonymous {
@@ -392,46 +487,34 @@ fn mode_menu() -> Screen {
 fn mode_menu_at(selected: usize, anonymous: bool) -> Screen {
     Screen::ModeMenu {
         selected,
-        notice: None,
         anonymous,
     }
 }
 
 fn mode_menu_key(selected: usize, anonymous: bool, key: KeyEvent) -> Step {
-    let stay = |notice: Option<String>| {
-        Step::Continue(Screen::ModeMenu {
-            selected,
-            notice,
-            anonymous,
-        })
-    };
 
-    // Code Exchange is a placeholder that keeps the CLI's mode numbering
-    // aligned with the web app's; every other mode runs a transfer.
-    let implemented = selected == MODE_PIN || selected == MODE_TOR;
-
-    // The option belongs to PIN Exchange, so the key does nothing on any other
-    // row rather than setting something that row would ignore.
-    if key.code == KeyCode::Char(ANONYMOUS_KEY) && selected == MODE_PIN {
+    // The option belongs to two of the three rows, so the key does nothing on
+    // the third rather than setting something that row would ignore.
+    if key.code == KeyCode::Char(ANONYMOUS_KEY) && has_anonymous_option(selected) {
         return Step::Continue(mode_menu_at(selected, !anonymous));
     }
 
     match key.code {
-        KeyCode::Enter if !implemented => stay(Some(CODE_EXCHANGE_UNAVAILABLE.to_string())),
         KeyCode::Enter => match Browser::new() {
             Ok(browser) => Step::Continue(Screen::FileBrowser {
                 mode: selected,
                 anonymous,
                 browser,
             }),
-            Err(_) => stay(None),
+            // A browser that cannot open its starting directory leaves the
+            // menu where it is rather than moving on to nothing.
+            Err(_) => Step::Continue(mode_menu_at(selected, anonymous)),
         },
         KeyCode::Esc => Step::Continue(Screen::MainMenu { selected: 0 }),
-        _ => Step::Continue(Screen::ModeMenu {
-            selected: menu_move(selected, MODES.len(), &key),
-            notice: None,
+        _ => Step::Continue(mode_menu_at(
+            menu_move(selected, MODES.len(), &key),
             anonymous,
-        }),
+        )),
     }
 }
 
@@ -445,13 +528,34 @@ fn receive_entry_key(
     mut input: String,
     mut cursor: usize,
     mut error: Option<String>,
+    simulate: bool,
     key: KeyEvent,
 ) -> Step {
+    // The toggle belongs to the one thing in the box that has something to
+    // fall back onto, so on anything else the key does nothing rather than
+    // arming a simulation the transfer would refuse to run.
+    if key.code == SIMULATE_KEY && simulate_offered(&input) {
+        return Step::Continue(Screen::ReceiveEntry {
+            output,
+            input,
+            cursor,
+            error,
+            simulate: !simulate,
+        });
+    }
+
     let mut edited = false;
     match key.code {
         KeyCode::Enter => match classify(&input) {
             Ok(Pasted::Pin { pin, .. }) => {
                 return Step::Finish(WizardPlan::ReceivePin { pin, output });
+            }
+            Ok(Pasted::Code { offer, fallback }) => {
+                return Step::Finish(WizardPlan::ReceiveCode {
+                    offer,
+                    output,
+                    simulate_no_direct: simulate && fallback,
+                });
             }
             Ok(Pasted::Onion(address)) => {
                 return Step::Continue(Screen::TorPassword {
@@ -481,7 +585,14 @@ fn receive_entry_key(
         input,
         cursor,
         error,
+        simulate,
     })
+}
+
+/// Whether what is in the receive box has a fallback to simulate a dead route
+/// into: a sender code, from a sender that turned the anonymous option on.
+fn simulate_offered(input: &str) -> bool {
+    matches!(classify(input), Ok(Pasted::Code { fallback: true, .. }))
 }
 
 /// The password half of a Tor receive.
@@ -514,6 +625,9 @@ fn tor_password_key(
                 cursor: address.len(),
                 input: address,
                 error: None,
+                // An onion address is what led here, and it has no fallback to
+                // simulate one into.
+                simulate: false,
             });
         }
         // The password is a PIN, so it filters exactly like one, and a full one
@@ -563,13 +677,19 @@ fn handle_paste(screen: Screen, pasted: &str) -> Step {
         // Trimmed, because a copied PIN or address routinely arrives with a
         // trailing newline, and nothing else is filtered — the field has to
         // hold either kind and [`classify`] judges the result.
-        Screen::ReceiveEntry { output, .. } => {
+        Screen::ReceiveEntry {
+            output, simulate, ..
+        } => {
             let input = pasted.trim().to_string();
             Step::Continue(Screen::ReceiveEntry {
                 output,
                 cursor: input.len(),
                 input,
                 error: None,
+                // Kept across the paste: pasting a second code is how a
+                // refused or stale offer is retried, and the choice made about
+                // the first one still stands.
+                simulate,
             })
         }
         Screen::TorPassword {
@@ -627,12 +747,11 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
 
         Screen::ModeMenu {
             selected,
-            notice,
             anonymous,
         } => {
             let inner = widgets::screen_frame(f, "send");
             // Three rows under the menu: the highlighted mode's hint, then the
-            // option that belongs to PIN Exchange and what it does.
+            // anonymous option of the mode that has one, and what it does.
             let area = widgets::centered(inner, 76, MODES.len() as u16 + 5);
             let [title, _, list, extra] = Layout::vertical([
                 Constraint::Length(1),
@@ -649,13 +768,16 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
                 Constraint::Length(1),
             ])
             .areas(extra);
-            match notice {
-                Some(notice) => widgets::error_line(f, hint, notice),
-                None => f.render_widget(Paragraph::new(MODE_HINTS[*selected]).dim(), hint),
-            }
-            if *selected == MODE_PIN {
-                f.render_widget(Paragraph::new(anonymous_toggle_line(*anonymous)), option);
-                f.render_widget(Paragraph::new(ANONYMOUS_TOGGLE_HINT).dim(), option_hint);
+            f.render_widget(Paragraph::new(MODE_HINTS[*selected]).dim(), hint);
+            if has_anonymous_option(*selected) {
+                f.render_widget(
+                    Paragraph::new(anonymous_toggle_line(*selected, *anonymous)),
+                    option,
+                );
+                f.render_widget(
+                    Paragraph::new(anonymous_toggle_hint(*selected)).dim(),
+                    option_hint,
+                );
             }
             widgets::key_hints(f, inner, "↑/↓ move · Enter select · Esc back");
         }
@@ -674,12 +796,18 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
             input,
             cursor,
             error,
+            simulate,
             ..
         } => {
             let inner = widgets::screen_frame(f, "receive");
-            let area = widgets::centered(inner, 76, 6);
-            let [title, line, extra] = Layout::vertical([
+            // Two rows taller once the box holds an offer with a fallback: the
+            // simulated dead route, and what turning it on does.
+            let offered = simulate_offered(input);
+            let area = widgets::centered(inner, 76, if offered { 8 } else { 6 });
+            let [title, line, extra, option, option_hint] = Layout::vertical([
                 Constraint::Length(2),
+                Constraint::Length(1),
+                Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Fill(1),
             ])
@@ -688,7 +816,25 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
                 Paragraph::new(format!("Paste {ACCEPTED} from the sender:")),
                 title,
             );
-            widgets::input_line(f, line, "> ", input, *cursor);
+            // A sender code is kilobytes of base64: rendering it into a
+            // one-line field would show a meaningless slice of it and put the
+            // cursor somewhere off screen, so it is summarized instead. What
+            // the summary calls it comes from the same classification the row
+            // below reports, so a long paste that is not a code is not
+            // announced as one.
+            if is_long_paste(input) {
+                let what = if matches!(classify(input), Ok(Pasted::Code { .. })) {
+                    "sender code"
+                } else {
+                    "unrecognized text"
+                };
+                f.render_widget(
+                    Paragraph::new(format!("> [{what}, {} characters]", input.len())),
+                    line,
+                );
+            } else {
+                widgets::input_line(f, line, "> ", input, *cursor);
+            }
             match (error.as_deref(), classify(input)) {
                 (Some(error), _) => widgets::error_line(f, extra, error),
                 // Naming what was recognized is the whole point of the screen:
@@ -710,12 +856,38 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
                     Paragraph::new("Onion address detected — the password comes next.").dim(),
                     extra,
                 ),
+                (None, Ok(Pasted::Code { .. })) => f.render_widget(
+                    Paragraph::new(
+                        "Sender code detected — you will get a response code to give back.",
+                    )
+                    .dim(),
+                    extra,
+                ),
                 (None, Err(rejection)) if rejection.while_typing() => {
                     widgets::error_line(f, extra, &rejection.message());
                 }
                 (None, Err(_)) => {}
             }
-            widgets::key_hints(f, inner, "Enter confirm · ←/→ move · Esc back");
+            // The web app keeps this under the response's advanced options,
+            // where it rebuilds a connection that is already running. Here it
+            // is asked before the transfer starts, which is the same choice a
+            // keystroke earlier.
+            if offered {
+                f.render_widget(Paragraph::new(simulate_toggle_line(*simulate)), option);
+                f.render_widget(
+                    Paragraph::new(simulate_toggle_hint(*simulate)).dim(),
+                    option_hint,
+                );
+            }
+            widgets::key_hints(
+                f,
+                inner,
+                if offered {
+                    "Enter confirm · Tab simulate no direct · Esc back"
+                } else {
+                    "Enter confirm · ←/→ move · Esc back"
+                },
+            );
         }
 
         Screen::TorPassword {
@@ -766,32 +938,31 @@ mod tests {
 
     const ONION: &str = "zrmxlosp6cvmkhxwhx7267wkvqyztsrmloqw76eu4fhn2gsbg5zk4kad.onion";
 
+    /// Every mode on the menu starts a transfer; none is a placeholder kept
+    /// only to align the numbering with the web app's any more.
     #[test]
-    fn code_exchange_reports_that_it_is_not_implemented() {
-        let step = mode_menu_key(1, false, press(KeyCode::Enter));
-
-        let Step::Continue(Screen::ModeMenu {
-            selected, notice, ..
-        }) = step
-        else {
-            panic!("Code Exchange should stay on the mode menu");
-        };
-        assert_eq!(selected, 1);
-        assert_eq!(notice.as_deref(), Some(CODE_EXCHANGE_UNAVAILABLE));
+    fn every_mode_starts_a_selection() {
+        for mode in 0..MODES.len() {
+            let step = mode_menu_key(mode, false, press(KeyCode::Enter));
+            let Step::Continue(Screen::FileBrowser { mode: chosen, .. }) = step else {
+                panic!("mode {mode} should open the file browser");
+            };
+            // The mode has to survive the shared browser to pick the right plan.
+            assert_eq!(chosen, mode);
+        }
     }
 
     #[test]
-    fn moving_off_a_notice_clears_it() {
-        let step = mode_menu_key(1, false, press(KeyCode::Up));
-
+    fn moving_the_selection_keeps_the_option() {
         let Step::Continue(Screen::ModeMenu {
-            selected, notice, ..
-        }) = step
+            selected,
+            anonymous,
+        }) = mode_menu_key(1, true, press(KeyCode::Up))
         else {
             panic!("expected the mode menu");
         };
         assert_eq!(selected, 0);
-        assert!(notice.is_none());
+        assert!(anonymous);
     }
 
     #[test]
@@ -803,16 +974,6 @@ mod tests {
             panic!("Esc should return to the main menu");
         };
         assert_eq!(selected, 0);
-    }
-
-    #[test]
-    fn the_tor_mode_starts_a_selection_rather_than_a_notice() {
-        let step = mode_menu_key(MODE_TOR, false, press(KeyCode::Enter));
-        let Step::Continue(Screen::FileBrowser { mode, .. }) = step else {
-            panic!("Tor should open the file browser");
-        };
-        // The mode has to survive the shared browser to pick the right plan.
-        assert_eq!(mode, MODE_TOR);
     }
 
     #[test]
@@ -938,6 +1099,194 @@ mod tests {
         );
     }
 
+    /// A sender code as the sending side would hand it over, with the
+    /// anonymous option `anonymous` says.
+    fn sender_code(anonymous: bool) -> String {
+        use crate::code::payload::{
+            CODE_SALT_LEN, PUBLIC_KEY_LEN, PayloadKind, SignalingPayload, encode, now_ms,
+            to_clipboard,
+        };
+        let offer = SignalingPayload {
+            kind: PayloadKind::Offer,
+            sdp: "v=0\r\n".to_string(),
+            candidates: vec![],
+            created_at: now_ms(),
+            public_key: vec![4u8; PUBLIC_KEY_LEN],
+            confirm: None,
+            file_name: Some("report.pdf".to_string()),
+            file_size: Some(1024),
+            content_encoding: Some(crate::wire::WireEncoding::DeflateRaw),
+            mime_type: Some("application/pdf".to_string()),
+            salt: Some(vec![7u8; CODE_SALT_LEN]),
+            relays: None,
+            anon: anonymous.then_some(true),
+        };
+        to_clipboard(&encode(&offer).unwrap())
+    }
+
+    /// The receiving side is not asked which mode a code is either, and the
+    /// one thing read out of it before the transfer starts is whether the
+    /// sender left it a fallback.
+    #[test]
+    fn a_pasted_sender_code_is_recognized_with_its_fallback() {
+        let anonymous = sender_code(true);
+        assert_eq!(
+            classify(&anonymous),
+            Ok(Pasted::Code {
+                offer: anonymous,
+                fallback: true,
+            })
+        );
+
+        let plain = sender_code(false);
+        let Ok(Pasted::Code { offer, fallback }) = classify(&format!("  {plain}\n")) else {
+            panic!("a sender code should be recognized");
+        };
+        assert_eq!(offer, plain, "the code is kept exactly as it was pasted");
+        assert!(!fallback, "this sender turned the anonymous option off");
+    }
+
+    /// The receiver's half of the simulated dead route, which the web app has
+    /// under the response's advanced options: it exists to exercise the
+    /// sender's fallback from a network where a direct route would work.
+    #[test]
+    fn the_simulated_dead_route_is_offered_only_where_there_is_a_fallback() {
+        let code = sender_code(true);
+        let toggle = press(SIMULATE_KEY);
+
+        let Step::Continue(Screen::ReceiveEntry { simulate, .. }) = receive_entry_key(
+            PathBuf::from("."),
+            code.clone(),
+            code.len(),
+            None,
+            false,
+            toggle,
+        ) else {
+            panic!("the toggle should stay on the receive screen");
+        };
+        assert!(simulate, "Tab should arm the simulation");
+
+        let Step::Finish(WizardPlan::ReceiveCode {
+            simulate_no_direct, ..
+        }) = receive_entry_key(
+            PathBuf::from("."),
+            code.clone(),
+            code.len(),
+            None,
+            true,
+            press(KeyCode::Enter),
+        )
+        else {
+            panic!("a sender code should finish the wizard");
+        };
+        assert!(simulate_no_direct, "the choice has to reach the transfer");
+
+        // And back off again.
+        let Step::Continue(Screen::ReceiveEntry { simulate, .. }) =
+            receive_entry_key(PathBuf::from("."), code.clone(), code.len(), None, true, toggle)
+        else {
+            panic!("the toggle should stay on the receive screen");
+        };
+        assert!(!simulate);
+    }
+
+    /// Armed on one code and then handed another that has nothing to fall back
+    /// onto, the flag cannot reach the transfer: it would only be refused
+    /// there, and this screen is where the difference is visible.
+    #[test]
+    fn a_code_without_a_fallback_never_carries_the_simulation() {
+        let plain = sender_code(false);
+
+        // The key is not a toggle here, so it changes nothing.
+        let Step::Continue(Screen::ReceiveEntry { simulate, .. }) = receive_entry_key(
+            PathBuf::from("."),
+            plain.clone(),
+            plain.len(),
+            None,
+            false,
+            press(SIMULATE_KEY),
+        ) else {
+            panic!("expected the receive entry screen");
+        };
+        assert!(!simulate);
+
+        let Step::Finish(WizardPlan::ReceiveCode {
+            simulate_no_direct, ..
+        }) = receive_entry_key(
+            PathBuf::from("."),
+            plain.clone(),
+            plain.len(),
+            None,
+            true,
+            press(KeyCode::Enter),
+        )
+        else {
+            panic!("a sender code should finish the wizard");
+        };
+        assert!(!simulate_no_direct);
+    }
+
+    /// An option nobody can see is not one, and this is the only thing on the
+    /// receiving side that is not settled by what was pasted.
+    #[test]
+    fn the_receive_box_shows_the_toggle_only_where_it_applies() {
+        for (code, shown) in [(sender_code(true), true), (sender_code(false), false)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 20)).unwrap();
+            let mut screen = Screen::ReceiveEntry {
+                output: PathBuf::from("."),
+                cursor: code.len(),
+                input: code,
+                error: None,
+                simulate: false,
+            };
+            terminal.draw(|f| draw(f, &mut screen)).unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert_eq!(
+                rendered.contains("Simulate no direct connection"),
+                shown,
+                "the toggle should{} be on screen",
+                if shown { "" } else { " not" }
+            );
+        }
+    }
+
+    /// A value too long to draw is summarized, and the summary says what the
+    /// row under it says: text of that length that is not a code is not
+    /// announced as one.
+    #[test]
+    fn a_long_paste_is_summarized_as_what_it_classifies_as() {
+        for (input, label) in [
+            (sender_code(true), "sender code"),
+            ("x".repeat(200), "unrecognized text"),
+        ] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 20)).unwrap();
+            let mut screen = Screen::ReceiveEntry {
+                output: PathBuf::from("."),
+                cursor: input.len(),
+                input,
+                error: None,
+                simulate: false,
+            };
+            terminal.draw(|f| draw(f, &mut screen)).unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains(label), "expected {label:?} on screen");
+        }
+    }
+
     #[test]
     fn a_pasted_onion_address_is_recognized_in_either_spelling() {
         assert_eq!(classify(ONION), Ok(Pasted::Onion(ONION.to_string())));
@@ -988,6 +1337,7 @@ mod tests {
             format!(" {pin} "),
             pin.len(),
             None,
+            false,
             press(KeyCode::Enter),
         ) else {
             panic!("a valid PIN should finish the wizard");
@@ -1002,6 +1352,7 @@ mod tests {
             "not-anything".to_string(),
             12,
             None,
+            false,
             press(KeyCode::Enter),
         ) else {
             panic!("expected the receive entry screen");
@@ -1023,6 +1374,7 @@ mod tests {
             format!("  {ONION}  "),
             ONION.len(),
             None,
+            false,
             press(KeyCode::Enter),
         )
         else {
@@ -1076,6 +1428,7 @@ mod tests {
             input: String::new(),
             cursor: 0,
             error: None,
+            simulate: false,
         };
 
         for c in "a│b".chars() {
@@ -1106,6 +1459,7 @@ mod tests {
             input: "old".to_string(),
             cursor: 3,
             error: Some("stale".to_string()),
+            simulate: false,
         };
         let pin = crate::crypto::pin::generate_pin(PinKind::Standard).unwrap();
 

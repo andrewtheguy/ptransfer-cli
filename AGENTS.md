@@ -4,4 +4,4 @@
 - run cargo clippy to lint after rust code changes.
 - no cargo fmt
 - document common ptransfer specs not specific to cli only on the ptransfer project's documentation instead of here
-- the live interoperability tests are not in this repo: they live in the sibling ptransfer checkout and are run from there with its bun scripts, `bun run test:live:webrtc` for PIN Exchange over a data channel and `bun run test:live:tor` for the onion transport. Both drive this checkout, so run them after a change to anything the two implementations share
+- the live interoperability tests are not in this repo: they live in the sibling ptransfer checkout and are run from there with its bun scripts, `bun run test:live:webrtc` for PIN Exchange over a data channel, `bun run test:live:code` for Code Exchange, and `bun run test:live:tor` for the onion transport. All three drive this checkout, so run the matching one after a change to anything the two implementations share

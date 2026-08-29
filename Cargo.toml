@@ -8,8 +8,12 @@ publish = false
 [package.metadata]
 # The interoperable protocol version this build implements: INTEROP_PROTOCOL_VERSION
 # in the pTransfer web app's src/lib/protocol.ts, specified by its
-# docs/INTEROP_PROTOCOL.md. Deliberately not pTransfer's npm version — that moves
-# for web-only changes (Code Exchange, the relay fallback) this CLI does not implement.
+# docs/INTEROP_PROTOCOL.md, which covers PIN Exchange and the shared
+# data-channel transfer layer. Deliberately not pTransfer's npm version — that
+# moves for web-only changes (the multi-QR codes, the clearnet relay fallback)
+# this CLI does not implement. The modes outside that document — Code Exchange,
+# anonymous signaling, the Tor transport — carry their own contracts and are
+# not versioned here.
 ptransfer-protocol-version = "4"
 
 [lib]

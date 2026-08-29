@@ -11,8 +11,9 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -37,12 +38,23 @@ pub enum FileExistsChoice {
 /// What a transfer flow reports while running, for the TUI to render.
 #[derive(Debug)]
 pub enum UiEvent {
-    Status(String),
-    /// A newer form of the most recent [`UiEvent::Status`] line — its progress
-    /// while it runs, or its completion ("Doing X..." → "Did X (elapsed)").
-    /// The TUI replaces that line instead of appending, so a step that reports
-    /// a hundred times still costs one row.
-    StatusDone(String),
+    Status {
+        /// Identifies the line, so a later revision can find it again.
+        id: u64,
+        line: String,
+    },
+    /// The finished form of the [`UiEvent::Status`] line with this `id`
+    /// ("Doing X..." → "Did X (elapsed)"). The TUI rewrites that line instead
+    /// of appending, so a step costs one row however long it took.
+    ///
+    /// Keyed by id rather than "the last line", because steps overlap: the Tor
+    /// bootstrap reports from a background task while the foreground is
+    /// reporting its own, and the two would otherwise overwrite each other's
+    /// rows and leave a log nobody can read a sequence out of.
+    StatusReplace {
+        id: u64,
+        line: String,
+    },
     Progress {
         dir: Direction,
         bytes: u64,
@@ -67,6 +79,18 @@ pub enum UiEvent {
     },
     /// The onion descriptor is published, so the address is now reachable.
     TorPublished,
+    /// A Code Exchange code the operator has to carry to the other device:
+    /// the sender's offer, or the receiver's response.
+    ShowCode {
+        label: String,
+        code: String,
+    },
+    /// The code has been acted on and is no longer worth showing.
+    HideCode,
+    /// Sender-side request for the response the receiver is showing.
+    ResponseCodeInput {
+        reply: oneshot::Sender<String>,
+    },
     /// Receiver-side code the user must read to the sender.
     ShowConfirmationCode(String),
     HideConfirmationCode,
@@ -118,37 +142,64 @@ fn sink() -> Option<&'static mpsc::UnboundedSender<UiEvent>> {
     TUI_SINK.get()
 }
 
+/// Ids for status lines. A counter rather than a position, so a line can still
+/// be found after other steps have reported over it.
+static NEXT_STATUS_ID: AtomicU64 = AtomicU64::new(0);
+
+fn next_status_id() -> u64 {
+    NEXT_STATUS_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Informational status line (stderr).
 pub fn status(line: &str) {
     if let Some(tx) = sink() {
-        let _ = tx.send(UiEvent::Status(line.to_string()));
+        let _ = tx.send(UiEvent::Status {
+            id: next_status_id(),
+            line: line.to_string(),
+        });
     } else {
         eprintln!("{line}");
     }
 }
 
-/// Informational status line with elapsed time, completing the step announced
-/// by the preceding [`status`] call.
-pub fn status_timed(line: &str, elapsed: Duration) {
-    let full = format!("{line} ({})", format_elapsed(elapsed));
-    if let Some(tx) = sink() {
-        let _ = tx.send(UiEvent::StatusDone(full));
-    } else {
-        eprintln!("{full}");
-    }
-}
-
-/// Replace the most recent status line with a newer form of the same step.
+/// A status line that will be rewritten in place when its step reports again.
 ///
-/// For a long step whose only news is that it is still going. The TUI
-/// overwrites the row it already has, so a minute of Tor bootstrap progress
-/// costs one line rather than a scrolling wall of them; without a sink each
-/// update is its own line on stderr, which is why callers throttle.
-pub fn status_update(line: &str) {
+/// Held by the step it announces, so "Fetching the Tor directory..." becomes
+/// "Fetched the Tor directory (36.5 s)" on the row it was written to, however
+/// many other steps reported in between. Without a sink there is no row to
+/// rewrite and the completion is simply a second line on stderr.
+#[must_use = "a step that is never completed leaves its line saying it is still running"]
+pub struct StatusStep {
+    id: u64,
+    started: Instant,
+}
+
+/// Announce a step and keep hold of its line.
+pub fn status_step(line: &str) -> StatusStep {
+    let id = next_status_id();
     if let Some(tx) = sink() {
-        let _ = tx.send(UiEvent::StatusDone(line.to_string()));
+        let _ = tx.send(UiEvent::Status {
+            id,
+            line: line.to_string(),
+        });
     } else {
         eprintln!("{line}");
+    }
+    StatusStep {
+        id,
+        started: Instant::now(),
+    }
+}
+
+impl StatusStep {
+    /// Rewrite the step's line as finished, with how long it took.
+    pub fn done(self, line: &str) {
+        let line = format!("{line} ({})", format_elapsed(self.started.elapsed()));
+        if let Some(tx) = sink() {
+            let _ = tx.send(UiEvent::StatusReplace { id: self.id, line });
+        } else {
+            eprintln!("{line}");
+        }
     }
 }
 
@@ -242,6 +293,124 @@ pub fn tor_published() {
     // The line callers script against: nothing can connect before it.
     println!("ready");
     let _ = std::io::stdout().flush();
+}
+
+/// Present a Code Exchange code for the operator to carry.
+///
+/// The code goes to stdout and everything else to stderr, so a piped run
+/// captures the code alone — it is a couple of kilobytes of base64, which is
+/// worth redirecting rather than reading.
+pub fn show_code(label: &str, code: &str) {
+    if let Some(tx) = sink() {
+        let _ = tx.send(UiEvent::ShowCode {
+            label: label.to_string(),
+            code: code.to_string(),
+        });
+        return;
+    }
+    eprintln!("{label}");
+    println!("{code}");
+    let _ = std::io::stdout().flush();
+}
+
+/// Stop showing a code that has been acted on. Plain mode prints nothing: the
+/// code is already scrolled into the terminal's history, where it is harmless
+/// once the session it belongs to has moved on.
+pub fn hide_code() {
+    if let Some(tx) = sink() {
+        let _ = tx.send(UiEvent::HideCode);
+    }
+}
+
+/// Assemble a hand-carried code from `reader`, however it was wrapped.
+///
+/// A code is a couple of kilobytes of base64, and everything that carries one
+/// is free to break it across lines — a mail client, a chat window, a terminal
+/// that soft-wrapped the paste it was given. The protocol says whitespace and
+/// line wrapping around a code are ignored, so reading a single line would
+/// refuse a code that arrived completely intact.
+///
+/// Lines are taken until they add up to a code that decodes, or until a blank
+/// line or end of input says there are no more. The first rule is what makes a
+/// one-line paste finish on its own Enter, the way it always did; the second
+/// is how a code that will never decode — expired, or from another hour — ends
+/// up reported as that rather than waiting forever for a line that would fix
+/// it.
+fn read_code(reader: &mut impl std::io::BufRead, noun: &str) -> Result<String> {
+    let mut code = String::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            // Nothing yet is a blank line before the paste, not the end of it.
+            if code.is_empty() {
+                continue;
+            }
+            break;
+        }
+        code.push_str(trimmed);
+        if is_complete_code(&code) {
+            break;
+        }
+    }
+    if code.is_empty() {
+        return Err(anyhow!("no {noun} on stdin"));
+    }
+    Ok(code)
+}
+
+/// Whether what has been read so far is a whole code. Only a complete
+/// container decodes, so this is what says another line is not needed.
+fn is_complete_code(text: &str) -> bool {
+    crate::code::payload::from_clipboard(text)
+        .is_ok_and(|binary| crate::code::payload::decode(&binary).is_ok())
+}
+
+/// Read a hand-carried code from stdin, prompting with `label` at a terminal.
+///
+/// The prompt says a blank line ends the paste, because that is the way out
+/// for a code this side cannot decode: an expired one, or one from a wrapped
+/// paste that lost a line on the way.
+pub async fn read_code_from_stdin(label: &'static str, noun: &'static str) -> Result<String> {
+    use std::io::IsTerminal;
+
+    tokio::task::spawn_blocking(move || {
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            eprint!("{label} (paste it; a blank line ends it): ");
+            std::io::stderr().flush()?;
+        }
+        read_code(&mut stdin.lock(), noun)
+    })
+    .await?
+}
+
+/// Read the receiver's response code, which is Code Exchange's confirmation
+/// step: nothing enters this session unless the operator puts it there.
+pub async fn prompt_response_code() -> Result<String> {
+    if let Some(tx) = sink() {
+        let (reply, rx) = oneshot::channel();
+        tx.send(UiEvent::ResponseCodeInput { reply })
+            .map_err(|_| anyhow!("TUI closed"))?;
+        return rx.await.map_err(|_| anyhow!("TUI closed"));
+    }
+
+    eprint!("Paste the receiver's response code (a blank line ends it): ");
+    std::io::stderr().flush()?;
+    // A detached OS thread, for the same reason the confirmation prompt uses
+    // one: Tokio's blocking pool waits for a stuck stdin read when the runtime
+    // is dropped, and this read has no deadline over it.
+    let (reply, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let result = read_code(&mut stdin.lock(), "response code");
+        let _ = reply.send(result);
+    });
+    rx.await.map_err(|_| anyhow!("response code input closed"))?
 }
 
 /// Display the ECDH-derived code the receiver must read to the sender.
@@ -359,6 +528,79 @@ fn prompt_file_exists_blocking(path: &Path) -> Result<FileExistsChoice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A code that arrives wrapped is a code: everything that carries one may
+    /// break it across lines, and the container is the same bytes either way.
+    #[test]
+    fn a_wrapped_code_is_read_as_one_value() {
+        let code = sample_code();
+        let wrapped: String = code
+            .as_bytes()
+            .chunks(64)
+            .map(|row| format!("{}\n", String::from_utf8_lossy(row)))
+            .collect();
+        assert!(wrapped.lines().count() > 1, "the sample should wrap");
+
+        let mut reader = std::io::Cursor::new(wrapped.into_bytes());
+        assert_eq!(read_code(&mut reader, "sender code").unwrap(), code);
+    }
+
+    /// The common case still finishes on its own Enter rather than waiting for
+    /// a line that is not coming.
+    #[test]
+    fn a_single_line_code_needs_no_terminator() {
+        let code = sample_code();
+        // Nothing after the newline: a reader that wanted more would block on
+        // a terminal, and here it would read past the value.
+        let mut reader = std::io::Cursor::new(format!("{code}\n").into_bytes());
+        assert_eq!(read_code(&mut reader, "sender code").unwrap(), code);
+    }
+
+    /// Text that will never decode — an expired code, a paste that lost a line
+    /// — ends at the blank line and is reported, not waited on.
+    #[test]
+    fn an_unreadable_paste_ends_at_a_blank_line() {
+        let mut reader = std::io::Cursor::new(b"not-a-code
+still-not
+
+left over
+".to_vec());
+        assert_eq!(read_code(&mut reader, "sender code").unwrap(), "not-a-codestill-not");
+
+        let mut empty = std::io::Cursor::new(b"
+
+".to_vec());
+        assert_eq!(
+            read_code(&mut empty, "sender code").unwrap_err().to_string(),
+            "no sender code on stdin"
+        );
+    }
+
+    /// A code as a sender hands it over, for the readers above.
+    fn sample_code() -> String {
+        use crate::code::payload::{
+            CODE_SALT_LEN, PUBLIC_KEY_LEN, PayloadKind, SignalingPayload, encode, now_ms,
+            to_clipboard,
+        };
+        to_clipboard(
+            &encode(&SignalingPayload {
+                kind: PayloadKind::Offer,
+                sdp: "v=0\r\n".to_string(),
+                candidates: vec![],
+                created_at: now_ms(),
+                public_key: vec![4u8; PUBLIC_KEY_LEN],
+                confirm: None,
+                file_name: Some("report.pdf".to_string()),
+                file_size: Some(1024),
+                content_encoding: Some(crate::wire::WireEncoding::DeflateRaw),
+                mime_type: Some("application/pdf".to_string()),
+                salt: Some(vec![7u8; CODE_SALT_LEN]),
+                relays: None,
+                anon: None,
+            })
+            .unwrap(),
+        )
+    }
 
     #[test]
     fn confirmation_code_input_rejects_whitespace_only() {
