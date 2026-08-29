@@ -48,8 +48,8 @@ pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://nos.lol",
     "wss://relay.primal.net",
     "wss://nostr.rocks",
-    "wss://relay.nostr.pub",
-    "wss://relay.snort.social",
+    "wss://relay.nostr.com",
+    "wss://nostr.oxtr.dev",
 ];
 
 /// Claim, confirm, and WebRTC signal events: an *ephemeral* kind, so relays
