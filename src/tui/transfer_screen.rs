@@ -205,6 +205,24 @@ struct ShownCode {
     /// stop at the end instead of scrolling into blank space.
     page: usize,
     rows: usize,
+    /// Where the code was written for an operator who can use neither the
+    /// clipboard nor a mouse selection, and `None` until they ask for it.
+    saved: Option<PathBuf>,
+    /// Set when that write failed, so the offer to make it is withdrawn
+    /// instead of silently doing nothing.
+    save_failed: bool,
+}
+
+/// The saved copy is the code, and the code is this transfer's whole secret,
+/// so it lives exactly as long as the code is on screen. A killed process can
+/// still leave one behind, the same way an interrupted receiver leaves a
+/// `.part` file behind.
+impl Drop for ShownCode {
+    fn drop(&mut self) {
+        if let Some(path) = &self.saved {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl ShownCode {
@@ -247,6 +265,34 @@ fn copy_to_clipboard(text: &str) -> bool {
     write!(stdout, "\x1b]52;c;{encoded}\x07")
         .and_then(|()| stdout.flush())
         .is_ok()
+}
+
+/// Write `text` where the operator can read it with another tool, and say
+/// where that is.
+///
+/// A terminal selection is the fallback for a terminal that ignores OSC 52,
+/// and it only reaches what is on screen: a code is a couple of kilobytes, so
+/// on an ordinary terminal it is several screens tall and no single selection
+/// can take all of it. A file is the only carrier left. It is created private
+/// to this user and removed when the code leaves the screen, because it holds
+/// the same secret the code does.
+fn save_code(text: &str) -> Result<PathBuf> {
+    use std::io::Write as _;
+
+    let path = std::env::temp_dir().join(format!("ptransfer-code-{}.txt", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    // A trailing newline, because everything that will read this file back —
+    // `cat`, an editor, a mail client — expects one.
+    writeln!(file, "{text}")?;
+    file.flush()?;
+    Ok(path)
 }
 
 /// What the Tor sender is showing its operator to hand over.
@@ -357,6 +403,8 @@ impl State {
                     scroll: 0,
                     page: 1,
                     rows: 1,
+                    saved: None,
+                    save_failed: false,
                 });
             }
             UiEvent::HideCode => self.code = None,
@@ -434,6 +482,19 @@ impl State {
                 let copied = copy_to_clipboard(&code.code);
                 code.copied = copied;
             }
+            // The way out of a terminal that has neither a working OSC 52 nor
+            // a screen tall enough to select the whole code from.
+            KeyCode::Char('s') => match save_code(&code.code) {
+                Ok(path) => {
+                    // The previous copy, if any, is this same path rewritten.
+                    code.saved = Some(path);
+                    code.save_failed = false;
+                }
+                Err(error) => {
+                    log::warn!("the code could not be saved to a file: {error:#}");
+                    code.save_failed = true;
+                }
+            },
             KeyCode::Enter | KeyCode::Backspace => self.response_code_key(key),
             _ => {}
         }
@@ -514,9 +575,9 @@ impl State {
             "type the code · Enter submit · Ctrl-C abort"
         } else if self.code.is_some() {
             if self.response_prompt.is_some() {
-                "paste the response · Enter send · c copy · ↑/↓ scroll · Ctrl-C abort"
+                "paste the response · Enter send · c copy · s save · ↑/↓ scroll · Ctrl-C abort"
             } else {
-                "c copy · ↑/↓ scroll · Ctrl-C abort"
+                "c copy · s save · ↑/↓ scroll · Ctrl-C abort"
             }
         } else if self.pin.is_some() {
             "r new PIN · Ctrl-C abort"
@@ -593,15 +654,41 @@ impl State {
             .iter()
             .map(|line| Line::from(line.as_str()).dim())
             .collect();
-        lines.push(if code.copied {
-            "Sent to your clipboard (c to copy again) — or select it above."
+        // A selection reaches only what is drawn, so once the code is taller
+        // than the screen the hand-copy fallback is a file rather than the
+        // mouse — and saying "select it above" there would be advice that
+        // cannot work.
+        let selectable = code.rows <= code.page;
+        let carrier: Line = match (&code.saved, code.save_failed, code.copied) {
+            (Some(path), _, _) => format!(
+                "Saved to {} — copy it from there; c retries the clipboard.",
+                path.display()
+            )
+            .dim()
+            .into(),
+            (None, true, _) => "The code could not be saved to a file; c retries the clipboard."
                 .dim()
-                .into()
-        } else {
-            "Select it above to copy; your terminal refused the clipboard."
+                .into(),
+            (None, false, true) if selectable => {
+                "Sent to your clipboard (c to copy again) — or select it above."
+                    .dim()
+                    .into()
+            }
+            (None, false, true) => "Sent to your clipboard (c to copy again) — or s to save it."
                 .dim()
-                .into()
-        });
+                .into(),
+            (None, false, false) if selectable => {
+                "Select it above to copy; your terminal refused the clipboard."
+                    .dim()
+                    .into()
+            }
+            (None, false, false) => {
+                "Too long to select in one go — s saves it to a file, c retries the clipboard."
+                    .dim()
+                    .into()
+            }
+        };
+        lines.push(carrier);
         if code.rows > code.page {
             lines.push(
                 format!(
@@ -874,6 +961,8 @@ mod tests {
             scroll: 0,
             page: 1,
             rows: 1,
+            saved: None,
+            save_failed: false,
         });
 
         // What is happening behind the overlay belongs on it: the overlay
@@ -914,6 +1003,75 @@ mod tests {
                 .any(|row| row.contains("Waiting for the sender to publish")),
             "the overlay should carry what is happening behind it: {rows:#?}"
         );
+    }
+
+    /// A code taller than the screen cannot be taken in one mouse selection,
+    /// which is the fallback for a terminal that ignores OSC 52. Telling the
+    /// operator to select it would be advice that cannot work, so the overlay
+    /// offers the file instead — and `s` writes exactly the code.
+    #[tokio::test]
+    async fn a_code_too_tall_to_select_is_offered_as_a_file() {
+        let code = "A".repeat(2000);
+        let mut state = State::new(&WizardPlan::SendPin {
+            paths: Vec::new(),
+            pin_kind: crate::crypto::pin::PinKind::Standard,
+        });
+        // Set directly for the same reason as above: no OSC 52 into the test
+        // run's own terminal.
+        state.code = Some(ShownCode {
+            label: "Give this code to the receiver:".to_string(),
+            code: code.clone(),
+            copied: false,
+            scroll: 0,
+            page: 1,
+            rows: 1,
+            saved: None,
+            save_failed: false,
+        });
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let rendered = |terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+                        state: &mut State| {
+            terminal.draw(|f| state.render(f)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<String>>()
+        };
+
+        let rows = rendered(&mut terminal, &mut state);
+        assert!(
+            rows.iter().any(|row| row.contains("s saves it to a file")),
+            "a code that does not fit should offer the file: {rows:#?}"
+        );
+
+        state.code_key(KeyCode::Char('s'));
+        let path = state
+            .code
+            .as_ref()
+            .and_then(|code| code.saved.clone())
+            .expect("s should have saved the code");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            code,
+            "the file has to hold the code byte for byte"
+        );
+
+        let rows = rendered(&mut terminal, &mut state);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Saved to") && row.contains("copy it from there")),
+            "the overlay should say where the code went: {rows:#?}"
+        );
+
+        // The file holds the transfer's secret, so it goes when the code does.
+        state.apply(UiEvent::HideCode);
+        assert!(!path.exists(), "the saved code should not outlive the code");
     }
 
     #[tokio::test]

@@ -322,6 +322,73 @@ pub fn hide_code() {
     }
 }
 
+/// Assemble a hand-carried code from `reader`, however it was wrapped.
+///
+/// A code is a couple of kilobytes of base64, and everything that carries one
+/// is free to break it across lines — a mail client, a chat window, a terminal
+/// that soft-wrapped the paste it was given. The protocol says whitespace and
+/// line wrapping around a code are ignored, so reading a single line would
+/// refuse a code that arrived completely intact.
+///
+/// Lines are taken until they add up to a code that decodes, or until a blank
+/// line or end of input says there are no more. The first rule is what makes a
+/// one-line paste finish on its own Enter, the way it always did; the second
+/// is how a code that will never decode — expired, or from another hour — ends
+/// up reported as that rather than waiting forever for a line that would fix
+/// it.
+fn read_code(reader: &mut impl std::io::BufRead, noun: &str) -> Result<String> {
+    let mut code = String::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            // Nothing yet is a blank line before the paste, not the end of it.
+            if code.is_empty() {
+                continue;
+            }
+            break;
+        }
+        code.push_str(trimmed);
+        if is_complete_code(&code) {
+            break;
+        }
+    }
+    if code.is_empty() {
+        return Err(anyhow!("no {noun} on stdin"));
+    }
+    Ok(code)
+}
+
+/// Whether what has been read so far is a whole code. Only a complete
+/// container decodes, so this is what says another line is not needed.
+fn is_complete_code(text: &str) -> bool {
+    crate::code::payload::from_clipboard(text)
+        .is_ok_and(|binary| crate::code::payload::decode(&binary).is_ok())
+}
+
+/// Read a hand-carried code from stdin, prompting with `label` at a terminal.
+///
+/// The prompt says a blank line ends the paste, because that is the way out
+/// for a code this side cannot decode: an expired one, or one from a wrapped
+/// paste that lost a line on the way.
+pub async fn read_code_from_stdin(label: &'static str, noun: &'static str) -> Result<String> {
+    use std::io::IsTerminal;
+
+    tokio::task::spawn_blocking(move || {
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            eprint!("{label} (paste it; a blank line ends it): ");
+            std::io::stderr().flush()?;
+        }
+        read_code(&mut stdin.lock(), noun)
+    })
+    .await?
+}
+
 /// Read the receiver's response code, which is Code Exchange's confirmation
 /// step: nothing enters this session unless the operator puts it there.
 pub async fn prompt_response_code() -> Result<String> {
@@ -332,25 +399,15 @@ pub async fn prompt_response_code() -> Result<String> {
         return rx.await.map_err(|_| anyhow!("TUI closed"));
     }
 
-    eprint!("Paste the receiver's response code: ");
+    eprint!("Paste the receiver's response code (a blank line ends it): ");
     std::io::stderr().flush()?;
     // A detached OS thread, for the same reason the confirmation prompt uses
     // one: Tokio's blocking pool waits for a stuck stdin read when the runtime
     // is dropped, and this read has no deadline over it.
     let (reply, rx) = oneshot::channel();
     std::thread::spawn(move || {
-        let mut input = String::new();
-        let result = std::io::stdin()
-            .read_line(&mut input)
-            .map_err(anyhow::Error::from)
-            .and_then(|_| {
-                let input = input.trim();
-                if input.is_empty() {
-                    Err(anyhow!("no response code entered"))
-                } else {
-                    Ok(input.to_string())
-                }
-            });
+        let stdin = std::io::stdin();
+        let result = read_code(&mut stdin.lock(), "response code");
         let _ = reply.send(result);
     });
     rx.await.map_err(|_| anyhow!("response code input closed"))?
@@ -471,6 +528,79 @@ fn prompt_file_exists_blocking(path: &Path) -> Result<FileExistsChoice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A code that arrives wrapped is a code: everything that carries one may
+    /// break it across lines, and the container is the same bytes either way.
+    #[test]
+    fn a_wrapped_code_is_read_as_one_value() {
+        let code = sample_code();
+        let wrapped: String = code
+            .as_bytes()
+            .chunks(64)
+            .map(|row| format!("{}\n", String::from_utf8_lossy(row)))
+            .collect();
+        assert!(wrapped.lines().count() > 1, "the sample should wrap");
+
+        let mut reader = std::io::Cursor::new(wrapped.into_bytes());
+        assert_eq!(read_code(&mut reader, "sender code").unwrap(), code);
+    }
+
+    /// The common case still finishes on its own Enter rather than waiting for
+    /// a line that is not coming.
+    #[test]
+    fn a_single_line_code_needs_no_terminator() {
+        let code = sample_code();
+        // Nothing after the newline: a reader that wanted more would block on
+        // a terminal, and here it would read past the value.
+        let mut reader = std::io::Cursor::new(format!("{code}\n").into_bytes());
+        assert_eq!(read_code(&mut reader, "sender code").unwrap(), code);
+    }
+
+    /// Text that will never decode — an expired code, a paste that lost a line
+    /// — ends at the blank line and is reported, not waited on.
+    #[test]
+    fn an_unreadable_paste_ends_at_a_blank_line() {
+        let mut reader = std::io::Cursor::new(b"not-a-code
+still-not
+
+left over
+".to_vec());
+        assert_eq!(read_code(&mut reader, "sender code").unwrap(), "not-a-codestill-not");
+
+        let mut empty = std::io::Cursor::new(b"
+
+".to_vec());
+        assert_eq!(
+            read_code(&mut empty, "sender code").unwrap_err().to_string(),
+            "no sender code on stdin"
+        );
+    }
+
+    /// A code as a sender hands it over, for the readers above.
+    fn sample_code() -> String {
+        use crate::code::payload::{
+            CODE_SALT_LEN, PUBLIC_KEY_LEN, PayloadKind, SignalingPayload, encode, now_ms,
+            to_clipboard,
+        };
+        to_clipboard(
+            &encode(&SignalingPayload {
+                kind: PayloadKind::Offer,
+                sdp: "v=0\r\n".to_string(),
+                candidates: vec![],
+                created_at: now_ms(),
+                public_key: vec![4u8; PUBLIC_KEY_LEN],
+                confirm: None,
+                file_name: Some("report.pdf".to_string()),
+                file_size: Some(1024),
+                content_encoding: Some(crate::wire::WireEncoding::DeflateRaw),
+                mime_type: Some("application/pdf".to_string()),
+                salt: Some(vec![7u8; CODE_SALT_LEN]),
+                relays: None,
+                anon: None,
+            })
+            .unwrap(),
+        )
+    }
 
     #[test]
     fn confirmation_code_input_rejects_whitespace_only() {

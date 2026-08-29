@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use ptransfer_cli::tor;
 use ptransfer_cli::crypto::pin::PinKind;
 use ptransfer_cli::util::{OnConflict, is_interrupted};
-use ptransfer_cli::{archive, code, tui, webrtc};
+use ptransfer_cli::{archive, code, tui, ui, webrtc};
 
 #[derive(Parser)]
 #[command(name = "ptransfer")]
@@ -328,8 +328,10 @@ async fn async_main() -> Result<()> {
                     // Read like a secret rather than taken as an argument: the
                     // offer is the secret for the whole transfer, and an
                     // argument is readable in the process list for as long as
-                    // the receiver runs.
-                    let offer = read_secret("Sender code", "sender code").await?;
+                    // the receiver runs. Read as a code rather than a line,
+                    // because a code that reaches a terminal wrapped is still
+                    // a whole code.
+                    let offer = ui::read_code_from_stdin("Sender code", "sender code").await?;
                     code::receive_file_code(&offer, output, on_conflict, simulate_no_direct)
                         .await
                 }

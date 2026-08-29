@@ -55,6 +55,16 @@ pub const CODE_SALT_LEN: usize = 16;
 /// Uncompressed SEC1 P-256 public key, as the payload carries it.
 pub const PUBLIC_KEY_LEN: usize = 65;
 
+/// The widest `createdAt` a payload may carry: milliseconds since the epoch,
+/// through the end of year 9999.
+///
+/// A hand-carried payload's stamp is an arbitrary number until something says
+/// otherwise, and everything this side does with it is arithmetic — the age
+/// against now, the session deadline a TTL past it. Bounding it here is what
+/// keeps that arithmetic from overflowing on a value nobody could mean, which
+/// in a release build would come out the other side looking fresh.
+const MAX_CREATED_AT_MS: i64 = 253_402_300_799_999;
+
 /// A payload's own bound on decompressed size. An offer is a couple of
 /// kilobytes; this only stops a hand-carried blob from being a deflate bomb.
 const MAX_PAYLOAD_BYTES: u64 = 512 * 1024;
@@ -124,6 +134,9 @@ impl SignalingPayload {
         if self.public_key.len() != PUBLIC_KEY_LEN {
             bail!("signaling payload carries a malformed public key");
         }
+        if !(0..=MAX_CREATED_AT_MS).contains(&self.created_at) {
+            bail!("signaling payload carries a timestamp that is not a time");
+        }
         match self.kind {
             PayloadKind::Offer => {
                 // Nothing earlier exists for an offer's tag to be bound to.
@@ -156,7 +169,19 @@ impl SignalingPayload {
                 }
             }
             PayloadKind::Answer => {
-                if self.salt.is_some() || self.relays.is_some() || self.anon.is_some() {
+                // Every offer-only field, not just the three that steer a
+                // fallback: none of them is covered by the answer transcript
+                // the confirmation tag is computed over, so one carried here
+                // would be a correctly tagged field nothing agreed on — the
+                // file's own name and size among them.
+                if self.salt.is_some()
+                    || self.relays.is_some()
+                    || self.anon.is_some()
+                    || self.file_name.is_some()
+                    || self.file_size.is_some()
+                    || self.content_encoding.is_some()
+                    || self.mime_type.is_some()
+                {
                     bail!("an answer carries no offer-only fields");
                 }
                 let Some(confirm) = self.confirm.as_deref() else {
@@ -312,7 +337,10 @@ pub fn decode(binary: &[u8]) -> Result<SignalingPayload> {
 /// `createdAt` on both sides, so an answer is judged against the offer it
 /// answers rather than against its own stamp.
 pub fn check_freshness(created_at: i64) -> Result<()> {
-    let age = now_ms() - created_at;
+    // Saturating, not wrapping: validation bounds the stamp, and this is the
+    // one place that arithmetic is reached from, so the two together are what
+    // makes a stamp nobody could mean report as stale rather than as fresh.
+    let age = now_ms().saturating_sub(created_at);
     if age > TRANSFER_EXPIRATION_MS {
         bail!("This code has expired. Ask for a fresh one.");
     }
@@ -472,6 +500,58 @@ mod tests {
     fn the_payload_is_not_readable_in_the_clear() {
         let encoded = encode(&offer()).unwrap();
         assert!(!encoded.windows(4).any(|window| window == b"mag!"));
+    }
+
+    /// Offer-only means every offer-only field. None of them is covered by
+    /// the answer transcript the confirmation tag is computed over, so an
+    /// answer carrying one would be a correctly tagged claim about a file that
+    /// nothing agreed to — the sender's own metadata, overwritten on the way
+    /// back.
+    #[test]
+    fn an_answer_carrying_any_offer_only_field_is_refused() {
+        /// One offer-only field set on an answer.
+        type Mutation = fn(&mut SignalingPayload);
+        let mutations: [(&str, Mutation); 7] = [
+            ("salt", |p| p.salt = Some(vec![7u8; CODE_SALT_LEN])),
+            ("relays", |p| p.relays = Some(vec!["wss://relay".to_string()])),
+            ("anon", |p| p.anon = Some(true)),
+            ("fileName", |p| p.file_name = Some("other.pdf".to_string())),
+            ("fileSize", |p| p.file_size = Some(1)),
+            ("contentEncoding", |p| {
+                p.content_encoding = Some(WireEncoding::Identity)
+            }),
+            ("mimeType", |p| p.mime_type = Some("text/plain".to_string())),
+        ];
+        for (field, mutate) in mutations {
+            let mut payload = answer();
+            mutate(&mut payload);
+            let encoded = encode(&payload).unwrap();
+            assert!(
+                decode(&encoded).is_err(),
+                "an answer carrying {field} should be refused"
+            );
+        }
+        // And the answer they were derived from is still accepted.
+        assert!(decode(&encode(&answer()).unwrap()).is_ok());
+    }
+
+    /// A stamp is an arbitrary number carried by hand until something bounds
+    /// it, and every use of it here is arithmetic. Out of range it is refused;
+    /// were it not, the age of `i64::MIN` would wrap in a release build and
+    /// come out looking like a code minted moments ago.
+    #[test]
+    fn a_timestamp_nothing_could_mean_is_refused() {
+        for stamp in [i64::MIN, -1, MAX_CREATED_AT_MS + 1, i64::MAX] {
+            let mut payload = offer();
+            payload.created_at = stamp;
+            let encoded = encode(&payload).unwrap();
+            assert!(decode(&encoded).is_err(), "{stamp} is not a time");
+        }
+
+        // Nothing before validation can be relied on to have run, so the check
+        // that reads a stamp does not overflow on one either.
+        assert!(check_freshness(i64::MIN).is_err());
+        assert!(check_freshness(i64::MAX).is_ok());
     }
 
     #[test]

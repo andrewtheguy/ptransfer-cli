@@ -195,7 +195,8 @@ Codes go to stdout and everything else to stderr, so either side pipes cleanly
 and neither command needs a terminal. Both codes are read from stdin rather
 than taken as arguments: the offer is the secret for the whole transfer, and an
 argument is readable by every other process on the machine for as long as the
-command runs.
+command runs. A code that arrives wrapped across lines is still a whole code —
+lines are read until they add up to one, or until a blank line ends the paste.
 
 Pasting the response back is the confirmation step, and it is checked before it
 is acted on. The response carries a tag bound to the exact code being shown and
@@ -249,7 +250,10 @@ The wizard covers the same transfer: the sender picks **Code Exchange** from
 its mode menu (with `a` for the anonymous fallback), and the receiver pastes
 the code into the one box it asks for. The wizard shows a code full-screen,
 offers it to the system clipboard over OSC 52 where the terminal allows it, and
-takes the response by paste. A response stays on screen until the sender turns
+takes the response by paste. Where the clipboard is refused, `s` writes the
+code to a file and names the path — a code is taller than an ordinary terminal,
+so a mouse selection cannot take all of it. That file holds the same secret the
+code does and is removed as soon as the code leaves the screen. A response stays on screen until the sender turns
 up — a direct route that dies, or is simulated dead, does not clear it, because
 the sender still needs it to start the fallback — with what is happening behind
 it reported underneath. Pasting a code whose sender chose the anonymous

@@ -268,6 +268,26 @@ The web app's multi-QR offer path is not implemented and does not need to be:
 both sides carry the same container, and the copy/paste half is enough to
 transfer with a browser on the other end.
 
+**Three ways off the screen, because two of them do not always work.** OSC 52
+is refused by terminals that do not implement it and by tmux unless it is
+turned on, and a mouse selection reaches only what is drawn — a code is several
+screens tall on an ordinary terminal, so no single selection can take all of
+it. `s` is the third: it writes the code to a file in the temporary directory,
+private to this user, and names the path. The file holds what the code holds,
+so it is removed when the code leaves the screen. What the overlay offers
+follows what can actually work: it stops suggesting a selection once the code
+does not fit in one.
+
+**A code is read as a code, not as a line.** Whatever carries a code may wrap
+it — a mail client, a chat window, a terminal that soft-wrapped the paste — and
+[`CODE_EXCHANGE_PROTOCOL.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/CODE_EXCHANGE_PROTOCOL.md)
+§6 says whitespace and wrapping around a code are ignored. So the stdin
+readers for the offer and the response take lines until they add up to a
+container that decodes, or until a blank line or EOF says there are no more.
+The first rule is what lets an unwrapped paste finish on its own Enter; the
+second is how a code that will never decode is reported as that instead of
+waiting for a line that would fix it.
+
 **Modules.** `src/code/payload.rs` is the container — obfuscation, validation,
 and the two transcript digests; `keys.rs` is the ECDH agreement and every
 derivation off it; `sender.rs` and `receiver.rs` are the two halves of the
