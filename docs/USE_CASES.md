@@ -2,9 +2,8 @@
 
 The interactive interface is the TUI wizard — run `ptransfer` with no
 arguments and follow the screens. The examples below show the equivalent
-non-interactive commands. PIN Exchange's plain-text command is the `test`
-subcommand and exists for testing only; Code Exchange and Tor have their own
-subcommands.
+non-interactive commands: the `pin`, `code` and `tor` subcommands, one per
+mode.
 
 ## Send Between CLI and pTransfer
 
@@ -13,10 +12,10 @@ Run `ptransfer`, choose **Send** and pick files and/or folders in the browser
 Multiple files or a folder arrive as one ZIP, exactly as if they had been sent
 from the web app.
 
-Test mode:
+Non-interactive:
 
 ```bash
-ptransfer test send ./file.bin ./photos
+ptransfer pin send ./file.bin ./photos
 ```
 
 ## Receive From pTransfer
@@ -25,11 +24,11 @@ Start a send in pTransfer with **PIN Exchange**, then run `ptransfer`, choose
 **Receive**, pick the output directory, and paste the PIN. There is no mode to
 choose on this side — the PIN itself says which one it is.
 
-Test mode (fails if the destination exists; add `--overwrite` to replace):
+Non-interactive (fails if the destination exists; add `--overwrite` to replace):
 
 ```bash
 # The PIN is read from stdin, never from the command line
-ptransfer test receive --output ./downloads
+ptransfer pin receive --output ./downloads
 ```
 
 ## CLI to CLI
@@ -39,11 +38,11 @@ and enter the sender's PIN on the receiving side. Read the receiver's
 8-character confirmation code back to the sender and enter it there to start
 the transfer.
 
-Test mode:
+Non-interactive:
 
 ```bash
-ptransfer test send ./file.bin
-ptransfer test receive   # then type or pipe the PIN
+ptransfer pin send ./file.bin
+ptransfer pin receive   # then type or pipe the PIN
 ```
 
 ## Code Exchange
@@ -89,7 +88,7 @@ and gets the address and password to hand over. The receiving side chooses
 a PIN would go into; being an onion address is what selects this mode, and the
 password is asked for on the screen after it.
 
-Test mode:
+Non-interactive:
 
 ```bash
 # sender: prints the address and password, then `ready`
@@ -122,12 +121,12 @@ presses `a` to turn **Anonymous signaling** on before picking files — it is an
 option of that mode, not a mode of its own, exactly as it is in the web app.
 The receiving side does exactly what it does for any other PIN.
 
-Test mode:
+Non-interactive:
 
 ```bash
 # sender: prints a 16-character PIN
-ptransfer test send --anonymous ./file.bin
+ptransfer pin send --anonymous ./file.bin
 
 # receiver: no flag; the PIN says the rest, and comes in on stdin
-ptransfer test receive --output ./downloads
+ptransfer pin receive --output ./downloads
 ```

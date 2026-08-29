@@ -161,22 +161,23 @@ code is kilobytes of base64, so the box reports it by length rather than trying
 to draw it. Something of the right shape
 that fails its checksum is called out as a typo while it is still being typed.
 
-### Non-Interactive Test Mode
+### Non-Interactive PIN Exchange
 
-The `test` subcommand exists for testing only. Paths and options come from
-arguments; its PIN and confirmation code are read from stdin, prompted for at a
-terminal and piped in from a script, so neither appears in the process list.
-The separate `tor receive` command applies the same rule to its password.
+The `pin` subcommand runs PIN Exchange without the wizard, for scripts and
+pipes. Paths and options come from arguments; its PIN and confirmation code
+are read from stdin, prompted for at a terminal and piped in from a script, so
+neither appears in the process list. The separate `tor receive` command
+applies the same rule to its password.
 
 ```bash
-ptransfer test send /path/to/file more-files a-folder
+ptransfer pin send /path/to/file more-files a-folder
 
 # The PIN is typed at the prompt, or piped
-ptransfer test receive --output /path/to/dir
-echo "$PIN" | ptransfer test receive --output /path/to/dir
+ptransfer pin receive --output /path/to/dir
+echo "$PIN" | ptransfer pin receive --output /path/to/dir
 
 # Anonymous signaling; the receiver needs no flag
-ptransfer test send --anonymous /path/to/file
+ptransfer pin send --anonymous /path/to/file
 ```
 
 The sender prints a case-sensitive 12-character PIN on stdout — 16 characters

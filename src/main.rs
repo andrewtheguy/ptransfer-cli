@@ -1,10 +1,10 @@
 //! ptransfer-cli: the pTransfer command-line client for peer-to-peer file transfer.
 //!
 //! Running with no arguments launches the full-screen TUI wizard, which covers
-//! all three transfer modes. The `code` and `tor` subcommands run Code Exchange
-//! and the onion transport non-interactively, and the `test` subcommand exposes
-//! PIN Exchange the same way for testing. Code Exchange codes are copied and
-//! pasted as text; drawing an offer QR is on the roadmap, reading one is not.
+//! all three transfer modes. The `pin`, `code` and `tor` subcommands run PIN
+//! Exchange, Code Exchange and the onion transport non-interactively, for
+//! scripts and pipes. Code Exchange codes are copied and pasted as text;
+//! drawing an offer QR is on the roadmap, reading one is not.
 //! Build with: cargo build --release
 
 use anyhow::Result;
@@ -27,10 +27,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Non-interactive plain-text mode, for testing only
-    Test {
+    /// PIN Exchange: a short PIN typed on the other device
+    Pin {
         #[command(subcommand)]
-        command: TestCommands,
+        command: PinCommands,
 
         /// Use verbose logging
         #[arg(short, long, global = true)]
@@ -159,8 +159,12 @@ enum TorCommands {
     },
 }
 
+/// File transfer through the signaling relays: the sender prints a rotating
+/// PIN, the receiver enters it, and the file goes over a direct WebRTC data
+/// channel. The PIN and the confirmation code go to stdout and everything
+/// else to stderr, so either side can be piped.
 #[derive(Subcommand)]
-enum TestCommands {
+enum PinCommands {
     /// Send files and/or folders; multiple inputs are bundled into one ZIP.
     Send {
         /// Files and/or directories to send
@@ -264,7 +268,7 @@ async fn async_main() -> Result<()> {
             tui::run().await
         }
 
-        Some(Commands::Test { command, verbose }) => {
+        Some(Commands::Pin { command, verbose }) => {
             // Without --verbose, keep the transfer output clean: suppress
             // info/debug/trace log noise from this crate and its dependencies,
             // leaving only warnings and errors. RUST_LOG still overrides both.
@@ -272,7 +276,7 @@ async fn async_main() -> Result<()> {
             init_logging(&format!("{log_level},webrtc_ice=error"));
 
             match command {
-                TestCommands::Send {
+                PinCommands::Send {
                     paths,
                     anonymous,
                 } => {
@@ -288,7 +292,7 @@ async fn async_main() -> Result<()> {
                     webrtc::send_file_nostr(&source, pin_kind).await
                 }
 
-                TestCommands::Receive { output, overwrite } => {
+                PinCommands::Receive { output, overwrite } => {
                     let on_conflict = if overwrite {
                         OnConflict::Overwrite
                     } else {
@@ -395,13 +399,13 @@ mod tests {
     #[test]
     fn test_send_takes_multiple_paths() {
         let cli =
-            Cli::try_parse_from(["ptransfer", "test", "send", "a.txt", "b", "dir"]).unwrap();
-        let Some(Commands::Test {
-            command: TestCommands::Send { paths, .. },
+            Cli::try_parse_from(["ptransfer", "pin", "send", "a.txt", "b", "dir"]).unwrap();
+        let Some(Commands::Pin {
+            command: PinCommands::Send { paths, .. },
             ..
         }) = cli.command
         else {
-            panic!("expected test send");
+            panic!("expected pin send");
         };
         assert_eq!(paths.len(), 3);
     }
@@ -412,22 +416,22 @@ mod tests {
     #[test]
     fn only_test_send_takes_anonymous() {
         let cli =
-            Cli::try_parse_from(["ptransfer", "test", "send", "a.txt", "--anonymous"]).unwrap();
-        let Some(Commands::Test {
-            command: TestCommands::Send { anonymous, .. },
+            Cli::try_parse_from(["ptransfer", "pin", "send", "a.txt", "--anonymous"]).unwrap();
+        let Some(Commands::Pin {
+            command: PinCommands::Send { anonymous, .. },
             ..
         }) = cli.command
         else {
-            panic!("expected test send");
+            panic!("expected pin send");
         };
         assert!(anonymous);
 
-        assert!(Cli::try_parse_from(["ptransfer", "test", "receive", "--anonymous"]).is_err());
+        assert!(Cli::try_parse_from(["ptransfer", "pin", "receive", "--anonymous"]).is_err());
     }
 
     #[test]
     fn test_send_requires_a_path() {
-        assert!(Cli::try_parse_from(["ptransfer", "test", "send"]).is_err());
+        assert!(Cli::try_parse_from(["ptransfer", "pin", "send"]).is_err());
     }
 
     /// The PIN comes from stdin, so an argument that looks like one is rejected
@@ -435,10 +439,10 @@ mod tests {
     /// Tor transport's password follows.
     #[test]
     fn test_receive_never_takes_the_pin_as_an_argument() {
-        assert!(Cli::try_parse_from(["ptransfer", "test", "receive"]).is_ok());
-        assert!(Cli::try_parse_from(["ptransfer", "test", "receive", "PIN123"]).is_err());
+        assert!(Cli::try_parse_from(["ptransfer", "pin", "receive"]).is_ok());
+        assert!(Cli::try_parse_from(["ptransfer", "pin", "receive", "PIN123"]).is_err());
         assert!(
-            Cli::try_parse_from(["ptransfer", "test", "receive", "PIN123", "--overwrite"])
+            Cli::try_parse_from(["ptransfer", "pin", "receive", "PIN123", "--overwrite"])
                 .is_err()
         );
     }
@@ -561,13 +565,13 @@ mod tests {
 
     #[test]
     fn test_receive_parses_overwrite() {
-        let cli = Cli::try_parse_from(["ptransfer", "test", "receive", "--overwrite"]).unwrap();
-        let Some(Commands::Test {
-            command: TestCommands::Receive { overwrite, .. },
+        let cli = Cli::try_parse_from(["ptransfer", "pin", "receive", "--overwrite"]).unwrap();
+        let Some(Commands::Pin {
+            command: PinCommands::Receive { overwrite, .. },
             ..
         }) = cli.command
         else {
-            panic!("expected test receive");
+            panic!("expected pin receive");
         };
         assert!(overwrite);
     }
