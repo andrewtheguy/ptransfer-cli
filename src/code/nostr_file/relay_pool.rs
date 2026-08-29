@@ -59,6 +59,10 @@ pub struct HealthyRelay {
 pub struct Probed {
     /// Relays that passed, fastest first, capped at the pass's target.
     pub healthy: Vec<HealthyRelay>,
+    /// Every relay that passed, including the ones that came in after the
+    /// target had filled — their sockets are closed, but their verdicts are
+    /// as good as any other's, and a later pass can take them unprobed.
+    pub passed: Vec<HealthyRelay>,
     /// Every relay that got a verdict, passed or failed. What is left of the
     /// candidate list after these is what a later pass has any reason to try.
     pub checked: HashSet<String>,
@@ -222,11 +226,13 @@ pub async fn health_check(
         next: usize,
         checked: HashSet<String>,
         healthy: Vec<HealthyRelay>,
+        passed: Vec<HealthyRelay>,
     }
     let state = Mutex::new(Progress {
         next: 0,
         checked: HashSet::new(),
         healthy: Vec::new(),
+        passed: Vec::new(),
     });
     let workers = HEALTH_CHECK_CONCURRENCY.min(candidates.len().max(1));
     let run = |_worker: usize| async {
@@ -244,6 +250,15 @@ pub async fn health_check(
             let rtt = probe_relay(pool, url, opts.timeout, opts.probe_bytes).await;
             let (checked, healthy, kept) = {
                 let mut state = state.lock().expect("health check state");
+                // Every verdict is kept, whether or not the target had room
+                // left for it: what this pass cannot use, the next one takes
+                // without paying for the probe again.
+                if let Some(rtt) = rtt {
+                    state.passed.push(HealthyRelay {
+                        url: url.clone(),
+                        rtt,
+                    });
+                }
                 // Re-checked here: sibling probes may have filled the target
                 // while this one was in flight.
                 let keep = rtt.is_some() && state.healthy.len() < opts.target;
@@ -272,6 +287,7 @@ pub async fn health_check(
     healthy.sort_by_key(|relay| relay.rtt);
     Probed {
         healthy,
+        passed: std::mem::take(&mut state.passed),
         checked: std::mem::take(&mut state.checked),
     }
 }
@@ -318,11 +334,18 @@ pub async fn resolve_control_relays(
             },
         )
         .await;
-        let mut passed = probed.healthy;
-        let rest = passed.split_off(passed.len().min(missing));
-        backfill = passed;
+        let chosen: Vec<HealthyRelay> = probed.healthy.into_iter().take(missing).collect();
+        let backfilled: HashSet<String> = chosen.iter().map(|relay| relay.url.clone()).collect();
         discovered = Some(Discovered {
-            proven: rest,
+            // Everything the probe proved that the control set did not take.
+            // The early stop caps what this pass *uses*, not what it learns:
+            // a relay that passed once the target was full is a relay the ring
+            // can have for nothing.
+            proven: probed
+                .passed
+                .into_iter()
+                .filter(|relay| !backfilled.contains(&relay.url))
+                .collect(),
             // Only what nobody has tried: a relay that already failed a
             // full-size probe is not a candidate the ring should spend its own
             // budget on again.
@@ -332,6 +355,7 @@ pub async fn resolve_control_relays(
                 .cloned()
                 .collect(),
         });
+        backfill = chosen;
     }
 
     let relays: Vec<String> = defaults
@@ -423,13 +447,16 @@ pub struct PreparedRing {
 }
 
 impl PreparedRing {
+    /// Takes the control relays and the leftovers as the two separate things
+    /// they are, rather than a whole [`ControlSelection`] alongside a relay
+    /// list a caller could get out of step with it.
     pub fn spawn(
         pool: Arc<FilePool>,
         control_relays: Vec<String>,
-        selection: ControlSelection,
+        discovered: Option<Discovered>,
     ) -> Self {
         let task = tokio::spawn(async move {
-            resolve_storage_ring(&pool, &control_relays, selection.discovered, &|_, _| {}).await
+            resolve_storage_ring(&pool, &control_relays, discovered, &|_, _| {}).await
         });
         Self { task }
     }

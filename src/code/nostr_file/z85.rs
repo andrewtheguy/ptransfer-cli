@@ -11,6 +11,22 @@ use anyhow::{Result, bail};
 const ALPHABET: &[u8; 85] =
     b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
 
+/// The value of a byte that is not a Z85 digit.
+const NO_VALUE: u8 = u8::MAX;
+
+/// [`ALPHABET`] reversed, built at compile time. Decoding walks every
+/// character of a ~60 KiB event content, so a scan of the alphabet per
+/// character is most of what decoding a chunk costs.
+const VALUES: [u8; 256] = {
+    let mut table = [NO_VALUE; 256];
+    let mut index = 0;
+    while index < ALPHABET.len() {
+        table[ALPHABET[index] as usize] = index as u8;
+        index += 1;
+    }
+    table
+};
+
 /// Encode arbitrary-length bytes. A trailing group of 1-3 bytes is zero-padded
 /// to four, encoded, and truncated to `remaining + 1` characters — the Ascii85
 /// partial-block scheme on the Z85 alphabet.
@@ -66,9 +82,9 @@ pub fn decode(text: &str) -> Result<Vec<u8>> {
 }
 
 fn digit_value(character: u8) -> Result<u8> {
-    match ALPHABET.iter().position(|entry| *entry == character) {
-        Some(index) => Ok(index as u8),
-        None => bail!("Z85 text carries a character the alphabet has no value for"),
+    match VALUES[character as usize] {
+        NO_VALUE => bail!("Z85 text carries a character the alphabet has no value for"),
+        value => Ok(value),
     }
 }
 

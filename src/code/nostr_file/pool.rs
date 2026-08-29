@@ -11,7 +11,8 @@
 //! a candidate the ring did not need — because with reconnection enabled a
 //! lingering dead socket retries for the rest of the transfer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -43,6 +44,14 @@ pub struct FilePool {
     /// Relays a socket has already been asked for, so a publish or a query
     /// does not re-enter the connect path on every call.
     opened: Mutex<HashSet<String>>,
+    /// One gate per relay URL, so two operations that name the same unopened
+    /// relay take the connect path one after the other rather than at once.
+    /// Two connects racing on one relay leave it in neither state: the one
+    /// that failed drops the relay out of the pool while the other has already
+    /// counted it open, and everything the second does from then on fails with
+    /// `relay not found`. Upload workers reach this directly — several of them
+    /// publish to the same ring relay the moment the ring is announced.
+    gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl FilePool {
@@ -57,16 +66,28 @@ impl FilePool {
                 ))
                 .build(),
             opened: Mutex::new(HashSet::new()),
+            gates: Mutex::new(HashMap::new()),
         }
     }
 
     /// Open a socket to one relay, or report that it would not open.
+    ///
+    /// One caller at a time per relay: the check and the connect are not one
+    /// step, so without the gate two callers both find the relay unopened,
+    /// both connect it, and a failure on either drops the socket the other is
+    /// about to use.
     pub async fn ensure(&self, url: &str) -> Result<()> {
-        {
-            let opened = self.opened.lock().await;
-            if opened.contains(url) {
-                return Ok(());
-            }
+        if self.opened.lock().await.contains(url) {
+            return Ok(());
+        }
+        let gate = {
+            let mut gates = self.gates.lock().await;
+            Arc::clone(gates.entry(url.to_string()).or_default())
+        };
+        let _connecting = gate.lock().await;
+        // Re-checked behind the gate: whoever held it was opening this relay.
+        if self.opened.lock().await.contains(url) {
+            return Ok(());
         }
         self.client
             .add_relay(url)
@@ -119,11 +140,11 @@ impl FilePool {
 
     /// Open sockets to as many of `urls` as will answer, and report which did.
     ///
-    /// Opening is separated from asking because two operations that named the
-    /// same relay and opened it themselves would race: the one whose connect
-    /// failed drops the relay out of the pool, and the one that had already
-    /// counted it reachable then loses its whole query to `relay not found`.
-    /// Everything that asks several relays at once opens them here first.
+    /// Opening is separated from asking because a query that names several
+    /// relays fails as a whole if one of them is not in the pool: which relays
+    /// answered has to be known before the query is sent, not discovered by
+    /// losing it to `relay not found`. Everything that asks several relays at
+    /// once opens them here first.
     pub async fn open_all(&self, urls: &[String]) -> Vec<String> {
         let mut reachable = Vec::new();
         for url in urls {
@@ -190,6 +211,11 @@ impl FilePool {
 
     /// Drop the sockets to relays that have no further job, so no reconnect
     /// loop outlives what it was opened for.
+    ///
+    /// The gates outlive the sockets on purpose: a relay closed here may be
+    /// opened again — the ring reopens the ones a probe proved and closed —
+    /// and dropping its gate while a caller held it would let the next opener
+    /// run beside that one.
     pub async fn close(&self, urls: &[String]) {
         let mut opened = self.opened.lock().await;
         for url in urls {
@@ -201,5 +227,6 @@ impl FilePool {
     pub async fn shutdown(&self) {
         self.client.shutdown().await;
         self.opened.lock().await.clear();
+        self.gates.lock().await.clear();
     }
 }

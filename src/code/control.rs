@@ -158,14 +158,13 @@ impl ControlChannel {
         self.counter += 1;
         message.set_counter(self.counter);
         let content = seal(&self.key, &self.transfer_id, self.role, &message)?;
-        let event = build_control_event(
-            self.client.keys(),
+        let event = self.client.sign(build_control_event(
             &self.transfer_id,
             self.role,
             self.counter,
             content,
             self.expires_at,
-        )?;
+        )?)?;
         self.client.publish(&event).await
     }
 

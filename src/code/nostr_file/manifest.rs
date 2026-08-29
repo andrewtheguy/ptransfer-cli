@@ -97,7 +97,11 @@ impl NostrFileManifest {
         if self.pubkey.len() != 64 || !self.pubkey.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("the manifest names no usable sender identity");
         }
-        if self.expires_at != self.created_at + NOSTR_FILE_EXPIRATION_SEC {
+        // Checked rather than added: `created_at` is a number a peer chose,
+        // and one near the end of the range would overflow the sum — which is
+        // a panic in a debug build and a wrapped comparison in a release one.
+        // A window that cannot even be computed is not this mode's window.
+        if self.created_at.checked_add(NOSTR_FILE_EXPIRATION_SEC) != Some(self.expires_at) {
             bail!("the manifest's window is not the one this mode gives a transfer");
         }
         Ok(())
@@ -107,13 +111,13 @@ impl NostrFileManifest {
     /// this far out. Relay copies live an hour; a manifest outside that is
     /// pointing at pieces that are already gone.
     pub fn check_window(&self, now: u64) -> Result<()> {
-        if now > self.expires_at + CLOCK_SKEW_TOLERANCE_SEC {
+        if now > self.expires_at.saturating_add(CLOCK_SKEW_TOLERANCE_SEC) {
             bail!(
                 "This transfer has expired — relay copies are only kept for an hour. \
                  Ask the sender to start a new one."
             );
         }
-        if self.created_at > now + CLOCK_SKEW_TOLERANCE_SEC {
+        if self.created_at > now.saturating_add(CLOCK_SKEW_TOLERANCE_SEC) {
             bail!(
                 "The sender's transfer is dated in the future — check that this device's \
                  clock is right."
@@ -169,7 +173,7 @@ mod tests {
     #[test]
     fn a_manifest_that_does_not_describe_itself_is_refused() {
         type Mutation = fn(&mut NostrFileManifest);
-        let cases: [(&str, Mutation); 9] = [
+        let cases: [(&str, Mutation); 10] = [
             ("version", |m| m.v = 6),
             ("codec", |m| m.enc = 1),
             ("no name", |m| m.file_name.clear()),
@@ -184,6 +188,10 @@ mod tests {
             ("piece count", |m| m.total_chunks = 3),
             ("hash", |m| m.file_hash = "not base64".to_string()),
             ("window", |m| m.expires_at = m.created_at + 1),
+            ("a window whose end cannot be computed", |m| {
+                m.created_at = u64::MAX;
+                m.expires_at = u64::MAX;
+            }),
         ];
         for (name, mutate) in cases {
             let mut subject = manifest();
@@ -209,5 +217,16 @@ mod tests {
         subject.check_window(subject.created_at).unwrap();
         assert!(subject.check_window(subject.expires_at + CLOCK_SKEW_TOLERANCE_SEC + 1).is_err());
         assert!(subject.check_window(subject.created_at - CLOCK_SKEW_TOLERANCE_SEC - 1).is_err());
+    }
+
+    /// `check_window` is public and takes both ends from the manifest, so a
+    /// clock comparison against a peer's numbers must not be able to overflow.
+    #[test]
+    fn a_window_at_the_end_of_the_range_compares_rather_than_overflows() {
+        let mut subject = manifest();
+        subject.created_at = u64::MAX;
+        subject.expires_at = u64::MAX;
+        subject.check_window(u64::MAX).unwrap();
+        assert!(subject.check_window(0).is_err());
     }
 }

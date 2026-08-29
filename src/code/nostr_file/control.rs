@@ -289,23 +289,22 @@ pub fn control_kind() -> Kind {
     Kind::from_u16(EVENT_KIND_FILE_CHUNK)
 }
 
+/// The unsigned control event. Signing is the caller's, so an identity that
+/// belongs to a client — the Code Exchange channel signs as its signaling
+/// client — never has to be handed out to be used here.
 pub fn build_control_event(
-    keys: &Keys,
     transfer_id: &str,
     role: ControlRole,
     counter: u64,
     content: String,
     expires_at: u64,
-) -> Result<Event> {
+) -> Result<EventBuilder> {
     let tags = vec![
         control_tag("d", format!("{transfer_id}:ctl:{}:{counter}", role.as_str()))?,
         control_tag("x", channel_tag(transfer_id))?,
         control_tag("expiration", expires_at.to_string())?,
     ];
-    EventBuilder::new(control_kind(), content)
-        .tags(tags)
-        .sign_with_keys(keys)
-        .context("could not sign a control event")
+    Ok(EventBuilder::new(control_kind(), content).tags(tags))
 }
 
 /// Whether an event is one of the peer's messages on this channel.
@@ -469,13 +468,14 @@ impl ControlChannel {
     /// counter, so a caller cannot number two messages alike.
     async fn publish(&self, content: String, counter: u64) -> Result<()> {
         let event = build_control_event(
-            &self.keys,
             &self.transfer_id,
             self.role,
             counter,
             content,
             self.expires_at,
-        )?;
+        )?
+        .sign_with_keys(&self.keys)
+        .context("could not sign a control event")?;
         publish_to_any(Arc::clone(&self.pool), &self.relays, event).await
     }
 }

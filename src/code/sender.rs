@@ -34,7 +34,7 @@ use super::keys::CodeKeyPair;
 use super::nostr_file::RELAY_MAX_BYTES;
 use super::nostr_file::codec::PayloadCompression;
 use super::nostr_file::pool::FilePool;
-use super::nostr_file::relay_pool::{PreparedRing, resolve_control_relays};
+use super::nostr_file::relay_pool::{ControlSelection, PreparedRing, resolve_control_relays};
 use super::nostr_file::upload::{RelaySource, SendContext, send_over_relays};
 use super::payload::{
     self, PayloadKind, SignalingPayload, TRANSFER_EXPIRATION_MS, now_ms,
@@ -105,7 +105,7 @@ pub async fn send_file_code(source: &SendSource, anonymous: bool) -> Result<()> 
         let step = ui::status_step("Proving Nostr relays for the fallback...");
         match probe.await {
             Ok(Ok(selection)) => {
-                let relays = selection.relays.clone();
+                let ControlSelection { relays, discovered } = selection;
                 step.done(&format!(
                     "{} Nostr relays proven for the fallback",
                     relays.len()
@@ -113,7 +113,7 @@ pub async fn send_file_code(source: &SendSource, anonymous: bool) -> Result<()> 
                 // The storage ring is prepared behind the exchange, on the
                 // same pool: the code does not depend on it, and a direct
                 // connection simply leaves it unused.
-                let ring = PreparedRing::spawn(Arc::clone(&pool), relays.clone(), selection);
+                let ring = PreparedRing::spawn(Arc::clone(&pool), relays.clone(), discovered);
                 fallback = Fallback::Relays { pool, relays, ring };
             }
             Ok(Err(error)) => {
