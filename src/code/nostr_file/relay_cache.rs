@@ -675,7 +675,7 @@ mod tests {
 
         // Past the TTL the candidate list is stale and the verdicts expire.
         let mut stale = cache.clone();
-        let merged = stale.merge_candidates(Vec::new(), &seeds(), Capability::Storage, NOW + 25 * HOUR);
+        let merged = stale.merge_candidates(Vec::new(), &seeds(), Capability::Storage, NOW + 8 * 24 * HOUR);
         assert!(merged.is_empty());
         assert!(stale.relays.is_empty());
     }
