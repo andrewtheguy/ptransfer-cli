@@ -280,18 +280,62 @@ fn save_code(text: &str) -> Result<PathBuf> {
     use std::io::Write as _;
 
     let path = std::env::temp_dir().join(format!("ptransfer-code-{}.txt", std::process::id()));
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    // Windows has no mode bits to set here; the file lands in the user's own
+    // %TEMP%, which is where its protection comes from there.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
     // A trailing newline, because everything that will read this file back —
     // `cat`, an editor, a mail client — expects one.
     writeln!(file, "{text}")?;
     file.flush()?;
     Ok(path)
+}
+
+/// Break `text` into rows of at most `width` columns, at a space where there
+/// is one and inside a word where there is not.
+///
+/// A path is a single word and can be wider than the screen on its own, so
+/// there has to be a mid-word break; everything else here reads as a sentence,
+/// so a space is preferred wherever one fits. Counted in characters: every
+/// character these lines can hold — the path's, and the dashes and arrows the
+/// screen writes itself — occupies one column.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    let mut len = 0;
+    for word in text.split(' ') {
+        let chars: Vec<char> = word.chars().collect();
+        // An empty word is a doubled space, and a path may hold one: it still
+        // has to be placed, or the path drawn is not the path written.
+        let chunks: Vec<&[char]> = if chars.is_empty() {
+            vec![&[]]
+        } else {
+            chars.chunks(width).collect()
+        };
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            // Only the first chunk of a word can share a row with what came
+            // before it; the rest are what is left of a word too long to fit.
+            let space = usize::from(i == 0 && len > 0);
+            if len > 0 && len + space + chunk.len() > width {
+                rows.push(std::mem::take(&mut row));
+                len = 0;
+            } else if space == 1 {
+                row.push(' ');
+                len += 1;
+            }
+            row.extend(chunk);
+            len += chunk.len();
+        }
+    }
+    rows.push(row);
+    rows
 }
 
 fn plural(count: usize) -> &'static str {
@@ -684,45 +728,46 @@ impl State {
         f.render_widget(Paragraph::new(visible), code_area);
         f.render_widget(edge_rule(&bottom_label, code_area.width), bottom_edge);
 
-        let mut lines: Vec<Line> = status
-            .iter()
-            .map(|line| Line::from(line.as_str()).dim())
-            .collect();
         // A selection reaches only what is drawn, so once the code is taller
         // than the screen the hand-copy fallback is a file rather than the
         // mouse — and saying "select it above" there would be advice that
         // cannot work.
         let selectable = code.rows <= code.page;
-        let carrier: Line = match (&code.saved, code.save_failed, code.copied) {
+        let carrier: String = match (&code.saved, code.save_failed, code.copied) {
             (Some(path), _, _) => format!(
                 "Saved to {} — copy it from there; c retries the clipboard.",
                 path.display()
-            )
-            .dim()
-            .into(),
-            (None, true, _) => "The code could not be saved to a file; c retries the clipboard."
-                .dim()
-                .into(),
-            (None, false, true) if selectable => {
-                "Sent to your clipboard (c to copy again) — or select it above."
-                    .dim()
-                    .into()
+            ),
+            (None, true, _) => {
+                "The code could not be saved to a file; c retries the clipboard.".to_string()
             }
-            (None, false, true) => "Sent to your clipboard (c to copy again) — or s to save it."
-                .dim()
-                .into(),
-            (None, false, false) if selectable => {
-                "Select it above to copy; your terminal refused the clipboard."
-                    .dim()
-                    .into()
+            (None, false, true) if selectable => format!(
+                "Sent to your clipboard (c to copy again) — or select it above{}.",
+                ui::COPY_KEYS
+            ),
+            (None, false, true) => {
+                "Sent to your clipboard (c to copy again) — or s to save it.".to_string()
             }
+            (None, false, false) if selectable => format!(
+                "Select it above to copy{}; your terminal refused the clipboard.",
+                ui::COPY_KEYS
+            ),
             (None, false, false) => {
                 "Too long to select in one go — s saves it to a file, c retries the clipboard."
-                    .dim()
-                    .into()
+                    .to_string()
             }
         };
-        lines.push(carrier);
+
+        // The lines that have to be read to act on the code, in drawing order.
+        // The carrier line is wrapped rather than cut at the edge: it carries
+        // a path whose length is not this screen's to choose — a Windows
+        // `%TEMP%` is fifty columns before the file name even starts — and a
+        // truncated one says the code was saved without saying where.
+        let width = footer.width.max(1) as usize;
+        let mut lines: Vec<Line> = wrap(&carrier, width)
+            .into_iter()
+            .map(|row| Line::from(row).dim())
+            .collect();
         if code.rows > code.page {
             lines.push(
                 format!(
@@ -737,15 +782,30 @@ impl State {
         }
         if let Some(pasted) = pasted {
             lines.push(if pasted == 0 {
-                "Paste the receiver's response here when you have it."
-                    .yellow()
-                    .into()
+                format!(
+                    "Paste the receiver's response here{} when you have it.",
+                    ui::PASTE_KEYS
+                )
+                .yellow()
+                .into()
             } else {
                 format!("{pasted} characters pasted — Enter to send, Backspace to clear")
                     .yellow()
                     .into()
             });
         }
+        // The status excerpt goes above them and is what gives up rows when
+        // the footer runs out: it is a copy of the log, which is back on
+        // screen the moment the code leaves it, while these lines are the
+        // only place their instruction appears.
+        let room = (footer.height as usize).saturating_sub(lines.len());
+        let head = status.len().saturating_sub(room);
+        let lines: Vec<Line> = status
+            .iter()
+            .skip(head)
+            .map(|line| Line::from(line.as_str()).dim())
+            .chain(lines)
+            .collect();
         f.render_widget(Paragraph::new(lines), footer);
     }
 
@@ -975,6 +1035,35 @@ mod tests {
         );
     }
 
+    /// The carrier line under the code holds a path, and a path can be wider
+    /// than the screen on its own: it has to wrap rather than be cut, and
+    /// wrapping may not change a character of it.
+    #[test]
+    fn wrapping_keeps_every_character_and_fits_the_width() {
+        let path = r"C:\Users\Administrator\AppData\Local\Temp\ptransfer-code-1700.txt";
+        let text = format!("Saved to {path} — copy it from there; c retries the clipboard.");
+        for width in [1, 7, 20, 40, 79, 80, 200] {
+            let rows = wrap(&text, width);
+            assert!(
+                rows.iter().all(|row| row.chars().count() <= width),
+                "width {width} overflows: {rows:#?}"
+            );
+            // Only the spaces a break stood in for are ever dropped, so
+            // everything else survives in order at every width.
+            assert_eq!(
+                rows.concat().replace(' ', ""),
+                text.replace(' ', ""),
+                "width {width} lost or reordered something: {rows:#?}"
+            );
+            assert!(
+                rows.concat().contains(path) || width < path.chars().count(),
+                "a path that fits should not be broken up: {rows:#?}"
+            );
+        }
+        // A doubled space belongs to the path, not to the sentence.
+        assert_eq!(wrap("a  b", 4), vec!["a  b".to_string()]);
+    }
+
     /// Regression: the code overlay used to be a full box, so dragging the
     /// mouse over the code — the fallback for terminals that ignore OSC 52 —
     /// copied a border glyph at the start and end of every line, and the
@@ -1133,10 +1222,16 @@ mod tests {
         );
 
         let rows = rendered(&mut terminal, &mut state);
+        // Both halves of the line, which are on one row or two depending on
+        // how long the platform's temporary directory is; `wrap` is what says
+        // nothing is lost between them.
         assert!(
-            rows.iter()
-                .any(|row| row.contains("Saved to") && row.contains("copy it from there")),
-            "the overlay should say where the code went: {rows:#?}"
+            rows.iter().any(|row| row.contains("Saved to")),
+            "the overlay should say the code was saved: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("copy it from there")),
+            "the overlay should say what to do with the file: {rows:#?}"
         );
 
         // The file holds the transfer's secret, so it goes when the code does.

@@ -731,7 +731,9 @@ fn filter_pin_paste(pasted: &str) -> (String, bool) {
 fn draw(f: &mut Frame, screen: &mut Screen) {
     match screen {
         Screen::MainMenu { selected } => {
-            let inner = widgets::screen_frame(f, "wizard");
+            // Every run starts here, which is the one place worth saying that
+            // this platform is a beta one; see [`crate::ui::BETA_TITLE`].
+            let inner = widgets::screen_frame(f, &format!("wizard{}", crate::ui::BETA_TITLE));
             let area = widgets::centered(inner, 40, 6);
             let [title, _, list] = Layout::vertical([
                 Constraint::Length(1),
@@ -883,14 +885,21 @@ fn draw(f: &mut Frame, screen: &mut Screen) {
                     option_hint,
                 );
             }
+            // The box takes a kilobyte of base64 by paste and nothing else,
+            // so the paste key leads the row wherever it is not the obvious
+            // one; see [`crate::ui::PASTE_KEYS`].
             widgets::key_hints(
                 f,
                 inner,
-                if offered {
-                    "Enter confirm · Tab simulate no direct · Esc back"
-                } else {
-                    "Enter confirm · ←/→ move · Esc back"
-                },
+                &format!(
+                    "{}{}",
+                    crate::ui::PASTE_KEY_HINT,
+                    if offered {
+                        "Enter confirm · Tab simulate no direct · Esc back"
+                    } else {
+                        "Enter confirm · ←/→ move · Esc back"
+                    }
+                ),
             );
         }
 

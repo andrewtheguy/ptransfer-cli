@@ -283,6 +283,29 @@ so it is removed when the code leaves the screen. What the overlay offers
 follows what can actually work: it stops suggesting a selection once the code
 does not fit in one.
 
+**On Windows the keys are named, because the mouse silently loses the code.** A
+console there keeps `Ctrl-C` for the interrupt, so PowerShell, Windows Terminal
+and conhost put copy and paste on `Ctrl+Shift+C` and `Ctrl+Shift+V`. What a
+Windows user reaches for instead is the right-click of QuickEdit mode, and that
+is the one that does not work here: it copies whatever mark mode grabbed and
+pastes through the console's line buffer, neither of which survives a kilobyte
+of base64 — the code arrives truncated, fails to decode, and nothing on either
+screen says a mouse was the reason. A code is also the one value in the CLI
+that cannot be retyped by hand. So every screen that hands one over or takes
+one in names the keys on a Windows build: the code overlay's carrier line, the
+response prompt under it, the wizard's receive box, and the plain-mode prompts,
+which have room for the reason as well. `ui::PASTE_KEYS` and its neighbours are
+empty strings everywhere else, where the platform's usual keys work and naming
+any would be noise, and the sentences around them are written to read either
+way. The saved-code file is the other place the platform shows through: it is
+created `0600` where there are mode bits, and on Windows the per-user `%TEMP%`
+is what keeps it to one user. That path is also why the line naming it wraps
+instead of being cut at the edge of the screen — `%TEMP%` runs to fifty
+columns before the file name starts, and a cut one would say the code was
+saved without saying where. The status excerpt above it gives up its rows to
+make the room, since the log it quotes returns the moment the code leaves the
+screen.
+
 **A code is read as a code, not as a line.** Whatever carries a code may wrap
 it — a mail client, a chat window, a terminal that soft-wrapped the paste — and
 [`CODE_EXCHANGE_PROTOCOL.md`](https://github.com/andrewtheguy/ptransfer/blob/main/docs/CODE_EXCHANGE_PROTOCOL.md)
@@ -574,6 +597,11 @@ The advertised size is the input byte count as a progress hint; the sender
 enforces the limit against actual output and seals the final length in `DONE`.
 
 ## Scope
+
+Linux and macOS are the tested platforms. Windows is **beta**: the whole
+feature set builds for `x86_64-pc-windows-msvc` and is published for every
+release, prereleases included, but it gets far less real use than the other
+two, and PowerShell 7 in Windows Terminal is the console it is meant for.
 
 The CLI intentionally has no legacy signaling protocol, no resume path, and no
 custom relay mode, and carries no QR support yet: Code Exchange's codes are

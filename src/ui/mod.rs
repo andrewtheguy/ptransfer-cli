@@ -20,6 +20,65 @@ use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::util::{calc_percent, format_bytes};
 
+/// How the screens that carry a Code Exchange code name the terminal's own
+/// paste, and its copy of a selection.
+///
+/// On Windows the keys have to be said out loud. A console there keeps Ctrl-C
+/// for the interrupt, so PowerShell, Windows Terminal and conhost put copy and
+/// paste on the Shift variants — and the thing a Windows user reaches for
+/// instead, the right-click of QuickEdit mode, is the one that does not work
+/// here: it copies whatever mark mode happened to grab and pastes through the
+/// console's own line buffer, which a kilobyte of base64 does not survive
+/// intact. A truncated code fails to decode with nothing on either screen to
+/// say a mouse was the reason, so every screen that hands a code over or takes
+/// one in names Ctrl+Shift+C and Ctrl+Shift+V, which carry the whole thing.
+///
+/// Every other platform's usual copy and paste work, and naming them would be
+/// noise: these are empty strings there, and the sentences around them are
+/// written to read either way.
+#[cfg(windows)]
+pub const PASTE_KEYS: &str = " with Ctrl+Shift+V";
+#[cfg(not(windows))]
+pub const PASTE_KEYS: &str = "";
+
+#[cfg(windows)]
+pub const COPY_KEYS: &str = " with Ctrl+Shift+C";
+#[cfg(not(windows))]
+pub const COPY_KEYS: &str = "";
+
+/// A line of its own above a plain-mode code prompt, and another under a code
+/// it has just printed — the two places with room to say why the mouse is not
+/// an option. Each ends with its own newline, because what follows it is the
+/// prompt or the code.
+#[cfg(windows)]
+pub const PASTE_CODE_NOTE: &str =
+    "Paste with Ctrl+Shift+V: a right-click paste truncates a code this long.\n";
+#[cfg(not(windows))]
+pub const PASTE_CODE_NOTE: &str = "";
+
+#[cfg(windows)]
+pub const COPY_CODE_NOTE: &str =
+    "\nSelect it and copy it with Ctrl+Shift+C: a right-click copy takes only part of it.";
+#[cfg(not(windows))]
+pub const COPY_CODE_NOTE: &str = "";
+
+/// The same for a TUI key-hint row, where the keys are listed rather than
+/// spoken. Carries its own separator so the row reads correctly without it,
+/// and names the key alone: the row it leads already runs to 69 columns with
+/// it, and an 80-column terminal would cut off whatever came after.
+#[cfg(windows)]
+pub const PASTE_KEY_HINT: &str = "Ctrl+Shift+V paste · ";
+#[cfg(not(windows))]
+pub const PASTE_KEY_HINT: &str = "";
+
+/// What the wizard's first screen adds to its frame title, so the one platform
+/// that is not a tested one says so before anything is sent. Empty on the
+/// others, whose title reads as it always has.
+#[cfg(windows)]
+pub const BETA_TITLE: &str = " (Windows beta)";
+#[cfg(not(windows))]
+pub const BETA_TITLE: &str = "";
+
 /// Direction of a transfer, used to label progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -308,7 +367,7 @@ pub fn show_code(label: &str, code: &str) {
         });
         return;
     }
-    eprintln!("{label}");
+    eprintln!("{label}{COPY_CODE_NOTE}");
     println!("{code}");
     let _ = std::io::stdout().flush();
 }
@@ -381,7 +440,7 @@ pub async fn read_code_from_stdin(label: &'static str, noun: &'static str) -> Re
     tokio::task::spawn_blocking(move || {
         let stdin = std::io::stdin();
         if stdin.is_terminal() {
-            eprint!("{label} (paste it; a blank line ends it): ");
+            eprint!("{PASTE_CODE_NOTE}{label} (paste it{PASTE_KEYS}; a blank line ends it): ");
             std::io::stderr().flush()?;
         }
         read_code(&mut stdin.lock(), noun)
@@ -399,7 +458,9 @@ pub async fn prompt_response_code() -> Result<String> {
         return rx.await.map_err(|_| anyhow!("TUI closed"));
     }
 
-    eprint!("Paste the receiver's response code (a blank line ends it): ");
+    eprint!(
+        "{PASTE_CODE_NOTE}Paste the receiver's response code{PASTE_KEYS} (a blank line ends it): "
+    );
     std::io::stderr().flush()?;
     // A detached OS thread, for the same reason the confirmation prompt uses
     // one: Tokio's blocking pool waits for a stuck stdin read when the runtime

@@ -11,7 +11,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_tag: ${{ steps.version.outputs.new }}
-      is_prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
 
@@ -113,8 +112,40 @@ jobs:
           name: release-ptransfer-${{ matrix.suffix }}
           path: target/release/ptransfer-${{ matrix.suffix }}
 
+  # Windows is a beta target: built for every release, prereleases included,
+  # since a prerelease is where a beta target is most worth trying.
+  build-windows:
+    needs: setup
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      SUFFIX: windows-amd64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Release
+        run: cargo build --release --target ${{ env.TARGET }}
+
+      - name: Rename CLI binary
+        # target\release holds only host artifacts of a --target build, so it may
+        # not exist at all; Move-Item will not create a missing destination directory.
+        run: |
+          New-Item -ItemType Directory -Force -Path target\release | Out-Null
+          Move-Item -Force target\${{ env.TARGET }}\release\ptransfer.exe target\release\ptransfer-${{ env.SUFFIX }}.exe
+
+      - name: Upload CLI release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-ptransfer-${{ env.SUFFIX }}
+          path: target/release/ptransfer-${{ env.SUFFIX }}.exe
+
   create-release:
-    needs: [setup, build-linux, build-macos]
+    needs: [setup, build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Download all release artifacts
