@@ -132,7 +132,11 @@ jobs:
         run: cargo build --release --target ${{ env.TARGET }}
 
       - name: Rename CLI binary
-        run: move target\${{ env.TARGET }}\release\ptransfer.exe target\release\ptransfer-${{ env.SUFFIX }}.exe
+        # target\release holds only host artifacts of a --target build, so it may
+        # not exist at all; Move-Item will not create a missing destination directory.
+        run: |
+          New-Item -ItemType Directory -Force -Path target\release | Out-Null
+          Move-Item -Force target\${{ env.TARGET }}\release\ptransfer.exe target\release\ptransfer-${{ env.SUFFIX }}.exe
 
       - name: Upload CLI release artifact
         uses: actions/upload-artifact@v4
