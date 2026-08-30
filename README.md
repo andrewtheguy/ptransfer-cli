@@ -104,6 +104,41 @@ curl -sSL https://andrewtheguy.github.io/ptransfer-cli/install.sh | bash -s -- -
 curl -sSL https://andrewtheguy.github.io/ptransfer-cli/install.sh | bash -s <release-tag>
 ```
 
+### Quick Install (Windows, beta)
+
+Windows is a **beta** target. The binary is built and published for every
+release the same way the others are, and it is x86_64 (AMD64) only, but it sees
+far less use than Linux and macOS — expect rough edges and report them.
+
+Run it under **PowerShell 7** in Windows Terminal. Windows PowerShell 5.1 works,
+but 7 is what the CLI is exercised under and what gives the TUI a proper
+virtual-terminal console; the installer says so if it finds an older one.
+`winget install --id Microsoft.PowerShell --source winget` installs it.
+
+```powershell
+irm https://andrewtheguy.github.io/ptransfer-cli/install.ps1 | iex
+```
+
+Because parameter binding is unavailable when piping into `iex`, pass flags via
+`$env:PTRANSFER_CLI_INSTALL_ARGS`. Examples:
+
+```powershell
+# Pin to a specific tag
+$env:PTRANSFER_CLI_INSTALL_ARGS='<release-tag>'; irm https://andrewtheguy.github.io/ptransfer-cli/install.ps1 | iex
+
+# Latest prerelease
+$env:PTRANSFER_CLI_INSTALL_ARGS='-PreRelease'; irm https://andrewtheguy.github.io/ptransfer-cli/install.ps1 | iex
+```
+
+**Copy and paste a code with the keyboard, not the mouse.** A Windows console
+keeps `Ctrl-C` for the interrupt, so copy and paste live on the Shift variants
+there: select a Code Exchange code and press **`Ctrl+Shift+C`**, and paste one
+with **`Ctrl+Shift+V`**. Right-click copy and paste — QuickEdit mode, the
+habit a console teaches — is the one thing that does not work for a code: it
+copies only what mark mode grabbed and pastes through the console's line
+buffer, so a kilobyte of base64 arrives truncated and simply fails to decode.
+The screens that carry a code name the keys on Windows builds.
+
 ### From Source
 
 ```bash
@@ -254,7 +289,8 @@ Behind every transfer a background sweep enumerates the whole relay population
 and probes as far as the transfer lasts, so the next one is not limited to
 what this one happened to need. The cache is one JSON file,
 `ptransfer/relay-cache.json` under the platform's per-user cache directory
-(`~/.cache` on Linux, `~/Library/Caches` on macOS), holding relay URLs and verdicts and nothing about any transfer;
+(`~/.cache` on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on
+Windows), holding relay URLs and verdicts and nothing about any transfer;
 several commands running at once share it safely. `PTRANSFER_RELAY_CACHE=off`
 keeps it in memory for one run, and `PTRANSFER_RELAY_CACHE=<directory>` moves
 it.

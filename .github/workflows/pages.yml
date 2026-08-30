@@ -7,6 +7,7 @@ on:
     branches: ["main"]
     paths:
       - 'install.sh'
+      - 'install.ps1'
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
@@ -37,6 +38,7 @@ jobs:
         run: |
           mkdir -p _pages
           cp install.sh _pages/
+          cp install.ps1 _pages/
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
