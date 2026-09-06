@@ -275,34 +275,35 @@ pub async fn send_over_relays(context: SendContext<'_>, source: RelaySource) -> 
         .await
         .context("The relays would not take this transfer's manifest")?;
 
-    let mut tasks = Vec::new();
-    tasks.push(tokio::spawn(read_receiver(
-        incoming,
-        Arc::clone(&state),
-        Arc::clone(&work),
-        Arc::clone(&announce),
-        keys.public_key(),
-        file_size,
-        outcome_tx.clone(),
-    )));
-    tasks.push(tokio::spawn(announce_loop(
-        Arc::clone(&channel),
-        Arc::clone(&state),
-        Arc::clone(&announce),
-        outcome_tx.clone(),
-    )));
-    tasks.push(tokio::spawn(promote_loop(
-        Arc::clone(&channel),
-        Arc::clone(&state),
-        demoted_rx,
-        Arc::clone(&promote),
-        Arc::clone(&announce),
-    )));
-    tasks.push(tokio::spawn(watchdog(
-        Arc::clone(&state),
-        expires_at,
-        outcome_tx.clone(),
-    )));
+    let mut tasks = vec![
+        tokio::spawn(read_receiver(
+            incoming,
+            Arc::clone(&state),
+            Arc::clone(&work),
+            Arc::clone(&announce),
+            keys.public_key(),
+            file_size,
+            outcome_tx.clone(),
+        )),
+        tokio::spawn(announce_loop(
+            Arc::clone(&channel),
+            Arc::clone(&state),
+            Arc::clone(&announce),
+            outcome_tx.clone(),
+        )),
+        tokio::spawn(promote_loop(
+            Arc::clone(&channel),
+            Arc::clone(&state),
+            demoted_rx,
+            Arc::clone(&promote),
+            Arc::clone(&announce),
+        )),
+        tokio::spawn(watchdog(
+            Arc::clone(&state),
+            expires_at,
+            outcome_tx.clone(),
+        )),
+    ];
     // The first announcement goes out at once: an empty ring tells a receiver
     // the sender is here while storage relays are still being found.
     state.lock().expect("upload state").avail_dirty = true;
