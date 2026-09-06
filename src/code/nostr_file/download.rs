@@ -318,12 +318,6 @@ fn handle(
             gens,
             ctl,
         } => {
-            // The control set, unlike the ring, does change: the sender
-            // replaces a signaling relay that stops carrying its share, and
-            // this is the only way the replacement is ever heard of. Taking a
-            // relay on only ever adds — nothing this side already listens to
-            // is dropped — so a forged set can at worst waste a socket.
-            state.adopt_ctl = ctl;
             if !relays.is_empty() {
                 if state.ring.is_empty() {
                     state.ring = relays;
@@ -334,6 +328,13 @@ fn handle(
                     return Ok(Handled::Nothing);
                 }
             }
+            // The control set, unlike the ring, does change: the sender
+            // replaces a signaling relay that stops carrying its share, and
+            // this is the only way the replacement is ever heard of. Taking a
+            // relay on only ever adds — nothing this side already listens to
+            // is dropped — but a message rejected above is rejected whole, and
+            // the set rides every announcement, so the next good one carries it.
+            state.adopt_ctl = ctl;
             state.last_sender_n = n;
             state.saw_sender();
             state.upto = upto;
@@ -583,6 +584,55 @@ mod tests {
             .unwrap();
         assert_eq!(state.ring, vec!["wss://one.example"]);
         assert_eq!(state.last_sender_n, 2);
+    }
+
+    /// A message dropped for naming the wrong ring is dropped whole: its
+    /// control set is not taken on either. Nothing is lost by that — the set
+    /// rides every announcement, so the next accepted one carries it.
+    #[test]
+    fn a_refused_announcement_does_not_hand_over_its_control_set() {
+        let mut state = Download::new();
+        let keys = Keys::generate();
+        let mut manifest = manifest("report.pdf");
+        manifest.pubkey = keys.public_key().to_hex();
+        handle(
+            &mut state,
+            manifest_message(manifest),
+            keys.public_key(),
+            "report.pdf",
+        )
+        .unwrap();
+
+        let announce = |n: u64, relay: &str, ctl: &str| {
+            serde_json::to_value(SenderMessage::Avail {
+                n,
+                upto: 1,
+                relays: vec![relay.to_string()],
+                map: "A".to_string(),
+                gens: Vec::new(),
+                ctl: vec![ctl.to_string()],
+            })
+            .unwrap()
+        };
+        handle(
+            &mut state,
+            announce(2, "wss://one.example", "wss://ctl.example"),
+            keys.public_key(),
+            "report.pdf",
+        )
+        .unwrap();
+        // What `run` does with it once there is an await to subscribe on.
+        assert_eq!(state.adopt_ctl, vec!["wss://ctl.example"]);
+        state.adopt_ctl.clear();
+
+        handle(
+            &mut state,
+            announce(3, "wss://two.example", "wss://forged.example"),
+            keys.public_key(),
+            "report.pdf",
+        )
+        .unwrap();
+        assert!(state.adopt_ctl.is_empty());
     }
 
     /// The code is the only description the receiver agreed to, and the name

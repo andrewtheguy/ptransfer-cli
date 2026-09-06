@@ -655,7 +655,19 @@ impl ControlChannel {
         // opens its own socket, and a relay that will not take a message
         // either is what demotion is for.
         match self.pool.subscribe(&fresh, self.filter.clone()).await {
-            Ok((subscription, _)) => self.subscriptions.lock().await.push(subscription),
+            Ok((subscription, _)) => {
+                // The lock is taken before the flag is read, and `close` sets
+                // the flag before it takes the same lock: a subscription that
+                // opened while the channel was being closed is ended here
+                // rather than outliving everything that would have ended it.
+                let mut subscriptions = self.subscriptions.lock().await;
+                if self.closed.load(Ordering::Relaxed) {
+                    drop(subscriptions);
+                    self.pool.unsubscribe(&subscription).await;
+                } else {
+                    subscriptions.push(subscription);
+                }
+            }
             Err(error) => log::debug!("a promoted signaling relay would not answer: {error:#}"),
         }
         fresh
