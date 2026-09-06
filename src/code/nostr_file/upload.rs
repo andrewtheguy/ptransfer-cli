@@ -34,7 +34,8 @@ use super::codec::{
     PayloadCompression, chunk_aad, compress_payload, encode_chunk_content, sha256,
 };
 use super::control::{
-    ChannelConfig, ControlChannel, ControlRole, ReceiverMessage, SenderMessage, encode_position,
+    ChannelConfig, ControlChannel, ControlDemotion, ControlRole, ReceiverMessage, SenderMessage,
+    encode_position,
 };
 use super::events::{ChunkEvent, build_chunk_event};
 use super::manifest::NostrFileManifest;
@@ -43,9 +44,9 @@ use super::relay_pool::PreparedRing;
 use super::{
     CLOCK_SKEW_TOLERANCE_SEC, LIVE_BATCH_CHUNKS, LIVE_HEARTBEAT, LIVE_IDLE_TIMEOUT,
     LIVE_MIN_RETRANSMITS_PER_CHUNK, LIVE_RELAY_DEMOTE_GIVEUPS, LIVE_RELAY_DEMOTE_MISSES,
-    MANIFEST_VERSION, NOSTR_FILE_CHUNK_SIZE, NOSTR_FILE_EXPIRATION_SEC, PUBLISH_BACKOFF_BASE,
-    PUBLISH_BACKOFF_CAP, PUBLISH_BACKOFF_JITTER, PUBLISH_MAX_RETRIES, RELAY_MAX_BYTES, UPLOAD_CHUNK_CONCURRENCY,
-    now_seconds,
+    MANIFEST_VERSION, MIN_CONTROL_RELAYS, NOSTR_FILE_CHUNK_SIZE, NOSTR_FILE_EXPIRATION_SEC,
+    PUBLISH_BACKOFF_BASE, PUBLISH_BACKOFF_CAP, PUBLISH_BACKOFF_JITTER, PUBLISH_MAX_RETRIES,
+    RELAY_MAX_BYTES, UPLOAD_CHUNK_CONCURRENCY, now_seconds,
 };
 
 /// What the sender needs beyond the file itself.
@@ -81,6 +82,12 @@ struct Upload {
     misses: Vec<u32>,
     give_ups: Vec<u32>,
     demoted: HashSet<usize>,
+    /// Proven relays held back from the ring, waiting to replace a signaling
+    /// relay that stops carrying its share.
+    reserve: VecDeque<String>,
+    /// Demotions the reserve has yet to answer, so one that lands before the
+    /// ring has resolved is still made good.
+    owed_promotions: usize,
     max_retransmits: u64,
     /// Chunks `[0, upto)` are all placed.
     upto: usize,
@@ -108,6 +115,8 @@ impl Upload {
             misses: Vec::new(),
             give_ups: Vec::new(),
             demoted: HashSet::new(),
+            reserve: VecDeque::new(),
+            owed_promotions: 0,
             max_retransmits: LIVE_MIN_RETRANSMITS_PER_CHUNK,
             upto: 0,
             chunks_done: 0,
@@ -153,9 +162,11 @@ impl Upload {
         }
     }
 
-    /// The announcement as it stands: the whole ring and the whole placement,
-    /// in every message, so a lost one costs nothing.
-    fn announcement(&self) -> Result<SenderMessage> {
+    /// The announcement as it stands: the whole ring, the whole placement, and
+    /// the control set in every message, so a lost one costs nothing — a
+    /// signaling relay swapped since the last announcement is simply named
+    /// again on the next.
+    fn announcement(&self, ctl: Vec<String>) -> Result<SenderMessage> {
         let mut map = String::with_capacity(self.upto);
         let mut gens = Vec::new();
         for index in 0..self.upto {
@@ -171,6 +182,7 @@ impl Upload {
             relays: self.ring.clone(),
             map,
             gens,
+            ctl,
         })
     }
 }
@@ -224,6 +236,10 @@ pub async fn send_over_relays(context: SendContext<'_>, source: RelaySource) -> 
         expires_at,
     };
 
+    // A signaling relay that throws away most of what it is handed is
+    // replaced while the transfer runs, not only before it starts: this side
+    // hears about each one here and puts a spare in its place.
+    let (demoted_tx, demoted_rx) = mpsc::unbounded_channel();
     let (channel, incoming) = ControlChannel::open(
         Arc::clone(&context.pool),
         ChannelConfig {
@@ -234,6 +250,10 @@ pub async fn send_over_relays(context: SendContext<'_>, source: RelaySource) -> 
             keys: keys.clone(),
             since: created_at.saturating_sub(CLOCK_SKEW_TOLERANCE_SEC),
             expires_at,
+            demotion: Some(ControlDemotion {
+                min_relays: MIN_CONTROL_RELAYS,
+                demoted: demoted_tx,
+            }),
         },
     )
     .await?;
@@ -242,6 +262,7 @@ pub async fn send_over_relays(context: SendContext<'_>, source: RelaySource) -> 
     let state = Arc::new(Mutex::new(Upload::new(total)));
     let work = Arc::new(Notify::new());
     let announce = Arc::new(Notify::new());
+    let promote = Arc::new(Notify::new());
     let (outcome_tx, mut outcome_rx) = mpsc::unbounded_channel::<Result<()>>();
 
     // The manifest goes first, before any availability, so a receiver reading
@@ -254,27 +275,35 @@ pub async fn send_over_relays(context: SendContext<'_>, source: RelaySource) -> 
         .await
         .context("The relays would not take this transfer's manifest")?;
 
-    let mut tasks = Vec::new();
-    tasks.push(tokio::spawn(read_receiver(
-        incoming,
-        Arc::clone(&state),
-        Arc::clone(&work),
-        Arc::clone(&announce),
-        keys.public_key(),
-        file_size,
-        outcome_tx.clone(),
-    )));
-    tasks.push(tokio::spawn(announce_loop(
-        Arc::clone(&channel),
-        Arc::clone(&state),
-        Arc::clone(&announce),
-        outcome_tx.clone(),
-    )));
-    tasks.push(tokio::spawn(watchdog(
-        Arc::clone(&state),
-        expires_at,
-        outcome_tx.clone(),
-    )));
+    let mut tasks = vec![
+        tokio::spawn(read_receiver(
+            incoming,
+            Arc::clone(&state),
+            Arc::clone(&work),
+            Arc::clone(&announce),
+            keys.public_key(),
+            file_size,
+            outcome_tx.clone(),
+        )),
+        tokio::spawn(announce_loop(
+            Arc::clone(&channel),
+            Arc::clone(&state),
+            Arc::clone(&announce),
+            outcome_tx.clone(),
+        )),
+        tokio::spawn(promote_loop(
+            Arc::clone(&channel),
+            Arc::clone(&state),
+            demoted_rx,
+            Arc::clone(&promote),
+            Arc::clone(&announce),
+        )),
+        tokio::spawn(watchdog(
+            Arc::clone(&state),
+            expires_at,
+            outcome_tx.clone(),
+        )),
+    ];
     // The first announcement goes out at once: an empty ring tells a receiver
     // the sender is here while storage relays are still being found.
     state.lock().expect("upload state").avail_dirty = true;
@@ -286,6 +315,7 @@ pub async fn send_over_relays(context: SendContext<'_>, source: RelaySource) -> 
         Arc::clone(&state),
         Arc::clone(&work),
         Arc::clone(&announce),
+        Arc::clone(&promote),
         Arc::clone(&chunks),
         UploadIdentity {
             transfer_id: context.session.transfer_id.clone(),
@@ -305,6 +335,7 @@ pub async fn send_over_relays(context: SendContext<'_>, source: RelaySource) -> 
     }
     work.notify_waiters();
     announce.notify_waiters();
+    promote.notify_waiters();
     for task in &tasks {
         task.abort();
     }
@@ -340,17 +371,19 @@ async fn start_workers(
     state: Arc<Mutex<Upload>>,
     work: Arc<Notify>,
     announce: Arc<Notify>,
+    promote: Arc<Notify>,
     chunks: Arc<Vec<Vec<u8>>>,
     identity: UploadIdentity,
     outcome: mpsc::UnboundedSender<Result<()>>,
 ) {
-    let ring = match prepared.ring().await {
-        Ok(ring) => ring,
+    let prepared = match prepared.ring().await {
+        Ok(prepared) => prepared,
         Err(error) => {
             let _ = outcome.send(Err(error));
             return;
         }
     };
+    let ring = prepared.ring;
     ui::status(&format!(
         "Relaying the file through {} Nostr relays.",
         ring.len()
@@ -364,10 +397,13 @@ async fn start_workers(
         state.give_ups = vec![0; ring.len()];
         state.max_retransmits = (ring.len() as u64).max(LIVE_MIN_RETRANSMITS_PER_CHUNK);
         state.ring = ring;
+        state.reserve = prepared.reserve.into();
         state.avail_dirty = true;
         UPLOAD_CHUNK_CONCURRENCY.min(state.total)
     };
     announce.notify_one();
+    // A signaling relay demoted before the reserve existed is made good now.
+    promote.notify_one();
 
     let mut set = tokio::task::JoinSet::new();
     for _ in 0..workers {
@@ -575,13 +611,14 @@ async fn announce_loop(
         if !dirty {
             let _ = tokio::time::timeout(LIVE_HEARTBEAT, announce.notified()).await;
         }
+        let ctl = channel.relays();
         let message = {
             let mut state = state.lock().expect("upload state");
             if state.finished {
                 return;
             }
             state.avail_dirty = false;
-            state.announcement()
+            state.announcement(ctl)
         };
         let message = match message {
             Ok(message) => message,
@@ -593,6 +630,75 @@ async fn announce_loop(
         if let Err(error) = channel.send_sender(message).await {
             let _ = outcome.send(Err(error));
             return;
+        }
+    }
+}
+
+/// Put a spare relay in the place of every signaling relay the channel gave
+/// up on, and announce the new set.
+///
+/// The channel demotes but never promotes, so this is where the two meet: a
+/// demotion arrives here, a proven relay the ring did not need goes in its
+/// place, and the next announcement carries it. Nothing acknowledges the swap
+/// — the control set rides every announcement, so a receiver that missed one
+/// takes the relay on at the next heartbeat.
+///
+/// A demotion that arrives before the reserve exists is owed rather than
+/// dropped: `promote` is notified when the ring resolves, and what is owed is
+/// paid then.
+async fn promote_loop(
+    channel: Arc<ControlChannel>,
+    state: Arc<Mutex<Upload>>,
+    mut demoted: mpsc::UnboundedReceiver<String>,
+    promote: Arc<Notify>,
+    announce: Arc<Notify>,
+) {
+    loop {
+        tokio::select! {
+            relay = demoted.recv() => {
+                let Some(relay) = relay else { return };
+                let mut state = state.lock().expect("upload state");
+                if state.finished {
+                    return;
+                }
+                log::info!("replacing signaling relay {relay}");
+                state.owed_promotions += 1;
+            }
+            () = promote.notified() => {}
+        }
+
+        let mut promoted = false;
+        loop {
+            let replacement = {
+                let mut state = state.lock().expect("upload state");
+                if state.finished {
+                    return;
+                }
+                if state.owed_promotions == 0 {
+                    break;
+                }
+                let Some(replacement) = state.reserve.pop_front() else {
+                    break;
+                };
+                replacement
+            };
+            // A spare already in the set — the receiver announced it first —
+            // replaces nothing, so what is owed stays owed.
+            if channel.add(std::slice::from_ref(&replacement)).await.is_empty() {
+                continue;
+            }
+            let mut state = state.lock().expect("upload state");
+            state.owed_promotions -= 1;
+            promoted = true;
+        }
+        if promoted {
+            let mut state = state.lock().expect("upload state");
+            if state.finished {
+                return;
+            }
+            state.avail_dirty = true;
+            drop(state);
+            announce.notify_one();
         }
     }
 }
@@ -787,18 +893,21 @@ mod tests {
         upload.placed[1] = Some(1);
         upload.generation[1] = 2;
         upload.upto = 2;
-        match upload.announcement().unwrap() {
+        let ctl = vec!["wss://ctl.example".to_string()];
+        match upload.announcement(ctl.clone()).unwrap() {
             SenderMessage::Avail {
                 upto,
                 relays,
                 map,
                 gens,
+                ctl: announced,
                 ..
             } => {
                 assert_eq!(upto, 2);
                 assert_eq!(relays.len(), 2);
                 assert_eq!(map, "AB");
                 assert_eq!(gens, vec![(1, 2)]);
+                assert_eq!(announced, ctl);
             }
             other => panic!("expected an announcement, got {other:?}"),
         }

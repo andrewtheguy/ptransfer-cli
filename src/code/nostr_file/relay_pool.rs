@@ -42,7 +42,7 @@ use super::relay_cache::{Capability, RelayCache, now_ms};
 use super::relays::{SEED_RELAYS, canonical, normalize_relay_url};
 use super::{
     BACKGROUND_PROBE_CONCURRENCY, BACKGROUND_PROBE_SAVE_BATCH, CONTROL_PROBE_BYTES,
-    CONTROL_PROBE_TIMEOUT, CONTROL_RELAY_COUNT, DISCOVERY_CANDIDATE_CAP,
+    CONTROL_PROBE_TIMEOUT, CONTROL_RELAY_COUNT, CONTROL_RESERVE_COUNT, DISCOVERY_CANDIDATE_CAP,
     DISCOVERY_CANDIDATE_LIMIT, DISCOVERY_MAX_PAGES, DISCOVERY_PAGE_LIMIT,
     DISCOVERY_PAGE_TIMEOUT, DISCOVERY_TIMEOUT, HEALTH_CHECK_CONCURRENCY, HEALTH_CHECK_TIMEOUT,
     MIN_CONTROL_RELAYS, MIN_UPLOAD_RELAYS, NOSTR_FILE_CHUNK_SIZE, UPLOAD_RELAY_COUNT,
@@ -511,10 +511,15 @@ pub async fn resolve_control_relays(
     })
 }
 
-/// A storage ring, and what selecting it left untried.
+/// A storage ring, and what selecting it left over.
 pub struct Ring {
     /// The relays, in placement order.
     pub relays: Vec<String>,
+    /// The fastest proven relays the ring did not need, held back as control
+    /// replacements. They passed the full-size probe, which is strictly
+    /// stronger than the control probe, so promoting one needs no probe of its
+    /// own.
+    pub reserve: Vec<String>,
     /// Candidates the early stop never reached, for the sweep to start from.
     pub unprobed: Vec<String>,
 }
@@ -584,15 +589,23 @@ pub async fn resolve_storage_ring(
         .update(move |cache| cache.take_ring(&selection, UPLOAD_RELAY_COUNT))
         .await;
     let ring_set: HashSet<&String> = relays.iter().collect();
+    // `healthy` is sorted by round trip, so the reserve is the fastest of what
+    // the ring did not take. Its sockets are closed with the rest — a
+    // promotion reopens one, which costs a connect and nothing else.
     let unselected: Vec<String> = healthy
         .iter()
         .filter(|relay| !ring_set.contains(&relay.url))
         .map(|relay| relay.url.clone())
         .collect();
+    let reserve: Vec<String> = unselected.iter().take(CONTROL_RESERVE_COUNT).cloned().collect();
     if !unselected.is_empty() {
         pool.close(&unselected).await;
     }
-    Ok(Ring { relays, unprobed })
+    Ok(Ring {
+        relays,
+        reserve,
+        unprobed,
+    })
 }
 
 /// The background relay pass, run behind a transfer.
@@ -764,7 +777,14 @@ pub async fn sweep_relay_health(
 /// so only the ring's own probes reach the cache then; a relayed transfer
 /// keeps the sweep going behind the upload.
 pub struct PreparedRing {
-    task: tokio::task::JoinHandle<Result<Vec<String>>>,
+    task: tokio::task::JoinHandle<Result<PreparedRelays>>,
+}
+
+/// What the preparation resolved to: the ring the chunks go on, and the spare
+/// proven relays held back to replace a failing signaling relay.
+pub struct PreparedRelays {
+    pub ring: Vec<String>,
+    pub reserve: Vec<String>,
 }
 
 impl PreparedRing {
@@ -784,17 +804,21 @@ impl PreparedRing {
             let exclude: Vec<String> = control_relays
                 .iter()
                 .chain(ring.relays.iter())
+                .chain(ring.reserve.iter())
                 .cloned()
                 .collect();
             tokio::spawn(async move {
                 sweep_relay_health(&pool, &cache, ring.unprobed, &exclude).await;
             });
-            Ok(ring.relays)
+            Ok(PreparedRelays {
+                ring: ring.relays,
+                reserve: ring.reserve,
+            })
         });
         Self { task }
     }
 
-    pub async fn ring(self) -> Result<Vec<String>> {
+    pub async fn ring(self) -> Result<PreparedRelays> {
         self.task.await.map_err(|error| anyhow::anyhow!("the relay preparation failed: {error}"))?
     }
 
