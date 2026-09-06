@@ -21,8 +21,9 @@
 //! — or whose socket dropped — reads what it missed out of the backlog through
 //! the subscription's `since`.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -41,7 +42,8 @@ use crate::wire::Inflater;
 use super::manifest::NostrFileManifest;
 use super::pool::FilePool;
 use super::{
-    CONTROL_MESSAGE_MAX_BYTES, EVENT_KIND_FILE_CHUNK, NOSTR_FILE_AAD_PREFIX, PUBLISH_BACKOFF_BASE,
+    CONTROL_DEMOTE_FAILURE_RATIO, CONTROL_DEMOTE_MIN_PUBLISHES, CONTROL_MESSAGE_MAX_BYTES,
+    CONTROL_RELAY_MAX, EVENT_KIND_FILE_CHUNK, NOSTR_FILE_AAD_PREFIX, PUBLISH_BACKOFF_BASE,
     PUBLISH_MAX_RETRIES, UPLOAD_RELAY_COUNT,
 };
 
@@ -107,12 +109,24 @@ pub enum SenderMessage {
     /// presence and nothing else — `map` names, per chunk, the position in
     /// *this message's* ring of the relay holding it, and `gens` lists the
     /// chunks that were re-sent with their current generation.
+    ///
+    /// `ctl` is the sender's current control set: the relays the offer named
+    /// minus the ones it has demoted, plus the replacements it promoted in
+    /// their place. The receiver takes on whatever of it it does not already
+    /// hold, which is how a relay the offer never named reaches it — over the
+    /// signaling relays that still work.
+    ///
+    /// The whole ring, placement, and control set travel in every
+    /// announcement, so a lost one costs nothing: a swap the receiver missed
+    /// is repeated on the next heartbeat rather than needing an
+    /// acknowledgement of its own.
     Avail {
         n: u64,
         upto: usize,
         relays: Vec<String>,
         map: String,
         gens: Vec<(usize, u64)>,
+        ctl: Vec<String>,
     },
     Cancel {
         n: u64,
@@ -162,6 +176,7 @@ impl SenderMessage {
             relays,
             map,
             gens,
+            ctl,
             ..
         } = self
         else {
@@ -181,6 +196,20 @@ impl SenderMessage {
             // forms would make one position mean two things.
             if !seen.insert(normalized) {
                 bail!("the announced ring names one relay twice");
+            }
+        }
+        // A control set is never empty: the sender published this very message
+        // over it, and its demotion stops at MIN_CONTROL_RELAYS. The cap is
+        // what bounds the sockets an announcement can make this side open.
+        if ctl.is_empty() || ctl.len() > CONTROL_RELAY_MAX {
+            bail!("the announced control set is not a control set");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for relay in ctl {
+            let normalized = super::relays::normalize_relay_url(relay)
+                .context("the announced control set names something that is not a relay")?;
+            if !seen.insert(normalized) {
+                bail!("the announced control set names one relay twice");
             }
         }
         if *upto > total {
@@ -328,6 +357,112 @@ fn control_tag(name: &str, value: impl Into<String>) -> Result<Tag> {
     Tag::parse([name.to_string(), value.into()]).context("invalid Nostr tag")
 }
 
+/// When a control relay stops being worth publishing to.
+///
+/// The channel demotes; it never promotes. Each relay it drops is named once
+/// on `demoted`, and what — if anything — takes its place is the caller's,
+/// handed back through [`ControlChannel::add`]. Leave the whole policy out and
+/// nothing is ever demoted.
+pub struct ControlDemotion {
+    /// Never demote below this many relays still being published to.
+    pub min_relays: usize,
+    pub demoted: mpsc::UnboundedSender<String>,
+}
+
+/// The relays a channel publishes to, and what it has learned about them.
+///
+/// Two invariants make a swap safe without an acknowledgement. Demotion stops
+/// publishing and never listening — `known` only grows, and a demoted relay
+/// keeps its subscription — so nothing the peer says on a relay this side gave
+/// up on is lost. And it stops at `min_relays`, so the two sides' publish sets
+/// can never drift apart entirely.
+struct ControlRelaySet {
+    /// Published to, in the order they were taken on.
+    active: Vec<String>,
+    /// Everything ever taken on, subscribed to whether demoted or not.
+    known: HashSet<String>,
+    /// Publishes that settled per relay: accepted, and given up on.
+    settled: HashMap<String, (u64, u64)>,
+    policy: Option<ControlDemotion>,
+}
+
+impl ControlRelaySet {
+    /// Taken as given: every caller hands over canonical URLs already — the
+    /// offer's list came through `normalize_relay_url`, and so did anything
+    /// discovery proved.
+    fn new(relays: &[String], policy: Option<ControlDemotion>) -> Self {
+        let mut active = Vec::with_capacity(relays.len());
+        let mut known = HashSet::new();
+        for relay in relays {
+            if known.insert(relay.clone()) {
+                active.push(relay.clone());
+            }
+        }
+        Self {
+            active,
+            known,
+            settled: HashMap::new(),
+            policy,
+        }
+    }
+
+    /// A snapshot: one publish walks the set it started with.
+    fn snapshot(&self) -> Vec<String> {
+        self.active.clone()
+    }
+
+    /// Take on the relays of `relays` this set does not already hold, up to
+    /// what a channel may ever hold, and report which those were.
+    fn accept(&mut self, relays: &[String]) -> Vec<String> {
+        let mut fresh = Vec::new();
+        for relay in relays {
+            if self.known.len() >= CONTROL_RELAY_MAX {
+                break;
+            }
+            let Some(url) = super::relays::normalize_relay_url(relay) else {
+                continue;
+            };
+            if !self.known.insert(url.clone()) {
+                continue;
+            }
+            self.active.push(url.clone());
+            fresh.push(url);
+        }
+        fresh
+    }
+
+    fn accepted(&mut self, relay: &str) {
+        self.settled.entry(relay.to_string()).or_default().0 += 1;
+    }
+
+    /// Every retry rejected. Drops the relay from the publish set once the
+    /// share it has thrown away condemns it.
+    fn gave_up(&mut self, relay: &str) {
+        let tally = self.settled.entry(relay.to_string()).or_default();
+        tally.1 += 1;
+        let (accepted, given_up) = *tally;
+        let Some(policy) = &self.policy else {
+            return;
+        };
+        if self.active.len() <= policy.min_relays {
+            return;
+        }
+        let settled = accepted + given_up;
+        if settled < CONTROL_DEMOTE_MIN_PUBLISHES {
+            return;
+        }
+        if (given_up as f64) / (settled as f64) < CONTROL_DEMOTE_FAILURE_RATIO {
+            return;
+        }
+        let Some(at) = self.active.iter().position(|url| url == relay) else {
+            return;
+        };
+        self.active.remove(at);
+        log::info!("signaling relay {relay} is throwing away most of what it is handed");
+        let _ = policy.demoted.send(relay.to_string());
+    }
+}
+
 /// What opening a channel needs beyond the session it is derived from.
 pub struct ChannelConfig<'a> {
     pub relays: &'a [String],
@@ -343,20 +478,29 @@ pub struct ChannelConfig<'a> {
     pub since: u64,
     /// unix seconds: stamped on every event this side publishes.
     pub expires_at: u64,
+    /// When to stop publishing to a relay. Omitted: never.
+    pub demotion: Option<ControlDemotion>,
 }
 
 /// An open control channel: a subscription to the peer's half of the session
 /// and a way to publish this side's.
+///
+/// The relay set is live rather than fixed. With a [`ControlDemotion`] policy
+/// a relay that keeps giving up publishes stops being published to and the
+/// caller is told, so it can [`Self::add`] a replacement; the subscription
+/// stays, so nothing the peer sends over it is lost.
 pub struct ControlChannel {
     pool: Arc<FilePool>,
-    relays: Vec<String>,
+    relays: Arc<StdMutex<ControlRelaySet>>,
+    /// Kept so a relay taken on later is subscribed to on the same terms.
+    filter: Filter,
     keys: Keys,
     key: [u8; AES_KEY_LEN],
     transfer_id: String,
     role: ControlRole,
     expires_at: u64,
     counter: Mutex<u64>,
-    subscription: SubscriptionId,
+    subscriptions: Mutex<Vec<SubscriptionId>>,
     closed: Arc<AtomicBool>,
 }
 
@@ -444,14 +588,18 @@ impl ControlChannel {
         Ok((
             Self {
                 pool,
-                relays: config.relays.to_vec(),
+                relays: Arc::new(StdMutex::new(ControlRelaySet::new(
+                    config.relays,
+                    config.demotion,
+                ))),
+                filter,
                 keys: config.keys,
                 key: config.key,
                 transfer_id: config.transfer_id,
                 role: config.role,
                 expires_at: config.expires_at,
                 counter: Mutex::new(0),
-                subscription,
+                subscriptions: Mutex::new(vec![subscription]),
                 closed,
             },
             incoming,
@@ -478,6 +626,40 @@ impl ControlChannel {
         .context("could not sign a control event")?;
         publish_to_any(Arc::clone(&self.pool), &self.relays, event).await
     }
+
+    /// The relays this side is publishing to, which is what an announcement
+    /// carries as its `ctl` set.
+    pub fn relays(&self) -> Vec<String> {
+        self.relays.lock().expect("control relays").snapshot()
+    }
+
+    /// Take on relays this channel does not already hold: subscribe to them,
+    /// and start publishing there. Returns the ones actually taken on.
+    ///
+    /// A promotion opens a second subscription rather than reopening the
+    /// first: the relays already connected have no reason to re-serve their
+    /// backlog because a new one joined.
+    pub async fn add(&self, relays: &[String]) -> Vec<String> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        let fresh = self
+            .relays
+            .lock()
+            .expect("control relays")
+            .accept(relays);
+        if fresh.is_empty() {
+            return fresh;
+        }
+        // A relay that will not answer stays in the set regardless: publishing
+        // opens its own socket, and a relay that will not take a message
+        // either is what demotion is for.
+        match self.pool.subscribe(&fresh, self.filter.clone()).await {
+            Ok((subscription, _)) => self.subscriptions.lock().await.push(subscription),
+            Err(error) => log::debug!("a promoted signaling relay would not answer: {error:#}"),
+        }
+        fresh
+    }
 }
 
 impl ControlChannel {
@@ -503,7 +685,9 @@ impl ControlChannel {
 
     pub async fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
-        self.pool.unsubscribe(&self.subscription).await;
+        for subscription in self.subscriptions.lock().await.drain(..) {
+            self.pool.unsubscribe(&subscription).await;
+        }
     }
 }
 
@@ -513,13 +697,19 @@ impl ControlChannel {
 /// message that only ever reached the one relay that then fails to serve it is
 /// a message the peer never sees, and the one that matters most — the manifest
 /// — is sent exactly once.
-async fn publish_to_any(pool: Arc<FilePool>, relays: &[String], event: Event) -> Result<()> {
+async fn publish_to_any(
+    pool: Arc<FilePool>,
+    set: &Arc<StdMutex<ControlRelaySet>>,
+    event: Event,
+) -> Result<()> {
+    let relays = set.lock().expect("control relays").snapshot();
     if relays.is_empty() {
         bail!("this transfer has no control relays left to reach the other side on");
     }
     let (tx, mut rx) = mpsc::unbounded_channel();
-    for relay in relays {
+    for relay in &relays {
         let pool = Arc::clone(&pool);
+        let set = Arc::clone(set);
         let relay = relay.clone();
         let event = event.clone();
         let tx = tx.clone();
@@ -527,6 +717,7 @@ async fn publish_to_any(pool: Arc<FilePool>, relays: &[String], event: Event) ->
             for attempt in 0..=PUBLISH_MAX_RETRIES {
                 match pool.publish(&relay, &event).await {
                     Ok(()) => {
+                        set.lock().expect("control relays").accepted(&relay);
                         let _ = tx.send(true);
                         return;
                     }
@@ -537,6 +728,11 @@ async fn publish_to_any(pool: Arc<FilePool>, relays: &[String], event: Event) ->
                         }
                     }
                 }
+            }
+            // The teardown is not the relay's fault: a pool being shut down
+            // fails every publish still in flight.
+            if !pool.is_shut_down() {
+                set.lock().expect("control relays").gave_up(&relay);
             }
             let _ = tx.send(false);
         });
@@ -592,9 +788,10 @@ mod tests {
                 relays: vec!["wss://relay.example".to_string()],
                 map: "AA".to_string(),
                 gens: vec![(1, 2)],
+                ctl: vec!["wss://ctl.example".to_string()],
             })
             .unwrap(),
-            r#"{"t":"avail","n":5,"upto":2,"relays":["wss://relay.example"],"map":"AA","gens":[[1,2]]}"#
+            r#"{"t":"avail","n":5,"upto":2,"relays":["wss://relay.example"],"map":"AA","gens":[[1,2]],"ctl":["wss://ctl.example"]}"#
         );
     }
 
@@ -644,11 +841,13 @@ mod tests {
             ],
             map: "AB".to_string(),
             gens: vec![(1, 1)],
+            ctl: vec!["wss://ctl.example".to_string()],
         };
         good.validate(Some(4)).unwrap();
         // Nothing to size it against yet.
         assert!(good.validate(None).is_err());
 
+        let ctl = || vec!["wss://ctl.example".to_string()];
         let cases = [
             SenderMessage::Avail {
                 n: 1,
@@ -656,6 +855,7 @@ mod tests {
                 relays: vec!["wss://one.example".to_string()],
                 map: "AAAAA".to_string(),
                 gens: Vec::new(),
+                ctl: ctl(),
             },
             SenderMessage::Avail {
                 n: 1,
@@ -663,6 +863,7 @@ mod tests {
                 relays: vec!["wss://one.example".to_string()],
                 map: "AB".to_string(),
                 gens: Vec::new(),
+                ctl: ctl(),
             },
             SenderMessage::Avail {
                 n: 1,
@@ -670,6 +871,7 @@ mod tests {
                 relays: vec!["wss://one.example".to_string()],
                 map: "A".to_string(),
                 gens: Vec::new(),
+                ctl: ctl(),
             },
             SenderMessage::Avail {
                 n: 1,
@@ -680,6 +882,7 @@ mod tests {
                 ],
                 map: "A".to_string(),
                 gens: Vec::new(),
+                ctl: ctl(),
             },
             SenderMessage::Avail {
                 n: 1,
@@ -687,10 +890,45 @@ mod tests {
                 relays: vec!["ws://one.example".to_string()],
                 map: "A".to_string(),
                 gens: Vec::new(),
+                ctl: ctl(),
             },
         ];
         for case in cases {
             assert!(case.validate(Some(4)).is_err(), "{case:?} should be refused");
+        }
+    }
+
+    /// The control set is what this side is told to open sockets to, so it is
+    /// bounded and checked exactly as the ring is — and it is never empty: the
+    /// sender published the very message carrying it over that set.
+    #[test]
+    fn an_announcement_whose_control_set_is_not_one_is_refused() {
+        let avail = |ctl: Vec<String>| SenderMessage::Avail {
+            n: 1,
+            upto: 1,
+            relays: vec!["wss://one.example".to_string()],
+            map: "A".to_string(),
+            gens: Vec::new(),
+            ctl,
+        };
+        avail(vec!["wss://ctl.example".to_string()])
+            .validate(Some(4))
+            .unwrap();
+        let cases = [
+            Vec::new(),
+            vec!["wss://ctl.example".to_string(); CONTROL_RELAY_MAX + 1],
+            vec![
+                "wss://ctl.example".to_string(),
+                "wss://ctl.example/".to_string(),
+            ],
+            vec!["ws://ctl.example".to_string()],
+        ];
+        for case in cases {
+            let message = avail(case);
+            assert!(
+                message.validate(Some(4)).is_err(),
+                "{message:?} should be refused"
+            );
         }
     }
 

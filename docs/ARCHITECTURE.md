@@ -360,7 +360,12 @@ realization are worth naming:
   and adopted whenever it resolves — a transfer that connects directly drops it
   unused, exactly as it drops an unused Tor bootstrap. Below
   `MIN_CONTROL_RELAYS` the offer names none and the transfer has no clearnet
-  fallback at all.
+  fallback at all. Preparing the ring also holds back the fastest few proven
+  relays it did not need, and those are what a signaling relay is replaced
+  from when one starts throwing away most of what it is handed part-way
+  through a transfer: they passed the full-size probe, which is strictly
+  stronger than the control probe, so a promotion costs a reconnect and no
+  probe of its own.
 - **What the probes learn is kept.** The web app keeps a relay-health cache
   in IndexedDB and runs a background sweep of the relay population behind
   every transfer; this CLI carries both (`src/code/nostr_file/relay_cache.rs`,

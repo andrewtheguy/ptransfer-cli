@@ -32,13 +32,15 @@ use crate::ui;
 
 use super::codec::{assemble_chunks, chunk_aad, decode_chunk_content, decompress_payload, sha256};
 use super::control::{
-    ChannelConfig, ControlChannel, ControlRole, ReceiverMessage, SenderMessage, decode_position,
+    ChannelConfig, ControlChannel, ControlDemotion, ControlRole, ReceiverMessage, SenderMessage,
+    decode_position,
 };
 use super::events::{chunk_filters, parse_chunk_event};
 use super::manifest::NostrFileManifest;
 use super::pool::FilePool;
 use super::{
-    CLOCK_SKEW_TOLERANCE_SEC, LIVE_FETCH_RETRY, LIVE_IDLE_TIMEOUT, RELAY_QUERY_TIMEOUT, now_seconds,
+    CLOCK_SKEW_TOLERANCE_SEC, LIVE_FETCH_RETRY, LIVE_IDLE_TIMEOUT, MIN_CONTROL_RELAYS,
+    RELAY_QUERY_TIMEOUT, now_seconds,
 };
 
 /// What the receiver needs beyond the offer it took in.
@@ -71,6 +73,10 @@ struct Download {
     last_tried: Vec<Option<(usize, u64)>>,
     last_tried_at: Vec<Option<Instant>>,
     ring: Vec<String>,
+    /// Signaling relays the latest announcement named that this side has yet
+    /// to take on. Held here because applying an announcement is synchronous
+    /// and subscribing is not.
+    adopt_ctl: Vec<String>,
     /// The ring position of every announced chunk, decoded once from the
     /// announcement's map.
     map: Vec<usize>,
@@ -91,6 +97,7 @@ impl Download {
             last_tried: Vec::new(),
             last_tried_at: Vec::new(),
             ring: Vec::new(),
+            adopt_ctl: Vec::new(),
             map: Vec::new(),
             gens: HashMap::new(),
             upto: 0,
@@ -126,6 +133,15 @@ impl Download {
 /// Take the file the sender is relaying, and hand back the verified plaintext.
 pub async fn receive_over_relays(context: ReceiveContext<'_>) -> Result<Vec<u8>> {
     let key = context.session.key_bytes;
+    // This side demotes on its own publish record but never promotes: it has
+    // proven no relays of its own, and what replaces one is the sender's to
+    // choose and to announce.
+    let (demoted_tx, mut demoted_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(relay) = demoted_rx.recv().await {
+            log::info!("no longer sending to signaling relay {relay}");
+        }
+    });
     let (channel, mut incoming) = ControlChannel::open(
         Arc::clone(&context.pool),
         ChannelConfig {
@@ -136,6 +152,10 @@ pub async fn receive_over_relays(context: ReceiveContext<'_>) -> Result<Vec<u8>>
             keys: Keys::generate(),
             since: context.since.saturating_sub(CLOCK_SKEW_TOLERANCE_SEC),
             expires_at: context.expires_at,
+            demotion: Some(ControlDemotion {
+                min_relays: MIN_CONTROL_RELAYS,
+                demoted: demoted_tx,
+            }),
         },
     )
     .await?;
@@ -181,6 +201,13 @@ async fn run(
                 match handle(state, value, pubkey, &context.expected_name)? {
                     Handled::Fetch => fetch_now = true,
                     Handled::Nothing => {}
+                }
+                // Whatever the sender's latest control set named and this side
+                // does not hold yet: taken on here, where subscribing can be
+                // awaited.
+                if !state.adopt_ctl.is_empty() {
+                    let relays = std::mem::take(&mut state.adopt_ctl);
+                    channel.add(&relays).await;
                 }
             }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -289,7 +316,14 @@ fn handle(
             relays,
             map,
             gens,
+            ctl,
         } => {
+            // The control set, unlike the ring, does change: the sender
+            // replaces a signaling relay that stops carrying its share, and
+            // this is the only way the replacement is ever heard of. Taking a
+            // relay on only ever adds — nothing this side already listens to
+            // is dropped — so a forged set can at worst waste a socket.
+            state.adopt_ctl = ctl;
             if !relays.is_empty() {
                 if state.ring.is_empty() {
                     state.ring = relays;
@@ -538,6 +572,7 @@ mod tests {
                 relays: vec![relay.to_string()],
                 map: "A".to_string(),
                 gens: Vec::new(),
+                ctl: vec!["wss://ctl.example".to_string()],
             })
             .unwrap()
         };

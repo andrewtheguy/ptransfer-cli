@@ -167,6 +167,25 @@ pub const LIVE_RELAY_DEMOTE_MISSES: u32 = 2;
 /// stop starting there.
 pub const LIVE_RELAY_DEMOTE_GIVEUPS: u32 = 3;
 
+/// The share of a control relay's settled publishes that may be given up —
+/// every retry rejected — before it is dropped from the publish set
+/// mid-transfer. A ratio rather than a run of consecutive failures: a
+/// rate-limiting relay still accepts the odd message, which resets a
+/// consecutive counter forever while most of the traffic it is handed is
+/// still being thrown away.
+pub const CONTROL_DEMOTE_FAILURE_RATIO: f64 = 0.5;
+/// ...measured over at least this many settled publishes, so an early unlucky
+/// pair cannot condemn a relay that goes on to work.
+pub const CONTROL_DEMOTE_MIN_PUBLISHES: u64 = 6;
+/// Full-size-proven relays held back from the storage ring as control
+/// replacements. They passed the ring's own probe, which is strictly stronger
+/// than the control probe, so a promotion needs no probe of its own.
+pub const CONTROL_RESERVE_COUNT: usize = 4;
+/// Ceiling on the control relays one transfer may ever hold: the offer's set
+/// plus every replacement. Bounds what a peer's announcement can make this
+/// side connect to.
+pub const CONTROL_RELAY_MAX: usize = CONTROL_RELAY_COUNT + CONTROL_RESERVE_COUNT;
+
 /// Decompression bound for one control body. A full map of every chunk in a
 /// 100 MiB transfer is well under it.
 pub const CONTROL_MESSAGE_MAX_BYTES: u64 = 256 * 1024;
